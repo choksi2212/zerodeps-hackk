@@ -17,9 +17,10 @@ const rstStreamLen = 4
 // open a stream and immediately reset it, over and over: each cycle costs the
 // server a HPACK decode, a stream allocation and a handler dispatch, but the
 // stream closes at once so it never counts against SETTINGS_MAX_CONCURRENT_STREAMS.
-// A concurrency limit alone does not defend against it. The rate limit lives in
-// internal/limits, because it is a property of the connection over time rather
-// than of any single frame.
+// A concurrency limit alone does not defend against it. The rate limit is
+// limits.Bucket, configured by limits.NewResetBucket and held per connection,
+// because it is a property of the connection over time rather than of any single
+// frame — which is why nothing in this file can enforce it.
 type RSTStreamFrame struct {
 	StreamID uint32
 	ErrCode  h2.ErrCode

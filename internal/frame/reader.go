@@ -59,6 +59,13 @@ type ReaderConfig struct {
 }
 
 // Defaults for ReaderConfig.
+//
+// These are fallbacks, not the policy. internal/limits owns the numbers a server
+// runs with, and the server passes them in explicitly; these exist so that a
+// zero-valued ReaderConfig is safe and so this package can be tested without
+// importing a policy package. A test in internal/limits asserts the two agree,
+// because a bound that differs between the value enforced and the value tested is
+// worse than either value alone.
 const (
 	// DefaultMaxHeaderBlockSize is generous next to any real request — a large
 	// cookie jar compresses to a few kilobytes — while still being a bound.

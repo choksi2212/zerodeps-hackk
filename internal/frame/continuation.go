@@ -17,8 +17,9 @@ import "zerodeps/zdh/internal/h2"
 // block is accumulated in, and none of them opening a stream that any concurrency
 // limit would count. That is CVE-2023-45288, and no per-frame check can see it:
 // each frame in the flood is individually valid. The cap on the accumulated block
-// size and on the number of continuations lives in internal/limits, applied by
-// the reader that holds the running total.
+// size and on the number of continuations is policy, so the numbers are
+// limits.MaxHeaderBlockSize and limits.MaxContinuationFrames; they are applied
+// here, by the reader that holds the running total, through ReaderConfig.
 type ContinuationFrame struct {
 	StreamID uint32
 
