@@ -1,0 +1,10 @@
+bin/
+*.pem
+*.crt
+*.key
+*.test
+*.prof
+*.out
+
+# testdata/fuzz/ is deliberately NOT ignored: a fuzz crasher is a committed
+# regression test, and the corpus growing over the window is evidence.

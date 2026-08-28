@@ -1,0 +1,17 @@
+# Git for Windows sets core.autocrlf=true in its system config, so a fresh
+# clone there would check every file out with CRLF endings. Measured
+# consequence: `gofmt -l .` then lists every .go file as unformatted and the
+# build gate is red before a line of code is written. This file makes the
+# working tree LF everywhere, for us and for anyone who clones us.
+* text=auto eol=lf
+
+*.go   text eol=lf
+*.md   text eol=lf
+*.sh   text eol=lf
+*.pem  text eol=lf
+
+# Byte-exact protocol fixtures must never be touched by any line-ending
+# policy. A 0x0A rewritten to 0x0D 0x0A inside a frame or an HPACK vector
+# reads as "my parser is broken" and costs hours to find.
+testdata/**/*.bin -text
+testdata/**/*.raw -text
