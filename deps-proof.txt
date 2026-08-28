@@ -1,0 +1,62 @@
+zdh — zero-dependency proof
+Regenerate with: bash scripts/deps-proof.sh > deps-proof.txt
+
+----- $ go version -----
+go version go1.26.7 windows/amd64
+
+----- $ cat go.mod -----
+module zerodeps/zdh
+
+go 1.24
+
+----- $ ls go.sum -----
+go.sum: does not exist (this absence is the proof)
+
+----- $ ls vendor -----
+vendor/: does not exist
+
+----- $ go list -m all -----
+zerodeps/zdh
+
+----- $ go list -deps ./... | grep -v "^zerodeps/" | wc -l   (standard-library packages reached) -----
+68
+
+----- $ go list -deps -f "{{if not .Standard}}{{.ImportPath}}{{end}}" ./...   (non-standard packages) -----
+zerodeps/zdh/cmd/zdh
+zerodeps/zdh/internal/h2
+(every line above is one of our own packages; anything else would be an external dependency)
+
+----- $ go list -deps ./... | grep -E "^net/http(/|$)"   (net/http occurrences) -----
+net/http: 0 occurrences
+
+----- $ go list -deps ./... | grep "\." (dependency paths containing a dot) -----
+(none)
+
+Note on the paths above, if any are listed. Importing crypto/tls legitimately
+reaches a handful of paths under vendor/golang.org/x/crypto, vendor/golang.org/
+x/net and crypto/internal/entropy. Those are the standard library's own
+internal copies, shipped inside GOROOT as part of the Go distribution itself.
+They are in no manifest, cannot be removed or substituted, and `go list`
+reports .Standard = true for every one of them — see the non-standard listing
+above, which is the authoritative check. This project has no module
+dependencies at all.
+
+----- $ go version -m bin/zdh   (dependencies read out of the compiled binary) -----
+bin/zdh: go1.26.7
+	path	zerodeps/zdh/cmd/zdh
+	mod	zerodeps/zdh	(devel)	
+	build	-buildmode=exe
+	build	-compiler=gc
+	build	-trimpath=true
+	build	DefaultGODEBUG=containermaxprocs=0,cryptocustomrand=1,decoratemappings=0,tlssecpmlkem=0,tlssha1=1,updatemaxprocs=0,urlstrictcolons=0,x509sha256skid=0
+	build	CGO_ENABLED=0
+	build	GOARCH=amd64
+	build	GOOS=windows
+	build	GOAMD64=v1
+
+----- $ go version -m bin/zdh | grep -c '^\s*dep\s'   (dependency records in the binary) -----
+0
+
+----- conclusion -----
+No go.sum, no vendor directory, no require directive, no non-standard
+import, and no dependency record in the compiled binary.
