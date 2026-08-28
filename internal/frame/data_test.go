@@ -33,6 +33,9 @@ func TestParseDataValid(t *testing.T) {
 			want:   DataFrame{StreamID: 1},
 		},
 		{
+			// Matrix row 40. Closing the stream is internal/stream's part of the
+			// row; the framing part is that a zero-length payload with the flag
+			// set is well formed and must not be mistaken for a truncation.
 			name:   "empty with END_STREAM",
 			flags:  FlagEndStream,
 			stream: 1,

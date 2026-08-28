@@ -44,8 +44,8 @@ func (f WindowUpdateFrame) appendPayload(dst []byte) []byte {
 // keeping a connection the protocol says must die.
 //
 // The increment overflowing a window past 2^31-1 is also a FLOW_CONTROL_ERROR,
-// at the same two scopes, but that needs the current window value. It is
-// enforced in internal/flow, which owns the window.
+// at the same two scopes, but that needs the current window value. Matrix rows 30
+// and 31 are enforced in internal/flow, which owns the window.
 func parseWindowUpdate(h Header, payload []byte) (Frame, error) {
 	if h.Length != windowUpdateLen {
 		return nil, connErrf(h2.FrameSizeError,

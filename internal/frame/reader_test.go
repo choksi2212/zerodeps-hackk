@@ -316,7 +316,9 @@ func TestReadFrameCleanCloseIsEOF(t *testing.T) {
 }
 
 // TestReadFrameTruncated covers a connection cut mid-frame, which is an I/O
-// failure rather than a protocol error however deliberate it was.
+// failure rather than a protocol error however deliberate it was. It is matrix
+// rows 38 and 39: a header cut short, and a header whose promised payload never
+// arrives in full.
 //
 // The row at exactly HeaderLen is the interesting one: the peer sent a complete
 // header promising a payload and then closed. io.ReadFull reports that as a plain
@@ -422,9 +424,10 @@ func TestReadFrameOversizeAppliesToEveryType(t *testing.T) {
 
 // --- unknown frame types ----------------------------------------------------
 
-// TestReadFrameDiscardsUnknownTypes covers §4.1. The payload still has to be
-// consumed, and the proof of that is that the following frame parses: one octet
-// left behind and the next header would be read from the middle of this payload.
+// TestReadFrameDiscardsUnknownTypes covers §4.1, and is matrix row 36. The
+// payload still has to be consumed, and the proof of that is that the following
+// frame parses: one octet left behind and the next header would be read from the
+// middle of this payload.
 func TestReadFrameDiscardsUnknownTypes(t *testing.T) {
 	var stream []byte
 	stream = append(stream, rawFrame(
@@ -495,7 +498,9 @@ func TestReadFrameHeaderBlockContinued(t *testing.T) {
 	}
 }
 
-// TestReadFrameContinuityViolations is h2spec http2/6.10 stated as a table.
+// TestReadFrameContinuityViolations is h2spec http2/6.10 stated as a table, and
+// matrix rows 32, 33 and 34: a CONTINUATION with no block open, a CONTINUATION on
+// the wrong stream, and any other frame type arriving mid-block.
 // Every row is a connection error of type PROTOCOL_ERROR; the reader is the only
 // layer that can see any of them, because each frame in isolation is valid.
 func TestReadFrameContinuityViolations(t *testing.T) {

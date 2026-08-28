@@ -37,8 +37,8 @@ func (f RSTStreamFrame) appendPayload(dst []byte) []byte {
 // parseRSTStream parses a RST_STREAM frame payload.
 //
 // A RST_STREAM naming a stream that has never been opened is also a connection
-// error (§6.4), but that needs the stream registry to detect, so it is enforced
-// in internal/stream rather than here.
+// error (§6.4), but that needs the stream registry to detect, so matrix row 13 is
+// enforced in internal/stream rather than here.
 //
 // The error code is not validated against the assigned set. §7 requires unknown
 // error codes to be treated as INTERNAL_ERROR rather than rejected, and that

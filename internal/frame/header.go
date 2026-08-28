@@ -33,7 +33,7 @@ type Header struct {
 // RFC 9113 §4.1 requires a receiver to ignore it, and h2spec sends a frame with
 // it set to check that an implementation does not reject the frame — so
 // "ignore" has to mean discarding the bit, not tolerating it in a field nobody
-// looks at.
+// looks at. That is matrix row 37.
 //
 // No field can fail to parse: every 9-byte sequence is a syntactically valid
 // frame header. Length, Type, Flags and StreamID are validated against each

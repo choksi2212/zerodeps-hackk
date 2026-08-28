@@ -109,7 +109,9 @@ func TestParseContinuationValid(t *testing.T) {
 	}
 }
 
-// TestParseContinuationStreamZero is matrix row 32.
+// TestParseContinuationStreamZero is matrix row 35. The neighbouring rows 32 to
+// 34 are about a CONTINUATION's position in the frame sequence, which no single
+// frame can judge; they live with the reader.
 func TestParseContinuationStreamZero(t *testing.T) {
 	h := Header{Length: 1, Type: TypeContinuation, Flags: FlagEndHeaders, StreamID: 0}
 	_, err := parseContinuation(h, []byte{0x82})

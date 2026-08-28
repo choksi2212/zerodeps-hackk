@@ -9,10 +9,10 @@ import "zerodeps/zdh/internal/h2"
 // mechanism this server does not implement. So PRIORITY frames are parsed,
 // validated, and then deliberately ignored: the contents affect nothing.
 //
-// That is the specified behaviour rather than an omission. A receiver still has
-// to accept a well-formed PRIORITY frame, still has to reject a malformed one
-// with the right error at the right scope, and the frame still has to be
-// consumed so the connection stays byte-synchronised.
+// That is the specified behaviour rather than an omission, and it is matrix
+// row 10. A receiver still has to accept a well-formed PRIORITY frame, still has
+// to reject a malformed one with the right error at the right scope, and the
+// frame still has to be consumed so the connection stays byte-synchronised.
 type PriorityFrame struct {
 	StreamID uint32
 

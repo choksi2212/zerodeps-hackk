@@ -37,7 +37,8 @@ func (f PingFrame) appendPayload(dst []byte) []byte {
 //
 // Sending the reply is not done here — a parser that answered frames would be
 // writing to the socket from the reader goroutine, and exactly one goroutine
-// owns the write half of the connection. The connection loop replies.
+// owns the write half of the connection. The connection loop replies, so matrix
+// row 24 is enforced in internal/server.
 func parsePing(h Header, payload []byte) (Frame, error) {
 	if h.StreamID != 0 {
 		return nil, connErrf(h2.ProtocolError,
