@@ -82,3 +82,24 @@ func wantNoErr(t *testing.T, err error) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }
+
+// oneOfEachFrameType returns one valid frame of every assigned type, in an order
+// that satisfies the header-block continuity rule of §6.10 — so the sequence can
+// be written to a Writer and read back through a Reader as a legal connection.
+//
+// It is shared so that the reader and the writer are exercised over the same set,
+// and so that a new frame type has one place to be added rather than two.
+func oneOfEachFrameType() []Frame {
+	return []Frame{
+		SettingsFrame{Settings: []Setting{{ID: SettingMaxConcurrentStreams, Value: 100}}},
+		PingFrame{Data: [pingLen]byte{1, 2, 3, 4, 5, 6, 7, 8}},
+		PriorityFrame{StreamID: 1, StreamDependency: 3, Weight: 15},
+		RSTStreamFrame{StreamID: 1, ErrCode: h2.Cancel},
+		WindowUpdateFrame{Increment: DefaultInitialWindowSize},
+		DataFrame{StreamID: 1, Data: []byte("hi")},
+		HeadersFrame{StreamID: 1, Fragment: []byte{0x82}},
+		ContinuationFrame{StreamID: 1, EndHeaders: true, Fragment: []byte{0x86}},
+		PushPromiseFrame{StreamID: 1, PromisedID: 2, EndHeaders: true, Fragment: []byte{0x84}},
+		GoAwayFrame{LastStreamID: 1, ErrCode: h2.NoError, Debug: []byte("bye")},
+	}
+}

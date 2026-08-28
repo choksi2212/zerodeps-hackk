@@ -249,18 +249,7 @@ func TestParsersTableIsTotal(t *testing.T) {
 // asserts that all ten were seen. The coverage assertion is what makes it a
 // completeness test rather than ten spot checks.
 func TestReadFrameEveryType(t *testing.T) {
-	frames := []Frame{
-		SettingsFrame{Settings: []Setting{{ID: SettingMaxConcurrentStreams, Value: 100}}},
-		PingFrame{Data: [pingLen]byte{1, 2, 3, 4, 5, 6, 7, 8}},
-		PriorityFrame{StreamID: 1, StreamDependency: 3, Weight: 15},
-		RSTStreamFrame{StreamID: 1, ErrCode: h2.Cancel},
-		WindowUpdateFrame{Increment: DefaultInitialWindowSize},
-		DataFrame{StreamID: 1, Data: []byte("hi")},
-		HeadersFrame{StreamID: 1, Fragment: []byte{0x82}},
-		ContinuationFrame{StreamID: 1, EndHeaders: true, Fragment: []byte{0x86}},
-		PushPromiseFrame{StreamID: 1, PromisedID: 2, EndHeaders: true, Fragment: []byte{0x84}},
-		GoAwayFrame{LastStreamID: 1, ErrCode: h2.NoError, Debug: []byte("bye")},
-	}
+	frames := oneOfEachFrameType()
 	rd := readerOver(frameBytes(frames...), ReaderConfig{})
 	got := mustReadFrames(t, rd, len(frames))
 
