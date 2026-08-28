@@ -12,7 +12,8 @@ This section is kept honest as the build proceeds; nothing is claimed here befor
 |---|---|
 | Build gate, zero-dependency guards, reproducible build | working |
 | Shared `internal/h2` contract | frozen |
-| Frame layer (RFC 9113 §4, §6) | in progress |
+| Frame layer (RFC 9113 §4, §6) | working — all 10 frame types, 477 tests, 4 fuzz targets |
+| Connection timeouts and peer bounds (`internal/limits`) | in progress |
 | Connection lifecycle, SETTINGS, PING, GOAWAY | not started |
 | Streams and flow control (§5) | not started |
 | HPACK (RFC 7541) | in progress, separate author |
