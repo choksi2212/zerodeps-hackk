@@ -76,6 +76,6 @@ func HeaderOf(f Frame) Header {
 		Length:   f.PayloadLen(),
 		Type:     f.Type(),
 		Flags:    f.Flags(),
-		StreamID: f.StreamID(),
+		StreamID: f.Stream(),
 	}
 }

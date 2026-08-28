@@ -172,13 +172,22 @@ const (
 // The set of implementations is closed: appendPayload is unexported, so no type
 // outside this package can satisfy the interface. A reader can therefore switch
 // on the concrete types and know the switch is exhaustive.
+//
+// The accessor is Stream rather than StreamID because the frame structs carry an
+// exported StreamID field, and Go does not allow a field and a method to share a
+// name. The field keeps the name from RFC 9113 §4.1, since that is what someone
+// writing a frame literal will look for.
+//
+// Frames that are only ever sent on the connection — SETTINGS, PING, GOAWAY —
+// have no StreamID field at all and return 0 here. A SETTINGS frame on a stream
+// is not a mistake to be caught later; it cannot be constructed.
 type Frame interface {
 	// Type is the frame's wire type.
 	Type() FrameType
 	// Flags is the frame's wire flags, derived from the frame's own fields.
 	Flags() Flags
-	// StreamID is the stream this frame belongs to; 0 means the connection.
-	StreamID() uint32
+	// Stream is the stream this frame belongs to; 0 means the connection.
+	Stream() uint32
 	// PayloadLen is the wire length of the payload, excluding the 9-octet
 	// header.
 	PayloadLen() uint32

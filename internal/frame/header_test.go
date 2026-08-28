@@ -17,7 +17,7 @@ type stubFrame struct {
 
 func (f stubFrame) Type() FrameType                 { return f.typ }
 func (f stubFrame) Flags() Flags                    { return f.flags }
-func (f stubFrame) StreamID() uint32                { return f.streamID }
+func (f stubFrame) Stream() uint32                  { return f.streamID }
 func (f stubFrame) PayloadLen() uint32              { return uint32(len(f.payload)) }
 func (f stubFrame) appendPayload(dst []byte) []byte { return append(dst, f.payload...) }
 
