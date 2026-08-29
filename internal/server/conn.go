@@ -99,6 +99,42 @@ type StreamHandler interface {
 	// against every window that is already open, which cannot be applied by
 	// anything that does not hold them all.
 	SetInitialWindowSize(n uint32) error
+
+	// SetHeaderTableSize applies the peer's SETTINGS_HEADER_TABLE_SIZE (§6.5.2) to
+	// the HPACK context this connection's responses are encoded against.
+	//
+	// Behind this interface because the parameter governs a table, and the table
+	// belongs to the codec that turns a response's field list into a header block —
+	// which is on the far side of this boundary along with everything else about a
+	// response. This file holds no codec, by the same rule that stops it holding a
+	// stream table.
+	//
+	// The direction is what makes it the handler's rather than the frame writer's:
+	// this is the size of the table the *peer* keeps for decoding, so it bounds what
+	// we may encode against, and it has nothing to do with the table we decode the
+	// peer's own requests with.
+	//
+	// No error, unlike the method above. §6.5.2 gives this parameter no bounds, so
+	// there is no legal value the frame layer can hand us that the encoder cannot be
+	// told about, and §4.2 of RFC 7541 lets an encoder use less table than it is
+	// offered — so a value larger than any this server would use is not a failure
+	// either. SetInitialWindowSize has an error because its legal values can still
+	// overflow a window that already has one; this has nothing to overflow.
+	SetHeaderTableSize(n uint32)
+
+	// SetMaxHeaderListSize applies the peer's SETTINGS_MAX_HEADER_LIST_SIZE
+	// (§6.5.2): the largest field list, by that section's accounting, that this
+	// connection's responses may carry from now on.
+	//
+	// Here for the same reason again, and enforced where a response's field list is
+	// assembled, which is the only place the accounting can be done — the number is
+	// about a list of fields and their 32 octets of overhead each, not about the
+	// compressed block this connection puts on the wire.
+	//
+	// No error, and nothing is allocated on the strength of the value, so there is
+	// nothing to range-check either: a peer that sets it to zero has asked for a
+	// connection on which every response is refused, and it is entitled to.
+	SetMaxHeaderListSize(n uint32)
 }
 
 // The four ways a connection ends with nobody at fault.
@@ -689,13 +725,20 @@ func (c *conn) applySetting(s frame.Setting) error {
 		// its own SETTINGS. A client that sets ENABLE_PUSH to 1 gets no pushes
 		// anyway, which is permitted — the setting is a ceiling, not a request.
 
-	case frame.SettingHeaderTableSize, frame.SettingMaxHeaderListSize:
-		// Both belong to the HPACK encoder, which does not exist on this branch
-		// yet. HEADER_TABLE_SIZE reaches it through
-		// h2.HeaderCodec.SetMaxDynamicTableSize; MAX_HEADER_LIST_SIZE bounds the
-		// decoded size of a response's header list and has to be enforced where
-		// the list is built. Both are internal/hpack's, and neither can be
-		// obeyed or disobeyed until this connection sends a response.
+	case frame.SettingHeaderTableSize:
+		// The size of the dynamic table the peer keeps for decoding, and therefore a
+		// ceiling on the encoding context this connection's responses are compressed
+		// against. Forwarded because the codec is the handler's and this file has
+		// none: see StreamHandler.SetHeaderTableSize.
+		c.handler.SetHeaderTableSize(s.Value)
+
+	case frame.SettingMaxHeaderListSize:
+		// A ceiling on the field list a response may carry, enforced where the list
+		// is assembled: see StreamHandler.SetMaxHeaderListSize. §6.5.2 makes it
+		// advisory, so obeying it is this server's choice rather than a requirement —
+		// and the choice is made on the other side of this interface too, because the
+		// accounting is over a list this file never sees.
+		c.handler.SetMaxHeaderListSize(s.Value)
 
 	case frame.SettingInitialWindowSize:
 		// The awkward one, and the reason StreamHandler has a method for it.

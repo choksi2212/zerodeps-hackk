@@ -16,6 +16,15 @@ flag and the loop arming the deadline for its next read. Removing it leaves a
 server that answers a shutdown when the connection next hears from its peer, which
 on an idle connection is a minute later and on an abandoned one is never.
 
+A fourth and fifth are about a value rather than a route. HEADER_TABLE_SIZE and
+MAX_HEADER_LIST_SIZE each take 0 as a meaningful setting -- a peer that keeps no
+dynamic table for decoding, and a peer that will read no header list at all -- so a
+route that forwarded only non-zero values would carry every value a test is likely to
+pick and drop the one number that is hard to tell apart from the parameter never having
+been sent. Both breaks are that skip, and TestServeForwardsAHeaderSettingOfZero is the
+test that notices; nothing else in the suite does, because every other setting in it is
+non-zero on purpose.
+
 Two guards in discard have no break, and both are named rather than quietly skipped.
 
   * c.w.Close(). Removing it does not fail a test, it deadlocks one: the writer sits
@@ -114,8 +123,15 @@ BREAKS = [
         ["TestInitialSettingsAdvertiseTheServersLimits"],
     ),
     (
-        "applySetting: two of the peer's parameters are no longer named at all",
-        """	case frame.SettingHeaderTableSize, frame.SettingMaxHeaderListSize:
+        "applySetting: HEADER_TABLE_SIZE is no longer named at all",
+        """	case frame.SettingHeaderTableSize:
+""",
+        "",
+        ["TestApplySettingNamesEverySettingID"],
+    ),
+    (
+        "applySetting: MAX_HEADER_LIST_SIZE is no longer named at all",
+        """	case frame.SettingMaxHeaderListSize:
 """,
         "",
         ["TestApplySettingNamesEverySettingID"],
@@ -338,7 +354,7 @@ BREAKS = [
         """	return nil""",
         [
             "TestServeAcceptsAnEmptySettingsAsTheFirstFrame",
-            "TestServeAcknowledgesTheSettingsItDoesNotActOnYet",
+            "TestServeAcknowledgesTheSettingsItHasNothingToDoAbout",
         ],
     ),
     (
@@ -363,6 +379,49 @@ BREAKS = [
             "TestServeAppliesInitialWindowSizeToTheStreamLayer",
             "TestServeStopsOnASettingItCannotApply",
         ],
+    ),
+    (
+        "applySetting: HEADER_TABLE_SIZE never reaches the encoder, which compresses "
+        "against a table the peer is not keeping",
+        """		c.handler.SetHeaderTableSize(s.Value)""",
+        """		_ = s.Value""",
+        [
+            "TestServeAppliesTheHeaderSettingsToTheEncodingSide",
+            "TestServeForwardsAHeaderSettingOfZero",
+        ],
+    ),
+    (
+        "applySetting: MAX_HEADER_LIST_SIZE never reaches the layer that builds the list",
+        """		c.handler.SetMaxHeaderListSize(s.Value)""",
+        """		_ = s.Value""",
+        [
+            "TestServeAppliesTheHeaderSettingsToTheEncodingSide",
+            "TestServeForwardsAHeaderSettingOfZero",
+        ],
+    ),
+    (
+        "applySetting: a HEADER_TABLE_SIZE of 0 is read as no value at all, so the peer's "
+        "emptied table is never honoured",
+        """		c.handler.SetHeaderTableSize(s.Value)""",
+        """		if s.Value != 0 {
+			c.handler.SetHeaderTableSize(s.Value)
+		}""",
+        ["TestServeForwardsAHeaderSettingOfZero"],
+    ),
+    (
+        "applySetting: a MAX_HEADER_LIST_SIZE of 0 is read as no value at all, which is "
+        "the one state it must be distinguishable from",
+        """		c.handler.SetMaxHeaderListSize(s.Value)""",
+        """		if s.Value != 0 {
+			c.handler.SetMaxHeaderListSize(s.Value)
+		}""",
+        ["TestServeForwardsAHeaderSettingOfZero"],
+    ),
+    (
+        "applySetting: the two header parameters are crossed, so each is applied as the other",
+        """		c.handler.SetHeaderTableSize(s.Value)""",
+        """		c.handler.SetMaxHeaderListSize(s.Value)""",
+        ["TestServeAppliesTheHeaderSettingsToTheEncodingSide"],
     ),
     (
         "handleConnectionWindowUpdate: a stream-0 credit is swallowed at the connection level",

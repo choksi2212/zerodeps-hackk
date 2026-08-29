@@ -40,9 +40,28 @@ rather than what they remove.
   whether to wait for a body from that answer waits for a body that will never
   come, and the stream sits there until the idle timeout.
 
+The two setters that carry the peer's HPACK settings to the response encoder add a
+fifth of the same kind, and it is the reason TestSetHeaderTableSizeLeavesTheDecodingCodecAlone
+exists. HPACK runs as two tables with two histories, and this file holds both ends: the
+codec it decodes the peer's requests with, and the encoder its responses are compressed
+against. Both have a SetMaxDynamicTableSize taking the same argument, so sending the
+peer's SETTINGS_HEADER_TABLE_SIZE to the wrong one compiles, passes every test about
+requests, passes every test about responses, and resizes the decoding table the peer
+sized by *our* SETTINGS instead. The symptom arrives later and somewhere else, as an
+index resolving to a field line nobody sent. Only a test that asserts the codec was not
+touched at all can see it, which is a thing no test would think to assert without a
+break to justify it.
+
+The direction of limits.MaxEncoderTableSize is the other one worth reading. It is a
+minimum, never a clamp into a range, and the two breaks that turn it into a maximum or
+skip a zero are there because both are the sort of thing that reads as a tidy-up. A
+peer offering more encoding context than this server wants is offering, and declining
+is free; a peer offering less, or none, is stating what its own decoder will keep, and
+there is nothing there to decline.
+
 Every guard in the file has a break here, both scopes of every error that has a
 choice of scope, and every message has one that strips its section reference.
-All 115 are caught, and three of them are worth knowing about for how they are caught
+All 125 are caught, and three of them are worth knowing about for how they are caught
 rather than that they are: removing the CONTINUATION-with-no-block guard, dropping
 the streams map from the constructor, and letting New skip making a Sender all
 produce a nil dereference rather than a failed assertion. All three still report as an
@@ -145,6 +164,15 @@ BREAKS = [
 """,
         "",
         ["TestNewPanicsWithoutRequests"],
+    ),
+    (
+        "New accepts a nil Encoder, so the peer's first SETTINGS panics in the reader goroutine",
+        """	if cfg.Encoder == nil {
+		panic("stream: New requires a response encoder")
+	}
+""",
+        "",
+        ["TestNewPanicsWithoutAnEncoder"],
     ),
     (
         "New leaves the concurrency limit at zero, so every stream is refused",
@@ -383,6 +411,83 @@ BREAKS = [
 	}
 	return t.sender.SetInitialSize(n)""",
         ["TestSetInitialWindowSizeLeavesTheConnectionWindowAlone"],
+    ),
+
+    # --- the peer's two header settings --------------------------------------
+    (
+        "SetHeaderTableSize drops the peer's setting, leaving the encoder on its default",
+        """	t.enc.SetMaxDynamicTableSize(int(min(n, limits.MaxEncoderTableSize)))""",
+        """	_ = n""",
+        [
+            "TestSetHeaderTableSizeReachesTheEncoder",
+            "TestSetHeaderTableSizeIsAMinimumAndNotAClamp",
+            "TestTheTwoHeaderSettingsAreNotCrossed",
+        ],
+    ),
+    (
+        "SetHeaderTableSize honours a peer's four gigabytes (RFC 9113 6.5.2 sets no ceiling)",
+        """	t.enc.SetMaxDynamicTableSize(int(min(n, limits.MaxEncoderTableSize)))""",
+        """	t.enc.SetMaxDynamicTableSize(int(n))""",
+        ["TestSetHeaderTableSizeIsAMinimumAndNotAClamp"],
+    ),
+    (
+        "the encoder table bound is a maximum instead of a minimum, so a small table is enlarged",
+        """	t.enc.SetMaxDynamicTableSize(int(min(n, limits.MaxEncoderTableSize)))""",
+        """	t.enc.SetMaxDynamicTableSize(int(max(n, limits.MaxEncoderTableSize)))""",
+        ["TestSetHeaderTableSizeIsAMinimumAndNotAClamp"],
+    ),
+    (
+        "a peer that keeps no dynamic table is skipped rather than obeyed",
+        """	t.enc.SetMaxDynamicTableSize(int(min(n, limits.MaxEncoderTableSize)))""",
+        """	if n != 0 {
+		t.enc.SetMaxDynamicTableSize(int(min(n, limits.MaxEncoderTableSize)))
+	}""",
+        ["TestSetHeaderTableSizeIsAMinimumAndNotAClamp"],
+    ),
+    (
+        "the peer's table size resizes the table we decode with instead of the one we encode with",
+        """	t.enc.SetMaxDynamicTableSize(int(min(n, limits.MaxEncoderTableSize)))""",
+        """	t.codec.SetMaxDynamicTableSize(int(min(n, limits.MaxEncoderTableSize)))""",
+        [
+            "TestSetHeaderTableSizeReachesTheEncoder",
+            "TestSetHeaderTableSizeLeavesTheDecodingCodecAlone",
+        ],
+    ),
+    (
+        "SetMaxHeaderListSize drops the peer's setting, so responses ignore the limit it asked for",
+        """	t.enc.SetMaxHeaderListSize(n)""",
+        """	_ = n""",
+        [
+            "TestSetMaxHeaderListSizeReachesTheEncoderWhole",
+            "TestTheTwoHeaderSettingsAreNotCrossed",
+        ],
+    ),
+    (
+        "the encoder table bound is copied onto the header list size, which has nothing to do with it",
+        """	t.enc.SetMaxHeaderListSize(n)""",
+        """	t.enc.SetMaxHeaderListSize(min(n, limits.MaxEncoderTableSize))""",
+        ["TestSetMaxHeaderListSizeReachesTheEncoderWhole"],
+    ),
+    (
+        "a peer that will read no header list at all is skipped rather than obeyed",
+        """	t.enc.SetMaxHeaderListSize(n)""",
+        """	if n != 0 {
+		t.enc.SetMaxHeaderListSize(n)
+	}""",
+        ["TestSetMaxHeaderListSizeReachesTheEncoderWhole"],
+    ),
+    (
+        "the peer's table size is applied as its header list size, which is the crossing that compiles",
+        """func (t *Table) SetHeaderTableSize(n uint32) {
+	t.enc.SetMaxDynamicTableSize(int(min(n, limits.MaxEncoderTableSize)))
+}""",
+        """func (t *Table) SetHeaderTableSize(n uint32) {
+	t.enc.SetMaxHeaderListSize(n)
+}""",
+        [
+            "TestSetHeaderTableSizeReachesTheEncoder",
+            "TestTheTwoHeaderSettingsAreNotCrossed",
+        ],
     ),
 
     # --- headers: which of the two kinds of block this is --------------------

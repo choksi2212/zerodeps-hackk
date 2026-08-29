@@ -64,14 +64,49 @@ const (
 // Enforced in internal/stream, which owns the stream table.
 const MaxConcurrentStreams = 100
 
+// MaxEncoderTableSize bounds the HPACK dynamic table this server keeps for the
+// direction it sends in, whatever the peer's SETTINGS_HEADER_TABLE_SIZE asks for.
+//
+// That setting is the one parameter in §6.5.2 with no upper bound of its own. A peer
+// may advertise 2^32-1 and be entirely within the protocol, having asked this server
+// for four gigabytes of encoding context on one connection in a six-octet SETTINGS
+// entry, before it has sent a request. Multiplied by MaxConns it is not a number
+// worth naming.
+//
+// Sitting below what the peer offered is legal and costs nothing. §4.2 of RFC 7541
+// makes the value "the maximum size the encoder is permitted to use" rather than the
+// size it must use, and lets an encoder choose any size below it provided it says
+// which — with a dynamic table size update at the front of the next block, which is
+// the encoder's own business. So a peer that offers a larger table than this gets the
+// responses it would have got anyway, encoded against a smaller one.
+//
+// Which way the bound applies is the part worth being careful about: it lowers the
+// value the peer sent and never raises it. A peer that advertises a table smaller
+// than HPACK's default, or none at all, is the party that has to decode our indices,
+// so that direction is obeyed rather than chosen — an encoder referring to entries
+// the decoder is not keeping produces field lines nobody sent. A minimum, then, and
+// not a clamp into a range.
+//
+// 64 KiB is sixteen times HPACK's 4096-octet default, which is what browsers
+// actually advertise, and 32 MiB across MaxConns. Beyond it the compression a larger
+// table buys is nothing: a dynamic table holds the field lines a *later* response
+// repeats, and this server's responses repeat about a dozen.
+//
+// Enforced in internal/stream, where the setting arrives from internal/server and
+// meets the encoder. Bounding it there also removes a narrowing that would otherwise
+// need a guard no test could reach: the setting arrives as a uint32 and the codec
+// takes an int, so a peer's 2^32-1 would be -1 on a 32-bit platform.
+const MaxEncoderTableSize = 1 << 16
+
 // MaxConns is how many connections this server serves at once.
 //
 // It is the outermost bound, and the one the others are multiplied by: every
 // per-connection cost in this file — a 16 KiB read buffer, a 4 KiB write buffer,
-// two goroutines, and transiently up to MaxHeaderBlockSize while a header block is
-// being assembled — is paid once per connection here. 512 connections is about
-// 10 MiB of steady buffers and, in the worst case a peer can arrange, 64 MiB of
-// header blocks.
+// two goroutines, transiently up to MaxHeaderBlockSize while a header block is
+// being assembled, and up to MaxEncoderTableSize for as long as a peer asks for it
+// — is paid once per connection here. 512 connections is about 10 MiB of steady
+// buffers and, in the worst case a peer can arrange, 64 MiB of header blocks and
+// 32 MiB of encoder tables.
 //
 // The number is chosen against file descriptors rather than memory, because that
 // is the limit reached first. A process on Linux typically starts with a soft limit

@@ -189,16 +189,18 @@ func (ts *testSocket) pendingLen() int {
 
 // handlerFunc adapts a function to StreamHandler.
 //
-// The two connection-level hooks answer nil. A double built to observe frame
-// dispatch has nothing to say about flow control, and answering them with a
-// failure instead would make every dispatch test that happens to carry a
-// stream-0 WINDOW_UPDATE fail for a reason it is not about. recordingHandler is
-// the double that watches them.
+// The four connection-level hooks do nothing. A double built to observe frame
+// dispatch has nothing to say about flow control or about the HPACK context, and
+// answering the two that can fail with a failure instead would make every dispatch
+// test that happens to carry a stream-0 WINDOW_UPDATE fail for a reason it is not
+// about. recordingHandler is the double that watches them.
 type handlerFunc func(frame.Frame) error
 
 func (h handlerFunc) HandleFrame(f frame.Frame) error   { return h(f) }
 func (h handlerFunc) ConnWindowUpdate(uint32) error     { return nil }
 func (h handlerFunc) SetInitialWindowSize(uint32) error { return nil }
+func (h handlerFunc) SetHeaderTableSize(uint32)         {}
+func (h handlerFunc) SetMaxHeaderListSize(uint32)       {}
 
 // recordingHandler keeps every frame it is given and returns err for each.
 //
@@ -210,16 +212,18 @@ type recordingHandler struct {
 	frames []frame.Frame
 	err    error
 
-	// increments and initialWindows record the two connection-level hooks, which
-	// are the only evidence that a stream-0 WINDOW_UPDATE and a
-	// SETTINGS_INITIAL_WINDOW_SIZE were routed at all: neither produces a frame
-	// on the wire, so a connection that dropped them would look identical to one
-	// that applied them.
-	increments    []uint32
-	initialWindow []uint32
+	// increments, initialWindows, tableSizes and headerListSizes record the four
+	// connection-level hooks, which are the only evidence that a stream-0
+	// WINDOW_UPDATE or one of the three SETTINGS parameters that belong to the
+	// handler was routed at all: none of them produces a frame on the wire, so a
+	// connection that dropped them would look identical to one that applied them.
+	increments      []uint32
+	initialWindow   []uint32
+	tableSizes      []uint32
+	headerListSizes []uint32
 
-	// hookErr is what those two hooks return, kept apart from err so that a test
-	// can fail one without failing frame dispatch.
+	// hookErr is what the two hooks that can fail return, kept apart from err so
+	// that a test can fail one without failing frame dispatch.
 	hookErr error
 }
 
@@ -247,6 +251,18 @@ func (h *recordingHandler) SetInitialWindowSize(n uint32) error {
 	return err
 }
 
+func (h *recordingHandler) SetHeaderTableSize(n uint32) {
+	h.mu.Lock()
+	h.tableSizes = append(h.tableSizes, n)
+	h.mu.Unlock()
+}
+
+func (h *recordingHandler) SetMaxHeaderListSize(n uint32) {
+	h.mu.Lock()
+	h.headerListSizes = append(h.headerListSizes, n)
+	h.mu.Unlock()
+}
+
 func (h *recordingHandler) seenIncrements() []uint32 {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -257,6 +273,18 @@ func (h *recordingHandler) seenInitialWindows() []uint32 {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	return append([]uint32(nil), h.initialWindow...)
+}
+
+func (h *recordingHandler) seenTableSizes() []uint32 {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return append([]uint32(nil), h.tableSizes...)
+}
+
+func (h *recordingHandler) seenHeaderListSizes() []uint32 {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return append([]uint32(nil), h.headerListSizes...)
 }
 
 func (h *recordingHandler) seen() []frame.Frame {
@@ -855,30 +883,27 @@ func TestServeAppliesSettingsBeforeAcknowledging(t *testing.T) {
 	}
 }
 
-// TestServeAcknowledgesTheSettingsItDoesNotActOnYet is the connection's obligation
-// towards parameters whose enforcement lives in another package.
+// TestServeAcknowledgesTheSettingsItHasNothingToDoAbout is the connection's
+// obligation towards parameters it does not act on. §6.5 does not permit a parameter
+// to go unacknowledged, and a peer waiting for an acknowledgement that never comes
+// stalls the connection — ignoring a parameter and refusing it are different things.
 //
-// HEADER_TABLE_SIZE and MAX_HEADER_LIST_SIZE are internal/hpack's, and until it
-// exists the values are recorded nowhere — but §6.5 does not permit a parameter to
-// go unacknowledged, and a peer waiting for an acknowledgement that never comes
-// stalls the connection. Ignoring a parameter and refusing it are different things.
-//
-// INITIAL_WINDOW_SIZE used to belong here and no longer does: it reaches the stream
-// layer through StreamHandler.SetInitialWindowSize, which
-// TestServeAppliesInitialWindowSizeToTheStreamLayer covers. A parameter left in this
-// list after it grew an implementation would make this test claim it is ignored.
-func TestServeAcknowledgesTheSettingsItDoesNotActOnYet(t *testing.T) {
+// Nothing here is deferred. Both parameters bound what a server that initiates
+// streams may do, and this server initiates none, so the list is not "not implemented
+// yet" but "there is nothing to implement". INITIAL_WINDOW_SIZE, HEADER_TABLE_SIZE and
+// MAX_HEADER_LIST_SIZE were all in this list once and each left it as it grew a route
+// to the layer that holds what it governs; a parameter left here after that would make
+// this test claim it is ignored when it is not.
+func TestServeAcknowledgesTheSettingsItHasNothingToDoAbout(t *testing.T) {
 	ts := newTestSocket(&testTarget{}).
 		script(clientHello(t,
-			frame.Setting{ID: frame.SettingHeaderTableSize, Value: 8192},
-			frame.Setting{ID: frame.SettingMaxHeaderListSize, Value: 1 << 14},
 			frame.Setting{ID: frame.SettingEnablePush, Value: 1},
 			frame.Setting{ID: frame.SettingMaxConcurrentStreams, Value: 7},
 		)).
 		atEOF()
 
 	if err := serve(t, ts, rejectingHandler(t), testTimeouts()); err != nil {
-		t.Fatalf("Serve returned %v, want nil: none of these parameters is a reason to refuse the "+
+		t.Fatalf("Serve returned %v, want nil: neither parameter is a reason to refuse the "+
 			"connection", err)
 	}
 	got := peerSaw(t, ts)
@@ -1265,6 +1290,76 @@ func TestServeAppliesInitialWindowSizeToTheStreamLayer(t *testing.T) {
 	if got := c.w.fw.MaxFrameSize(); got != 1<<15 {
 		t.Errorf("the writer's maximum frame size is %d, want the %d that followed "+
 			"INITIAL_WINDOW_SIZE in the same frame", got, 1<<15)
+	}
+}
+
+// TestServeAppliesTheHeaderSettingsToTheEncodingSide is the route the two HPACK
+// parameters had nowhere to go until there was a response encoder to receive them.
+//
+// Neither produces a frame on the wire and neither can fail, so a connection that
+// read them and dropped them would be indistinguishable from one that applied them —
+// until a response referenced a dynamic table entry the peer is not keeping, which
+// surfaces as a decoding failure on some later request and takes the whole connection
+// with it. The hook being called is the whole of the evidence, which is why the
+// handler records it.
+func TestServeAppliesTheHeaderSettingsToTheEncodingSide(t *testing.T) {
+	ts := newTestSocket(&testTarget{}).
+		script(clientHello(t,
+			frame.Setting{ID: frame.SettingHeaderTableSize, Value: 8192},
+			frame.Setting{ID: frame.SettingMaxHeaderListSize, Value: 1 << 14},
+			frame.Setting{ID: frame.SettingMaxFrameSize, Value: 1 << 15},
+		)).
+		atEOF()
+
+	h := &recordingHandler{}
+	c := newConn(ts, always(h), testTimeouts())
+	if err := awaitServe(t, serveInBackground(c)); err != nil {
+		t.Fatalf("Serve: %v", err)
+	}
+	if got := h.seenTableSizes(); len(got) != 1 || got[0] != 8192 {
+		t.Errorf("the encoding side was told table size %v, want [8192]", got)
+	}
+	if got := h.seenHeaderListSizes(); len(got) != 1 || got[0] != 1<<14 {
+		t.Errorf("the encoding side was told header list size %v, want [%d]", got, 1<<14)
+	}
+	// The parameter that followed them was still applied, so neither hook is the end
+	// of the loop.
+	if got := c.w.fw.MaxFrameSize(); got != 1<<15 {
+		t.Errorf("the writer's maximum frame size is %d, want the %d that followed the two "+
+			"header settings in the same frame", got, 1<<15)
+	}
+}
+
+// TestServeForwardsAHeaderSettingOfZero is the value easiest to mistake for no value
+// at all, and the reason neither route may test s.Value before forwarding it.
+//
+// A HEADER_TABLE_SIZE of 0 says the peer keeps no dynamic table for decoding, which is
+// how §4.2 of RFC 7541 has a table emptied; a route that skipped it would leave this
+// server compressing against entries the peer has thrown away, and the failure would
+// land on a later request rather than on this frame. A MAX_HEADER_LIST_SIZE of 0 asks
+// for a connection on which every response is too large to send, which is absurd but
+// is a thing the peer said — and it is emphatically not the same as the parameter
+// being absent, which is the state every connection starts in.
+func TestServeForwardsAHeaderSettingOfZero(t *testing.T) {
+	ts := newTestSocket(&testTarget{}).
+		script(clientHello(t,
+			frame.Setting{ID: frame.SettingHeaderTableSize, Value: 0},
+			frame.Setting{ID: frame.SettingMaxHeaderListSize, Value: 0},
+		)).
+		atEOF()
+
+	h := &recordingHandler{}
+	c := newConn(ts, always(h), testTimeouts())
+	if err := awaitServe(t, serveInBackground(c)); err != nil {
+		t.Fatalf("Serve: %v", err)
+	}
+	if got := h.seenTableSizes(); len(got) != 1 || got[0] != 0 {
+		t.Errorf("the encoding side was told table size %v, want [0]: a peer that keeps no "+
+			"dynamic table has said so and must be obeyed", got)
+	}
+	if got := h.seenHeaderListSizes(); len(got) != 1 || got[0] != 0 {
+		t.Errorf("the encoding side was told header list size %v, want [0]: zero and absent "+
+			"are different states", got)
 	}
 }
 

@@ -95,6 +95,27 @@ func encodeFields(fields ...h2.Field) []byte {
 	return []byte(strings.Join(lines, "\n"))
 }
 
+// testEncoder stands in for *response.Encoder.
+//
+// The two setters are the whole of what this package asks of an encoder, and neither
+// has a visible effect: a table size reaches a codec's dynamic table, and a list size
+// reaches a comparison made when some later response is built. Recording the calls is
+// therefore the only way to say whether a SETTINGS parameter arrived here at all,
+// which is what these two fields are for.
+//
+// No lock, for the same reason testCodec has none: both setters are called from the
+// goroutine that reads the connection's frames, which is the goroutine a test drives
+// the table from.
+type testEncoder struct {
+	// tableSizes and listSizes are every value the two setters were given, in order.
+	tableSizes []int
+	listSizes  []uint32
+}
+
+func (e *testEncoder) SetMaxDynamicTableSize(n int) { e.tableSizes = append(e.tableSizes, n) }
+
+func (e *testEncoder) SetMaxHeaderListSize(n uint32) { e.listSizes = append(e.listSizes, n) }
+
 // event is one call the table made on Requests.
 //
 // One flat type for all four calls, and one flat slice of them, because most of
@@ -192,18 +213,28 @@ type harness struct {
 	t     *testing.T
 	tab   *Table
 	codec *testCodec
+	enc   *testEncoder
 	reqs  *recorder
 	clock *testClock
 }
 
 func newHarness(t *testing.T, cfg Config) *harness {
 	t.Helper()
-	h := &harness{t: t, codec: &testCodec{}, reqs: &recorder{}, clock: newClock()}
+	h := &harness{
+		t:     t,
+		codec: &testCodec{},
+		enc:   &testEncoder{},
+		reqs:  &recorder{},
+		clock: newClock(),
+	}
 	if cfg.Codec == nil {
 		cfg.Codec = h.codec
 	}
 	if cfg.Requests == nil {
 		cfg.Requests = h.reqs
+	}
+	if cfg.Encoder == nil {
+		cfg.Encoder = h.enc
 	}
 	if cfg.Now == nil {
 		cfg.Now = h.clock.now
@@ -372,15 +403,28 @@ func (h *harness) assertBlocks(want ...string) {
 
 // --- construction ----------------------------------------------------------
 
+// The three tests below each leave out one required field and supply the other two.
+//
+// Supplying the others is what makes them separate tests rather than three copies of
+// one: assertPanics only reports whether a panic happened, so a Config missing two
+// fields panics for the first reason New checks and says nothing about the second. A
+// guard that had been dropped would still be covered by whichever guard came before it.
+
 func TestNewPanicsWithoutACodec(t *testing.T) {
 	assertPanics(t, "New with no codec", func() {
-		New(Config{Requests: &recorder{}})
+		New(Config{Requests: &recorder{}, Encoder: &testEncoder{}})
 	})
 }
 
 func TestNewPanicsWithoutRequests(t *testing.T) {
 	assertPanics(t, "New with no Requests", func() {
-		New(Config{Codec: &testCodec{}})
+		New(Config{Codec: &testCodec{}, Encoder: &testEncoder{}})
+	})
+}
+
+func TestNewPanicsWithoutAnEncoder(t *testing.T) {
+	assertPanics(t, "New with no Encoder", func() {
+		New(Config{Codec: &testCodec{}, Requests: &recorder{}})
 	})
 }
 
@@ -424,7 +468,7 @@ func TestNewDefaultsTheClockToTimeNow(t *testing.T) {
 	// from it during New. A missing default is therefore not a wrong clock but a
 	// nil call in the constructor, which is why this is worth its own test rather
 	// than being left to the tests that inject one.
-	tab := New(Config{Codec: &testCodec{}, Requests: &recorder{}})
+	tab := New(Config{Codec: &testCodec{}, Requests: &recorder{}, Encoder: &testEncoder{}})
 	if err := tab.HandleFrame(request(1, false)); err != nil {
 		t.Fatalf("opening a stream on a table with the default clock: %v", err)
 	}
@@ -1525,6 +1569,111 @@ func TestSetInitialWindowSizeWithNoStreamsOpenIsRemembered(t *testing.T) {
 	// would have done.
 	if got := h.sendAvailable(1); got != 9 {
 		t.Errorf("send window is %d, want 9", got)
+	}
+}
+
+// --- the peer's two header settings ----------------------------------------
+
+func TestSetHeaderTableSizeReachesTheEncoder(t *testing.T) {
+	// HPACK's own default, which is what a browser's SETTINGS carries and is well
+	// under this server's bound, so nothing here is doing anything but passing the
+	// value along.
+	h := newHarness(t, Config{})
+	h.tab.SetHeaderTableSize(4096)
+	if got := h.enc.tableSizes; len(got) != 1 || got[0] != 4096 {
+		t.Errorf("the encoder was told table sizes %v, want [4096]", got)
+	}
+}
+
+func TestSetHeaderTableSizeIsAMinimumAndNotAClamp(t *testing.T) {
+	// The direction of the bound is the whole of what this test is about. A peer that
+	// offers more encoding context than this server wants is offering, and declining
+	// is free. A peer that offers less is stating what its own decoder will keep, and
+	// there is nothing to decline: an encoder that used indices past the end of the
+	// peer's table would produce field lines nobody sent.
+	//
+	// So MaxEncoderTableSize may only lower the value, never raise it, and the two
+	// rows below the bound are the ones that would catch a clamp into a range.
+	for _, tc := range []struct {
+		what string
+		sent uint32
+		want int
+	}{
+		{"nothing at all, which empties the table", 0, 0},
+		{"less than HPACK's default", 512, 512},
+		{"HPACK's default", 4096, 4096},
+		{"one octet under the bound", limits.MaxEncoderTableSize - 1, limits.MaxEncoderTableSize - 1},
+		{"exactly the bound", limits.MaxEncoderTableSize, limits.MaxEncoderTableSize},
+		{"one octet over the bound", limits.MaxEncoderTableSize + 1, limits.MaxEncoderTableSize},
+		{"four gigabytes, which is legal", 1<<32 - 1, limits.MaxEncoderTableSize},
+	} {
+		t.Run(tc.what, func(t *testing.T) {
+			h := newHarness(t, Config{})
+			h.tab.SetHeaderTableSize(tc.sent)
+			if got := h.enc.tableSizes; len(got) != 1 || got[0] != tc.want {
+				t.Errorf("a peer's SETTINGS_HEADER_TABLE_SIZE of %d reached the encoder as %v, want [%d]",
+					tc.sent, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestSetHeaderTableSizeLeavesTheDecodingCodecAlone(t *testing.T) {
+	// HPACK runs as two independent tables, and this is the guard against the two
+	// being crossed. The codec and the encoder both have a SetMaxDynamicTableSize, so
+	// sending the peer's setting to the codec compiles and would silently resize the
+	// table this connection *decodes* the peer's requests against — a table the peer
+	// sized by our own SETTINGS, not by theirs. The symptom would be indices resolving
+	// to the wrong field lines somewhere in a later request.
+	h := newHarness(t, Config{})
+	h.tab.SetHeaderTableSize(8192)
+	if got := h.codec.tableSizes; len(got) != 0 {
+		t.Errorf("the decoding codec was resized to %v by a setting that governs the "+
+			"encoding direction", got)
+	}
+}
+
+func TestSetMaxHeaderListSizeReachesTheEncoderWhole(t *testing.T) {
+	// Unbounded, unlike the table size, and deliberately: this one is a ceiling the
+	// peer put on what it is willing to read, and nothing here is allocated on the
+	// strength of it. Whatever the peer says is what the encoder gets, including the
+	// two values most likely to be dropped on the way — 0, which is a peer refusing
+	// header lists outright and is not the same as the parameter being absent, and
+	// 2^32-1, which a bound copied from the table size would cut down.
+	for _, tc := range []struct {
+		what string
+		sent uint32
+	}{
+		{"nothing at all", 0},
+		{"a byte", 1},
+		{"what a browser sends", 1 << 14},
+		{"past the encoder table bound", limits.MaxEncoderTableSize + 1},
+		{"the largest value the parameter holds", 1<<32 - 1},
+	} {
+		t.Run(tc.what, func(t *testing.T) {
+			h := newHarness(t, Config{})
+			h.tab.SetMaxHeaderListSize(tc.sent)
+			if got := h.enc.listSizes; len(got) != 1 || got[0] != tc.sent {
+				t.Errorf("a peer's SETTINGS_MAX_HEADER_LIST_SIZE of %d reached the encoder as %v, want [%d]",
+					tc.sent, got, tc.sent)
+			}
+		})
+	}
+}
+
+func TestTheTwoHeaderSettingsAreNotCrossed(t *testing.T) {
+	// Both take a size, both are forwarded from the same switch in internal/server,
+	// and both setters here are one line long. Swapping them compiles. This sends two
+	// values that cannot be mistaken for each other and checks each landed where it
+	// was addressed.
+	h := newHarness(t, Config{})
+	h.tab.SetHeaderTableSize(4096)
+	h.tab.SetMaxHeaderListSize(1 << 14)
+	if got := h.enc.tableSizes; len(got) != 1 || got[0] != 4096 {
+		t.Errorf("the encoder's table sizes are %v, want [4096]", got)
+	}
+	if got := h.enc.listSizes; len(got) != 1 || got[0] != 1<<14 {
+		t.Errorf("the encoder's header list sizes are %v, want [%d]", got, 1<<14)
 	}
 }
 

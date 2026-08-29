@@ -9,8 +9,8 @@ import (
 	"zerodeps/zdh/internal/limits"
 )
 
-// Config configures a Table. Codec and Requests are required; everything else
-// takes a documented default.
+// Config configures a Table. Codec, Requests and Encoder are required; everything
+// else takes a documented default.
 type Config struct {
 	// Codec is the connection's HPACK decoder for the peer's direction. It is
 	// driven in strict frame arrival order and must not be shared with another
@@ -19,6 +19,17 @@ type Config struct {
 
 	// Requests receives the decoded requests.
 	Requests Requests
+
+	// Encoder is the response-encoding half of this connection, and is here because
+	// two of the peer's SETTINGS parameters govern it and arrive as frames this table
+	// is given.
+	//
+	// Necessarily built over a different codec from Codec above. HPACK's two
+	// directions are two tables with two histories — the one Codec drives is built
+	// from what the peer sent us, and the encoder's from what we sent it — so a single
+	// codec driven by both would answer each direction's index lookups with the
+	// other's entries, and the symptom would be field lines nobody sent.
+	Encoder Encoder
 
 	// MaxConcurrent is the SETTINGS_MAX_CONCURRENT_STREAMS this connection
 	// advertised. Zero takes limits.MaxConcurrentStreams.
@@ -48,14 +59,39 @@ type Config struct {
 	Sender *flow.Sender
 }
 
+// Encoder is the response-encoding half of this connection as this table needs it:
+// the two things a peer's SETTINGS frame can change about the way responses are
+// compressed, and nothing else.
+//
+// Declared here rather than imported, which is this module's convention wherever the
+// dependency would otherwise point the wrong way — internal/response declares its own
+// Transport and Credit for the same reason. *response.Encoder is this method set
+// exactly, so it satisfies this by construction and neither package imports the
+// other; and a test can record what the two setters were given, which is the whole of
+// what there is to observe about a parameter that puts no frame on the wire.
+type Encoder interface {
+	// SetMaxDynamicTableSize applies the peer's SETTINGS_HEADER_TABLE_SIZE to the
+	// HPACK context responses are encoded against. An int rather than the uint32 the
+	// setting arrives in, because the codec's own method takes one — see
+	// h2.HeaderCodec.
+	SetMaxDynamicTableSize(n int)
+
+	// SetMaxHeaderListSize applies the peer's SETTINGS_MAX_HEADER_LIST_SIZE: the
+	// largest field list, by §6.5.2's accounting, a response may carry.
+	SetMaxHeaderListSize(n uint32)
+}
+
 // Table is the stream table for one connection.
 //
 // It satisfies internal/server's stream-handler interface: HandleFrame for the
-// frames that name a stream, and ConnWindowUpdate and SetInitialWindowSize for
-// the two connection-level frames whose effect is entirely on streams.
+// frames that name a stream, ConnWindowUpdate and SetInitialWindowSize for the two
+// connection-level frames whose effect is entirely on streams, and
+// SetHeaderTableSize and SetMaxHeaderListSize for the two SETTINGS parameters whose
+// effect is entirely on the responses this connection encodes.
 type Table struct {
 	codec h2.HeaderCodec
 	reqs  Requests
+	enc   Encoder
 	now   func() time.Time
 
 	maxConcurrent uint32
@@ -140,16 +176,19 @@ type block struct {
 
 // New returns a stream table.
 //
-// A missing codec or Requests panics, at construction. Both are dereferenced on
-// the first request of the connection, so the alternative is the same bug
-// reported later, from the reader goroutine, with a peer's traffic in the stack
-// trace.
+// A missing codec, Requests or Encoder panics, at construction. All three are
+// dereferenced on the first request of the connection — or, for the encoder, on the
+// peer's first SETTINGS frame — so the alternative is the same bug reported later,
+// from the reader goroutine, with a peer's traffic in the stack trace.
 func New(cfg Config) *Table {
 	if cfg.Codec == nil {
 		panic("stream: New requires a header codec")
 	}
 	if cfg.Requests == nil {
 		panic("stream: New requires a Requests")
+	}
+	if cfg.Encoder == nil {
+		panic("stream: New requires a response encoder")
 	}
 	if cfg.MaxConcurrent == 0 {
 		cfg.MaxConcurrent = limits.MaxConcurrentStreams
@@ -163,6 +202,7 @@ func New(cfg Config) *Table {
 	return &Table{
 		codec:         cfg.Codec,
 		reqs:          cfg.Requests,
+		enc:           cfg.Encoder,
 		now:           cfg.Now,
 		maxConcurrent: cfg.MaxConcurrent,
 		streams:       make(map[uint32]*Stream),
@@ -314,6 +354,41 @@ func (t *Table) ConnWindowUpdate(increment uint32) error {
 // over at once.
 func (t *Table) SetInitialWindowSize(n uint32) error {
 	return t.sender.SetInitialSize(n)
+}
+
+// SetHeaderTableSize applies the peer's SETTINGS_HEADER_TABLE_SIZE (§6.5.2) to the
+// HPACK context this connection's responses are compressed against.
+//
+// Bounded by limits.MaxEncoderTableSize, where the reasoning is: the parameter has no
+// upper bound of its own, so a peer may ask for four gigabytes of encoding context in
+// one SETTINGS entry, and §4.2 of RFC 7541 lets an encoder use less table than it is
+// offered as long as it says which.
+//
+// The bound is a minimum and so only ever lowers the value. That direction matters:
+// a peer keeping a smaller table than the default, or none at all, is the party that
+// will decode our indices, so it is obeyed rather than weighed — an encoder referring
+// to entries the decoder has discarded produces field lines nobody sent, on every
+// later response of the connection.
+//
+// No error, because no value a peer can legally send is one this cannot apply. See
+// the interface this satisfies, in internal/server.
+func (t *Table) SetHeaderTableSize(n uint32) {
+	t.enc.SetMaxDynamicTableSize(int(min(n, limits.MaxEncoderTableSize)))
+}
+
+// SetMaxHeaderListSize applies the peer's SETTINGS_MAX_HEADER_LIST_SIZE (§6.5.2): the
+// largest field list, by that section's accounting, this connection's responses may
+// carry from now on.
+//
+// Forwarded whole, with no bound of our own, and the asymmetry with the method above
+// is the point. That one bounds a table this server allocates, so it is our memory to
+// protect; this one bounds a list the peer is willing to read, nothing here is
+// allocated on the strength of it, and a value we quietly raised would buy a response
+// the peer is entitled to refuse after the bandwidth has been spent on it. A peer that
+// sets it to zero has asked for a connection on which every response is too large to
+// send, which is absurd and is still its own business.
+func (t *Table) SetMaxHeaderListSize(n uint32) {
+	t.enc.SetMaxHeaderListSize(n)
 }
 
 // headers begins a header block, either opening a stream or starting a trailer
