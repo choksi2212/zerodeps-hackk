@@ -1,0 +1,13 @@
+# RFC 7541 Appendix C.3 — request sequence without Huffman coding.
+# Three requests decoded through the same codec, in order. Each line is one
+# header block as ASCII hex (never raw binary — see .gitattributes and
+# STDLIB.md). Verified byte-exact against the codec in hpack_test.go.
+
+# C.3.1 First request: :method GET, :scheme http, :path /, :authority www.example.com
+828684410f7777772e6578616d706c652e636f6d
+
+# C.3.2 Second request: adds cache-control: no-cache
+828684be58086e6f2d6361636865
+
+# C.3.3 Third request: :scheme https, :path /index.html, custom-key: custom-value
+828785bf400a637573746f6d2d6b65790c637573746f6d2d76616c7565

@@ -1,0 +1,10 @@
+# RFC 7541 Appendix C.4 — same three requests as C.3, Huffman-coded.
+
+# C.4.1
+828684418cf1e3c2e5f23a6ba0ab90f4ff
+
+# C.4.2
+828684be5886a8eb10649cbf
+
+# C.4.3
+828785bf408825a849e95ba97d7f8925a849e95bb8e8b4bf
