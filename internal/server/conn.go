@@ -43,6 +43,29 @@ type connSocket interface {
 // answering the peer's PINGs and noticing its GOAWAY.
 type streamHandler interface {
 	HandleFrame(f frame.Frame) error
+
+	// ConnWindowUpdate applies a stream-0 WINDOW_UPDATE (§6.9).
+	//
+	// A stream-0 frame is the connection's, so it is read here — but the window it
+	// credits is spent by streams sending response bodies, and it is only useful
+	// alongside the per-stream windows. Splitting a counter across two packages
+	// makes the half that is never spent look maintained when it is not, so the
+	// whole of flow control lives on the other side of this interface and the
+	// connection forwards.
+	//
+	// The alternative, routing stream 0 through HandleFrame, would make the stream
+	// layer grow a special case for a stream that is not one. That is where flow
+	// control gets tangled up with the stream table in every implementation that
+	// has tried it.
+	ConnWindowUpdate(increment uint32) error
+
+	// SetInitialWindowSize applies the peer's SETTINGS_INITIAL_WINDOW_SIZE
+	// (§6.9.2).
+	//
+	// Here for the same reason, and more so: §6.9.2 makes the change a delta
+	// against every window that is already open, which cannot be applied by
+	// anything that does not hold them all.
+	SetInitialWindowSize(n uint32) error
 }
 
 // The four ways a connection ends with nobody at fault.
@@ -578,8 +601,15 @@ func (c *conn) handleSettings(f frame.SettingsFrame) error {
 	// §6.5 requires the values to be in force before the acknowledgement is sent,
 	// because the acknowledgement is the peer's licence to assume they are. Hence
 	// the loop before the Enqueue, and not the other way round.
+	//
+	// A parameter that cannot be applied stops the loop and no acknowledgement is
+	// sent, which is the only honest answer: the failure is a connection error, so
+	// there is no connection left for the peer to assume anything about, and an ACK
+	// followed by a GOAWAY would tell it the settings took effect first.
 	for _, s := range f.Settings {
-		c.applySetting(s)
+		if err := c.applySetting(s); err != nil {
+			return err
+		}
 	}
 	return c.w.Enqueue(frame.SettingsFrame{Ack: true})
 }
@@ -591,7 +621,12 @@ func (c *conn) handleSettings(f frame.SettingsFrame) error {
 // TestApplySettingNamesEverySettingID fails if an identifier is added to the
 // frame package and not accounted for here. An unknown identifier is ignored, as
 // §6.5.2 requires — the extension mechanism depends on it.
-func (c *conn) applySetting(s frame.Setting) {
+//
+// Only one parameter can fail to apply, and the error is never about the value
+// itself: the frame layer has already range-checked every setting §6.5.2 gives
+// bounds for. It is about what applying a legal value does to state this
+// connection already holds. See SettingInitialWindowSize.
+func (c *conn) applySetting(s frame.Setting) error {
 	switch s.ID {
 	case frame.SettingMaxFrameSize:
 		// The largest payload we may send from now on. Safe to set while the
@@ -613,12 +648,20 @@ func (c *conn) applySetting(s frame.Setting) {
 		// obeyed or disobeyed until this connection sends a response.
 
 	case frame.SettingInitialWindowSize:
-		// internal/flow's, and it is the awkward one: §6.9.2 requires the change
-		// to be applied to every open stream's window as a delta, not just to
-		// streams opened afterwards, and a change that pushes a window negative
-		// is legal and must be tolerated. There are no streams and no windows on
-		// this branch, so there is nothing to adjust yet.
+		// The awkward one, and the reason streamHandler has a method for it.
+		// §6.9.2 requires the change to be applied to every open stream's window
+		// as a delta rather than only to streams opened afterwards, and a change
+		// that pushes a window negative is legal and has to be carried. Neither is
+		// something this file can do: it holds no windows and no streams.
+		//
+		// The value has already been range-checked. frame.parseSettings rejects a
+		// value above 2^31-1 as a connection error of type FLOW_CONTROL_ERROR
+		// (§6.5.2), so what arrives here is a size some window can legally hold —
+		// which is not the same as one *every* window can, and the delta
+		// overflowing an individual stream is the error the handler returns.
+		return c.handler.SetInitialWindowSize(s.Value)
 	}
+	return nil
 }
 
 // handlePing answers the peer's PING. This is matrix row 24.
@@ -646,20 +689,18 @@ func (c *conn) handlePing(f frame.PingFrame) error {
 
 // handleConnectionWindowUpdate credits the connection-level flow-control window.
 //
-// The window itself is internal/flow's, and so are matrix rows 30 and 31: a
-// WINDOW_UPDATE that takes a window above 2^31-1 is a FLOW_CONTROL_ERROR, at the
-// connection level for stream 0 and at the stream level otherwise. Nothing on this
-// branch sends DATA, so there is no window yet to credit or to overflow, and
-// tracking one here would mean two packages owning the same counter — the version
-// that is never spent looks maintained and is not.
+// This is matrix rows 30 and 31, and the enforcement is two packages away: the
+// window is internal/flow's, held by the stream layer, and it is that package
+// which decides an increment taking a window above 2^31-1 is a FLOW_CONTROL_ERROR
+// — at connection scope for stream 0, at stream scope otherwise, because a window
+// there knows its own identifier. Nothing about the scope is decided here, which
+// is the point: this function cannot get it wrong.
 //
-// The parameter is unused and named so, rather than the routing being left out
-// until there is a window: a stream-0 frame has no stream to hand it to, and the
-// alternative to absorbing it here is the stream layer growing a special case for
-// stream zero, which is where flow control gets tangled up with the stream table
-// in every implementation that has done it that way.
-func (c *conn) handleConnectionWindowUpdate(_ frame.WindowUpdateFrame) error {
-	return nil
+// Absorbed at this level rather than routed through HandleFrame because a
+// stream-0 frame has no stream to hand it to, and the alternative is the stream
+// table growing a special case for stream zero. See streamHandler.
+func (c *conn) handleConnectionWindowUpdate(f frame.WindowUpdateFrame) error {
+	return c.handler.ConnWindowUpdate(f.Increment)
 }
 
 // handleStreamFrame hands a frame to the stream layer.

@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"zerodeps/zdh/internal/flow"
 	"zerodeps/zdh/internal/frame"
 	"zerodeps/zdh/internal/h2"
 	"zerodeps/zdh/internal/limits"
@@ -187,9 +188,17 @@ func (ts *testSocket) pendingLen() int {
 }
 
 // handlerFunc adapts a function to streamHandler.
+//
+// The two connection-level hooks answer nil. A double built to observe frame
+// dispatch has nothing to say about flow control, and answering them with a
+// failure instead would make every dispatch test that happens to carry a
+// stream-0 WINDOW_UPDATE fail for a reason it is not about. recordingHandler is
+// the double that watches them.
 type handlerFunc func(frame.Frame) error
 
-func (h handlerFunc) HandleFrame(f frame.Frame) error { return h(f) }
+func (h handlerFunc) HandleFrame(f frame.Frame) error   { return h(f) }
+func (h handlerFunc) ConnWindowUpdate(uint32) error     { return nil }
+func (h handlerFunc) SetInitialWindowSize(uint32) error { return nil }
 
 // recordingHandler keeps every frame it is given and returns err for each.
 //
@@ -200,6 +209,18 @@ type recordingHandler struct {
 	mu     sync.Mutex
 	frames []frame.Frame
 	err    error
+
+	// increments and initialWindows record the two connection-level hooks, which
+	// are the only evidence that a stream-0 WINDOW_UPDATE and a
+	// SETTINGS_INITIAL_WINDOW_SIZE were routed at all: neither produces a frame
+	// on the wire, so a connection that dropped them would look identical to one
+	// that applied them.
+	increments    []uint32
+	initialWindow []uint32
+
+	// hookErr is what those two hooks return, kept apart from err so that a test
+	// can fail one without failing frame dispatch.
+	hookErr error
 }
 
 func (h *recordingHandler) HandleFrame(f frame.Frame) error {
@@ -208,6 +229,34 @@ func (h *recordingHandler) HandleFrame(f frame.Frame) error {
 	err := h.err
 	h.mu.Unlock()
 	return err
+}
+
+func (h *recordingHandler) ConnWindowUpdate(increment uint32) error {
+	h.mu.Lock()
+	h.increments = append(h.increments, increment)
+	err := h.hookErr
+	h.mu.Unlock()
+	return err
+}
+
+func (h *recordingHandler) SetInitialWindowSize(n uint32) error {
+	h.mu.Lock()
+	h.initialWindow = append(h.initialWindow, n)
+	err := h.hookErr
+	h.mu.Unlock()
+	return err
+}
+
+func (h *recordingHandler) seenIncrements() []uint32 {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return append([]uint32(nil), h.increments...)
+}
+
+func (h *recordingHandler) seenInitialWindows() []uint32 {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return append([]uint32(nil), h.initialWindow...)
 }
 
 func (h *recordingHandler) seen() []frame.Frame {
@@ -532,6 +581,28 @@ func TestApplySettingNamesEverySettingID(t *testing.T) {
 	}
 }
 
+// TestInitialSettingsDoesNotSetTheInitialWindowSize is the other side of a decision
+// internal/stream depends on, and it is named from a comment there.
+//
+// A stream's receive window is created at flow.InitialWindowSize because that is what
+// §6.9.2 says a peer must assume in the absence of the parameter. Advertising a
+// different value here without the stream table following it would grant a client
+// credit no window holds — it would send that much, and the connection would end with
+// a FLOW_CONTROL_ERROR the client had done nothing to deserve. The two have to agree,
+// and the cheapest way to make them agree is for neither to have a value to get
+// wrong.
+//
+// TestInitialSettingsAdvertiseTheServersLimits already pins the parameter count, so
+// this would fail there too. It exists to say why, at the place a reader looking for
+// the missing parameter would come.
+func TestInitialSettingsDoesNotSetTheInitialWindowSize(t *testing.T) {
+	if v, ok := initialSettings().Get(frame.SettingInitialWindowSize); ok {
+		t.Errorf("the server's SETTINGS advertises INITIAL_WINDOW_SIZE = %d; internal/stream sizes "+
+			"every stream receive window at %d and has no way to learn otherwise, so the two would "+
+			"disagree by %d octets per stream", v, flow.InitialWindowSize, int64(v)-flow.InitialWindowSize)
+	}
+}
+
 // --- the preface -------------------------------------------------------------
 
 // TestServeSendsItsSettingsBeforeReadingThePreface is §3.4 from the server's side,
@@ -769,16 +840,19 @@ func TestServeAppliesSettingsBeforeAcknowledging(t *testing.T) {
 // TestServeAcknowledgesTheSettingsItDoesNotActOnYet is the connection's obligation
 // towards parameters whose enforcement lives in another package.
 //
-// HEADER_TABLE_SIZE and MAX_HEADER_LIST_SIZE are internal/hpack's and
-// INITIAL_WINDOW_SIZE is internal/flow's. Until those exist the values are recorded
-// nowhere — but §6.5 does not permit a parameter to go unacknowledged, and a peer
-// waiting for an acknowledgement that never comes stalls the connection. Ignoring a
-// parameter and refusing it are different things.
+// HEADER_TABLE_SIZE and MAX_HEADER_LIST_SIZE are internal/hpack's, and until it
+// exists the values are recorded nowhere — but §6.5 does not permit a parameter to
+// go unacknowledged, and a peer waiting for an acknowledgement that never comes
+// stalls the connection. Ignoring a parameter and refusing it are different things.
+//
+// INITIAL_WINDOW_SIZE used to belong here and no longer does: it reaches the stream
+// layer through streamHandler.SetInitialWindowSize, which
+// TestServeAppliesInitialWindowSizeToTheStreamLayer covers. A parameter left in this
+// list after it grew an implementation would make this test claim it is ignored.
 func TestServeAcknowledgesTheSettingsItDoesNotActOnYet(t *testing.T) {
 	ts := newTestSocket(&testTarget{}).
 		script(clientHello(t,
 			frame.Setting{ID: frame.SettingHeaderTableSize, Value: 8192},
-			frame.Setting{ID: frame.SettingInitialWindowSize, Value: 1 << 20},
 			frame.Setting{ID: frame.SettingMaxHeaderListSize, Value: 1 << 14},
 			frame.Setting{ID: frame.SettingEnablePush, Value: 1},
 			frame.Setting{ID: frame.SettingMaxConcurrentStreams, Value: 7},
@@ -1089,6 +1163,11 @@ func TestServeHandsStreamFramesToTheHandler(t *testing.T) {
 // connection, not a stream, so a WINDOW_UPDATE on it has no stream to be handed to.
 // Routing it to the stream layer anyway is how flow control ends up entangled with
 // the stream table.
+//
+// Both halves are asserted. Without the increment the test would pass on a server
+// that dropped the frame entirely, which is the same bug in the other direction: the
+// connection's send window would never grow and every response would stall at 65535
+// octets.
 func TestServeKeepsAStreamZeroWindowUpdateFromTheHandler(t *testing.T) {
 	ts := newTestSocket(&testTarget{}).
 		script(append(clientHello(t), encodeFrames(t,
@@ -1109,6 +1188,101 @@ func TestServeKeepsAStreamZeroWindowUpdateFromTheHandler(t *testing.T) {
 	}
 	if wu, ok := got[0].(frame.WindowUpdateFrame); !ok || wu.StreamID != 1 {
 		t.Errorf("the handler saw %#v, want the WINDOW_UPDATE on stream 1", got[0])
+	}
+
+	incs := h.seenIncrements()
+	if len(incs) != 1 || incs[0] != 65535 {
+		t.Errorf("the connection window was credited %v, want [65535]: the stream-0 WINDOW_UPDATE "+
+			"must reach ConnWindowUpdate rather than be discarded", incs)
+	}
+}
+
+// TestServeReportsARefusedConnectionWindowUpdate is the other outcome of the same
+// route. §6.9.1 caps a window at 2^31-1 and makes exceeding it a connection error of
+// type FLOW_CONTROL_ERROR, and the layer that holds the window is the only one that
+// can tell — so the connection's job is to carry the verdict back unchanged rather
+// than to have an opinion about it.
+func TestServeReportsARefusedConnectionWindowUpdate(t *testing.T) {
+	ts := newTestSocket(&testTarget{}).
+		script(append(clientHello(t), encodeFrames(t,
+			frame.WindowUpdateFrame{StreamID: 0, Increment: 1 << 30},
+			// Never reached: the connection ends on the frame above.
+			ping(5),
+		)...)).
+		atEOF()
+
+	h := &recordingHandler{hookErr: h2.ConnErrorf(h2.FlowControlError, "window would exceed 2^31-1")}
+	err := serve(t, ts, h, testTimeouts())
+	if ce := connErrorOf(t, err); ce.Code != h2.FlowControlError {
+		t.Errorf("Serve returned %s, want the FLOW_CONTROL_ERROR the handler reported", ce.Code)
+	}
+	if ga := goAwayIn(t, peerSaw(t, ts)); ga.ErrCode != h2.FlowControlError {
+		t.Errorf("the GOAWAY carries %s, want FLOW_CONTROL_ERROR", ga.ErrCode)
+	}
+}
+
+// TestServeAppliesInitialWindowSizeToTheStreamLayer is §6.9.2's other half. The
+// parameter is a delta against every stream window already open, which nothing that
+// does not hold them all can apply — so the connection reads the value and hands it
+// on, and the arithmetic belongs to internal/stream.
+func TestServeAppliesInitialWindowSizeToTheStreamLayer(t *testing.T) {
+	ts := newTestSocket(&testTarget{}).
+		script(clientHello(t,
+			frame.Setting{ID: frame.SettingInitialWindowSize, Value: 1 << 20},
+			frame.Setting{ID: frame.SettingMaxFrameSize, Value: 1 << 15},
+		)).
+		atEOF()
+
+	h := &recordingHandler{}
+	c := newConn(ts, h, testTimeouts())
+	if err := awaitServe(t, serveInBackground(c)); err != nil {
+		t.Fatalf("Serve: %v", err)
+	}
+	sizes := h.seenInitialWindows()
+	if len(sizes) != 1 || sizes[0] != 1<<20 {
+		t.Fatalf("the stream layer was told %v, want [%d]", sizes, 1<<20)
+	}
+	// The parameter after it was still applied, so the hook is a step in the loop
+	// rather than the end of it.
+	if got := c.w.fw.MaxFrameSize(); got != 1<<15 {
+		t.Errorf("the writer's maximum frame size is %d, want the %d that followed "+
+			"INITIAL_WINDOW_SIZE in the same frame", got, 1<<15)
+	}
+}
+
+// TestServeStopsOnASettingItCannotApply is the failure path §6.5 leaves implicit: an
+// acknowledgement is the peer's licence to assume every parameter in the frame took
+// effect, so a parameter that could not be applied must stop the loop and go
+// unacknowledged. Acknowledging and then sending a GOAWAY would tell the peer the
+// settings were in force first, and it is entitled to have acted on that.
+func TestServeStopsOnASettingItCannotApply(t *testing.T) {
+	ts := newTestSocket(&testTarget{}).
+		script(clientHello(t,
+			frame.Setting{ID: frame.SettingInitialWindowSize, Value: 1 << 20},
+			frame.Setting{ID: frame.SettingMaxFrameSize, Value: 1 << 15},
+		)).
+		atEOF()
+
+	h := &recordingHandler{hookErr: h2.ConnErrorf(h2.FlowControlError, "a stream window would overflow")}
+	c := newConn(ts, h, testTimeouts())
+	err := awaitServe(t, serveInBackground(c))
+	if ce := connErrorOf(t, err); ce.Code != h2.FlowControlError {
+		t.Errorf("Serve returned %s, want the FLOW_CONTROL_ERROR the stream layer reported", ce.Code)
+	}
+
+	got := peerSaw(t, ts)
+	for _, f := range got {
+		if s, ok := f.(frame.SettingsFrame); ok && s.Ack {
+			t.Errorf("the peer received %s: a SETTINGS whose parameter could not be applied was "+
+				"acknowledged anyway", describe(got))
+		}
+	}
+	if ga := goAwayIn(t, got); ga.ErrCode != h2.FlowControlError {
+		t.Errorf("the GOAWAY carries %s, want FLOW_CONTROL_ERROR", ga.ErrCode)
+	}
+	// The parameter behind the failure was not applied either: the loop stopped.
+	if got := c.w.fw.MaxFrameSize(); got == 1<<15 {
+		t.Errorf("MAX_FRAME_SIZE was applied after an earlier parameter in the same frame failed")
 	}
 }
 
