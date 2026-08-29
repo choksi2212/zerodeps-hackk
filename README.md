@@ -26,7 +26,7 @@ This section is kept honest as the build proceeds; nothing is claimed here befor
 | TLS 1.2/1.3, ALPN, RFC 9113 §9.2 cipher policy | working — 24 tests, and 31 guards each observed failing |
 | The server itself (`cmd/zdh`) | working — 20 tests, and 29 guards each observed failing; the only end-to-end coverage in the module |
 | Browser demo | working — `public/`, and the browser's own `window.performance` numbers in [docs/demo.png](docs/demo.png): 64 requests, all `h2`, zero connections opened |
-| h2spec conformance score | not yet run |
+| h2spec conformance score | **147 tests, 147 passed, 0 failed** on `--strict` — the transcript is [docs/H2SPEC.md](docs/H2SPEC.md) |
 
 Every count above is a top-level test function, which is what `go test -list '.*' ./...` prints: a table-driven test counts once rather than once per case, so the number is one command away from being checked rather than one convention away from being argued about.
 
