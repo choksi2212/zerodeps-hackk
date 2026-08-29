@@ -107,6 +107,47 @@ func TestASecondHeaderSectionIsRefused(t *testing.T) {
 	}
 }
 
+func TestAHeaderSectionThatFailedHalfwayIsNotRetried(t *testing.T) {
+	// writeSection can fail with the HEADERS frame already queued and its CONTINUATION
+	// frames not, which §6.10 leaves as a stream nothing can finish. What must not happen
+	// on top of that is a second header section: a handler that saw the error and tried
+	// again would put one field block's fragments behind another's, and §8.1 says "Other
+	// frames (from any stream) MUST NOT occur between the HEADERS frame and any
+	// CONTINUATION frames that might follow" — so one stream's retry would end the
+	// connection for every other stream on it.
+	//
+	// This is what the response being latched before the enqueue rather than after it
+	// buys, and it is the only thing it buys.
+	want := errors.New("the write half has stopped")
+
+	enc, c, tr := newEncoder()
+	c.block = func(int, []h2.Field) []byte { return filler(2*maxFrame+1, 'x') }
+	tr.refuse = func(n int, _ frame.Frame) error {
+		if n == 2 {
+			return want
+		}
+		return nil
+	}
+	w := NewWriter(enc, &fakeCredit{}, 1)
+
+	if err := w.WriteHeader(okFields()); !errors.Is(err, want) {
+		t.Fatalf("WriteHeader: %v, want %v", err, want)
+	}
+	before := len(tr.taken())
+	if before != 2 {
+		t.Fatalf("%d frames queued before the refusal, want 2", before)
+	}
+
+	if err := w.WriteHeader(okFields()); !errors.Is(err, ErrHeaderWritten) {
+		t.Errorf("WriteHeader after a burst that failed halfway: %v, want %v",
+			err, ErrHeaderWritten)
+	}
+	if got := len(tr.taken()); got != before {
+		t.Errorf("the retry put %d more frames on the wire behind a field block that has "+
+			"no END_HEADERS", got-before)
+	}
+}
+
 func TestNothingFollowsTheFrameThatEndedTheStream(t *testing.T) {
 	// Three ways to end a response and four things a handler might do afterwards. Each
 	// combination is a handler that thinks it still has a stream, and the frame that would
@@ -876,6 +917,54 @@ func TestARefusedTrailerSectionLeavesTheStreamOpen(t *testing.T) {
 	}
 	if d := fs[1].(frame.DataFrame); !d.EndStream {
 		t.Errorf("the recovering Close did not end the stream")
+	}
+}
+
+func TestATrailerSectionThatFailedHalfwayIsNotRetried(t *testing.T) {
+	// The other half of the rule the test above asserts, and the reason a refused trailer
+	// section and a half-sent one are not the same event. A refusal sends nothing, so the
+	// response is unfinished and may still be ended. A burst that failed partway has
+	// already put a HEADERS frame bearing END_STREAM on the queue, so the response is over
+	// whatever happened to the rest of it — and a handler that saw the error and tried
+	// again would send a second field block behind the first one's fragments, which §8.1
+	// makes a connection error rather than a second chance.
+	want := errors.New("the write half has stopped")
+
+	w, c, tr, _ := newWriter()
+	c.block = func(n int, _ []h2.Field) []byte {
+		if n == 0 {
+			return []byte("the header section, in one frame\n")
+		}
+		return filler(2*maxFrame+1, 'x')
+	}
+	tr.refuse = func(n int, _ frame.Frame) error {
+		if n == 3 {
+			return want
+		}
+		return nil
+	}
+
+	if err := w.WriteHeader(okFields()); err != nil {
+		t.Fatalf("WriteHeader: %v", err)
+	}
+	trailer := []h2.Field{{Name: "grpc-status", Value: "0"}}
+	if err := w.Trailers(trailer); !errors.Is(err, want) {
+		t.Fatalf("Trailers: %v, want %v", err, want)
+	}
+	before := len(tr.taken())
+	if before != 3 {
+		t.Fatalf("%d frames queued before the refusal, want 3", before)
+	}
+
+	if err := w.Trailers(trailer); !errors.Is(err, ErrDone) {
+		t.Errorf("Trailers after a burst that failed halfway: %v, want %v", err, ErrDone)
+	}
+	if err := w.Close(); err != nil {
+		t.Errorf("Close after a burst that failed halfway: %v, want nil", err)
+	}
+	if got := len(tr.taken()); got != before {
+		t.Errorf("%d more frames on the wire behind a field block that has no END_HEADERS",
+			got-before)
 	}
 }
 

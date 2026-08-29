@@ -1,11 +1,12 @@
 """Deliberately break internal/response, one guard at a time, and report which tests
 notice.
 
-Two files, one package: encoder.go turns a field list into frames and fields.go decides
-whether the field list may be sent at all. Each entry below removes exactly one guard
-from one of them and names the tests that must fail as a result. See breakage.py for
-the harness, for how a break finds the file it belongs to, and for what the five
-outcomes mean.
+Three files, one package: encoder.go turns a field list into frames, fields.go decides
+whether the field list may be sent at all, and writer.go is one stream's response — the
+order §8.1 puts those frames in, and the flow-control credit the body is sent against.
+Each entry below removes exactly one guard from one of them and names the tests that must
+fail as a result. See breakage.py for the harness, for how a break finds the file it
+belongs to, and for what the five outcomes mean.
 
 Two of these are index panics rather than wrong answers — an empty field name and an
 empty field value, each indexed by the check sitting immediately after the length guard
@@ -16,18 +17,38 @@ itself, which says something about breakage.py's taxonomy worth writing down: `c
 what a panic *outside* a subtest looks like, and a table-driven suite turns most of them
 into ordinary failures for nothing.
 
+The writer.go section found two guards with no test at all, which is the outcome this
+whole exercise is for. Both header and trailer sections are latched as sent *before* the
+enqueue that sends them and regardless of what it returns, because writeSection can fail
+with a HEADERS frame already on the queue and its CONTINUATION frames not — and a handler
+that took the error as permission to try again would put a second field block behind the
+first one's fragments, which §8.1 makes a connection error for every stream on the
+connection. Nothing asserted it. Writing the break is what asked the question; the two
+tests named ...ThatFailedHalfwayIsNotRetried are the answer, and they were written after
+this file and observed failing here before they were believed.
+
 Every test named below was checked against what it actually asserts rather than against
 what its name suggests, which is not a distinction worth drawing until it bites: the
 ordering test's blocks are 2*maxFrame+1 octets and so already span three frames, which
 makes a break clearing END_HEADERS on the HEADERS frame invisible to it. Naming it there
 would have reported a hole in a guard that is tested.
 
-Run from the repository root. Restores both files on the way out, including on error.
+Two guards here are deliberately not broken, because no textual edit isolates them. The
+`strings` import is used in exactly one expression, so a break that removes the informational
+test removes the import's only use and the outcome is `build` — a hole in the report that
+says nothing about the guard. Both are broken by substitution instead, which keeps the
+import and still gets the answer wrong.
+
+Run from the repository root. Restores all three files on the way out, including on error.
 """
 
 import breakage
 
-SRC = ["internal/response/encoder.go", "internal/response/fields.go"]
+SRC = [
+    "internal/response/encoder.go",
+    "internal/response/fields.go",
+    "internal/response/writer.go",
+]
 PKG = "./internal/response/"
 
 # (name, old, new, tests that must fail)
@@ -76,14 +97,20 @@ BREAKS = [
         """	if err := checkSection(sectionHeader, fields); err != nil {
 		return err
 	}
-""",
-        "",
+	return e.writeSection(id, fields, endStream)""",
+        """	return e.writeSection(id, fields, endStream)""",
         ["TestAMalformedFieldListIsRefusedWithoutBeingEncoded"],
     ),
     (
         "WriteHeaders: held to the trailer rules, so a response may not carry a status",
-        """	if err := checkSection(sectionHeader, fields); err != nil {""",
-        """	if err := checkSection(sectionTrailer, fields); err != nil {""",
+        """	if err := checkSection(sectionHeader, fields); err != nil {
+		return err
+	}
+	return e.writeSection(id, fields, endStream)""",
+        """	if err := checkSection(sectionTrailer, fields); err != nil {
+		return err
+	}
+	return e.writeSection(id, fields, endStream)""",
         ["TestABodylessResponseIsOneHeadersFrameThatEndsTheStream"],
     ),
     (
@@ -91,8 +118,8 @@ BREAKS = [
         """	if err := checkSection(sectionTrailer, fields); err != nil {
 		return err
 	}
-""",
-        "",
+	return e.writeSection(id, fields, true)""",
+        """	return e.writeSection(id, fields, true)""",
         [
             "TestATrailerSectionRefusesEveryPseudoHeaderField",
             "TestATrailerSectionIsHeldToTheFieldRules",
@@ -100,8 +127,14 @@ BREAKS = [
     ),
     (
         "WriteTrailers: held to the header rules, so a trailer section must carry a status",
-        """	if err := checkSection(sectionTrailer, fields); err != nil {""",
-        """	if err := checkSection(sectionHeader, fields); err != nil {""",
+        """	if err := checkSection(sectionTrailer, fields); err != nil {
+		return err
+	}
+	return e.writeSection(id, fields, true)""",
+        """	if err := checkSection(sectionHeader, fields); err != nil {
+		return err
+	}
+	return e.writeSection(id, fields, true)""",
         [
             "TestATrailerSectionNeedsNoStatus",
             "TestATrailerSectionRefusesEveryPseudoHeaderField",
@@ -798,6 +831,424 @@ BREAKS = [
             "TestASensitiveFieldIsRefusedTheSameWayAsAnyOther",
             "TestEveryRuleAResponseFieldListIsHeldTo",
         ],
+    ),
+
+    # ------------------------------------ writer.go: the three parts NewWriter needs
+    (
+        "NewWriter: no nil encoder check, so a handler's first write panics instead",
+        """	if enc == nil {
+		panic("response: NewWriter requires an encoder")
+	}
+""",
+        "",
+        ["TestNewWriterRefusesToBeBuiltWithoutItsThreeParts"],
+    ),
+    (
+        "NewWriter: no nil credit check, so a handler's first body write panics instead",
+        """	if credit == nil {
+		panic("response: NewWriter requires a source of flow-control credit")
+	}
+""",
+        "",
+        ["TestNewWriterRefusesToBeBuiltWithoutItsThreeParts"],
+    ),
+    (
+        "NewWriter: no stream check, so a whole response is written for the connection",
+        """	if id == 0 {
+		panic("response: NewWriter requires a stream identifier")
+	}
+""",
+        "",
+        ["TestNewWriterRefusesToBeBuiltWithoutItsThreeParts"],
+    ),
+
+    # ----------------------------------------------- writer.go: the order §8.1 fixes
+    (
+        "writeHeader: a header section after END_STREAM, reported as the wrong mistake",
+        """	case w.closed:
+		return ErrDone
+	case w.wroteHeader:
+		return ErrHeaderWritten
+	}
+""",
+        """	case w.wroteHeader:
+		return ErrHeaderWritten
+	}
+""",
+        ["TestNothingFollowsTheFrameThatEndedTheStream"],
+    ),
+    (
+        "writeHeader: a second final header section allowed",
+        """	case w.wroteHeader:
+		return ErrHeaderWritten
+	}
+""",
+        """	}
+""",
+        [
+            "TestASecondHeaderSectionIsRefused",
+            "TestAnInterimResponseDoesNotBecomeTheHeaderSection",
+            "TestAHeaderSectionThatFailedHalfwayIsNotRetried",
+        ],
+    ),
+    (
+        "Write: a body after END_STREAM",
+        """	case w.closed:
+		return 0, ErrDone
+	case !w.wroteHeader:
+		return 0, ErrNoHeader
+	}
+""",
+        """	case !w.wroteHeader:
+		return 0, ErrNoHeader
+	}
+""",
+        ["TestNothingFollowsTheFrameThatEndedTheStream"],
+    ),
+    (
+        "Write: a body before any header section",
+        """	case !w.wroteHeader:
+		return 0, ErrNoHeader
+	}
+""",
+        """	}
+""",
+        [
+            "TestNothingMayBeWrittenBeforeAHeaderSection",
+            "TestAnInterimResponseDoesNotBecomeTheHeaderSection",
+        ],
+    ),
+    (
+        "Close: not idempotent, so a teardown path ends an ended stream again",
+        """	if w.closed {
+		return nil
+	}
+""",
+        "",
+        [
+            "TestNothingFollowsTheFrameThatEndedTheStream",
+            "TestABodylessHeaderSectionNeedsNoClose",
+            "TestATrailerSectionEndsTheStreamAfterTheBody",
+        ],
+    ),
+    (
+        "Close: an empty response ended for a handler that never wrote one",
+        """	if !w.wroteHeader {
+		return ErrNoHeader
+	}
+	w.closed = true
+""",
+        """	w.closed = true
+""",
+        ["TestNothingMayBeWrittenBeforeAHeaderSection"],
+    ),
+    (
+        "Trailers: a trailer section after END_STREAM",
+        """	case w.closed:
+		return ErrDone
+	case !w.wroteHeader:
+		return ErrNoHeader
+	}
+""",
+        """	case !w.wroteHeader:
+		return ErrNoHeader
+	}
+""",
+        [
+            "TestNothingFollowsTheFrameThatEndedTheStream",
+            "TestATrailerSectionThatFailedHalfwayIsNotRetried",
+        ],
+    ),
+    (
+        "Trailers: a trailer section before any header section",
+        """	case !w.wroteHeader:
+		return ErrNoHeader
+	}
+""",
+        """	}
+""",
+        ["TestNothingMayBeWrittenBeforeAHeaderSection"],
+    ),
+
+    # -------------------------------------------- writer.go: the interim response
+    (
+        "writeHeader: an interim response latched, so the final one is refused",
+        """	w.wroteHeader = !interim""",
+        """	w.wroteHeader = true""",
+        ["TestAnInterimResponseDoesNotBecomeTheHeaderSection"],
+    ),
+    (
+        "writeHeader: no header section ever latched, so no body is ever legal",
+        """	w.wroteHeader = !interim""",
+        """	w.wroteHeader = false""",
+        [
+            "TestABodyIsSplitAtThePeersFrameSizeCap",
+            "TestASecondHeaderSectionIsRefused",
+            "TestATrailerSectionNeedsNoBody",
+        ],
+    ),
+    (
+        "writeHeader: every header section ends the stream, so no response has a body",
+        """	w.closed = endStream""",
+        """	w.closed = true""",
+        [
+            "TestABodyIsSplitAtThePeersFrameSizeCap",
+            "TestAnInterimResponseDoesNotBecomeTheHeaderSection",
+        ],
+    ),
+    (
+        "writeHeader: END_STREAM on the burst not recorded, so the response stays open",
+        """	w.closed = endStream""",
+        """	w.closed = false""",
+        [
+            "TestNothingFollowsTheFrameThatEndedTheStream",
+            "TestABodylessHeaderSectionNeedsNoClose",
+        ],
+    ),
+    (
+        "writeHeader: no 1xx-with-END_STREAM refusal, so a malformed response is sent",
+        """	interim := informational(fields)
+	if endStream && interim {
+		return ErrInformationalEnd
+	}
+""",
+        """	interim := informational(fields)
+""",
+        [
+            "TestAnInterimResponseCannotEndTheStream",
+            "TestWhichStatusCodesAreInformational",
+        ],
+    ),
+    (
+        "writeHeader: every interim response refused, not only one ending the stream",
+        """	if endStream && interim {""",
+        """	if interim {""",
+        ["TestAnInterimResponseDoesNotBecomeTheHeaderSection"],
+    ),
+    (
+        "writeHeader: the field list validated after the informational test, not before",
+        """	if err := checkSection(sectionHeader, fields); err != nil {
+		return err
+	}
+
+	interim := informational(fields)
+	if endStream && interim {
+		return ErrInformationalEnd
+	}
+""",
+        """	interim := informational(fields)
+	if endStream && interim {
+		return ErrInformationalEnd
+	}
+
+	if err := checkSection(sectionHeader, fields); err != nil {
+		return err
+	}
+""",
+        ["TestAMalformedFieldListIsReportedBeforeTheInformationalRule"],
+    ),
+    (
+        "informational: only 100 counted, so 101 and 103 may end a stream",
+        """			return strings.HasPrefix(f.Value, "1")""",
+        """			return strings.HasPrefix(f.Value, "100")""",
+        ["TestWhichStatusCodesAreInformational"],
+    ),
+    (
+        "informational: the wrong end of the status code read",
+        """			return strings.HasPrefix(f.Value, "1")""",
+        """			return strings.HasSuffix(f.Value, "1")""",
+        [
+            "TestWhichStatusCodesAreInformational",
+            "TestAnInterimResponseCannotEndTheStream",
+            "TestAnInterimResponseDoesNotBecomeTheHeaderSection",
+        ],
+    ),
+
+    # ----------------------------- writer.go: latched before the enqueue, not after
+    (
+        "writeHeader: the response latched only if the burst was accepted whole",
+        """	w.wroteHeader = !interim
+	w.closed = endStream
+
+	return w.enc.writeSection(w.id, fields, endStream)""",
+        """	if err := w.enc.writeSection(w.id, fields, endStream); err != nil {
+		return err
+	}
+	w.wroteHeader = !interim
+	w.closed = endStream
+	return nil""",
+        ["TestAHeaderSectionThatFailedHalfwayIsNotRetried"],
+    ),
+    (
+        "Trailers: the stream closed only if the burst was accepted whole",
+        """	if err := checkSection(sectionTrailer, fields); err != nil {
+		return err
+	}
+	w.closed = true
+
+	return w.enc.writeSection(w.id, fields, true)""",
+        """	if err := checkSection(sectionTrailer, fields); err != nil {
+		return err
+	}
+	if err := w.enc.writeSection(w.id, fields, true); err != nil {
+		return err
+	}
+	w.closed = true
+	return nil""",
+        ["TestATrailerSectionThatFailedHalfwayIsNotRetried"],
+    ),
+    (
+        "Trailers: the stream closed before the field list is validated",
+        """	if err := checkSection(sectionTrailer, fields); err != nil {
+		return err
+	}
+	w.closed = true
+""",
+        """	w.closed = true
+	if err := checkSection(sectionTrailer, fields); err != nil {
+		return err
+	}
+""",
+        ["TestARefusedTrailerSectionLeavesTheStreamOpen"],
+    ),
+    (
+        "Close: the stream closed only if the empty frame was accepted",
+        """	return w.enc.enqueue(frame.DataFrame{StreamID: w.id, EndStream: true})""",
+        """	if err := w.enc.enqueue(frame.DataFrame{StreamID: w.id, EndStream: true}); err != nil {
+		w.closed = false
+		return err
+	}
+	return nil""",
+        ["TestARefusedCloseStillEndsTheResponse"],
+    ),
+
+    # -------------------------------------- writer.go: the body's two separate limits
+    (
+        "Write: no frame-size cap, so one Write is one DATA frame of any size",
+        """min(len(p), w.enc.splitAt())""",
+        """len(p)""",
+        [
+            "TestABodyIsSplitAtThePeersFrameSizeCap",
+            "TestTheFrameSizeCapIsReadForEveryDataFrame",
+            "TestOnlyTheContentIsReservedAndTheFrameHeaderIsNot",
+        ],
+    ),
+    (
+        "Write: the cap read once for the whole body instead of once per frame",
+        """	sent := 0
+	for len(p) > 0 {
+		n, err := w.credit.Reserve(w.id, min(len(p), w.enc.splitAt()))""",
+        """	sent, size := 0, w.enc.splitAt()
+	for len(p) > 0 {
+		n, err := w.credit.Reserve(w.id, min(len(p), size))""",
+        ["TestTheFrameSizeCapIsReadForEveryDataFrame"],
+    ),
+    (
+        "Write: the caller's slice aliased into a frame the writer goroutine owns",
+        """			Data:     bytes.Clone(p[:n]),""",
+        """			Data:     bytes.NewBuffer(p[:n]).Bytes(),""",
+        ["TestTheContentIsCopiedRatherThanAliased"],
+    ),
+    (
+        "Write: the loop entered unconditionally, so an empty body reserves nothing",
+        """	for len(p) > 0 {""",
+        """	for first := true; first || len(p) > 0; first = false {""",
+        ["TestAnEmptyWriteSendsNothingAndReservesNothing"],
+    ),
+    (
+        "Write: a failed reservation reported as though its octets had been sent",
+        """		if err != nil {
+			// Short and honest. The octets already enqueued are on their way and the
+			// caller is entitled to know how many; the ones Reserve was asked for are
+			// not coming, on this stream, ever — see Credit.Reserve.
+			return sent, err
+		}
+""",
+        """		if err != nil {
+			return sent + len(p), err
+		}
+""",
+        ["TestAFailedReservationIsReportedWithTheOctetsAlreadySent"],
+    ),
+    (
+        "Write: a refused DATA frame reported as a short write with no error",
+        """		}); err != nil {
+			return sent, err
+		}
+""",
+        """		}); err != nil {
+			return sent, nil
+		}
+""",
+        ["TestARefusedDataFrameIsReportedWithTheOctetsAlreadySent"],
+    ),
+
+    # ------------------------------------------- writer.go: ending the stream
+    (
+        "Close: the empty END_STREAM frame reserved for, against §6.9.1's exemption",
+        """	return w.enc.enqueue(frame.DataFrame{StreamID: w.id, EndStream: true})""",
+        """	if _, err := w.credit.Reserve(w.id, 1); err != nil {
+		return err
+	}
+	return w.enc.enqueue(frame.DataFrame{StreamID: w.id, EndStream: true})""",
+        ["TestCloseSendsAnEmptyDataFrameAndReservesNothing"],
+    ),
+    (
+        "Close: the frame sent without END_STREAM, so it says nothing at all",
+        """	return w.enc.enqueue(frame.DataFrame{StreamID: w.id, EndStream: true})""",
+        """	return w.enc.enqueue(frame.DataFrame{StreamID: w.id})""",
+        [
+            "TestCloseSendsAnEmptyDataFrameAndReservesNothing",
+            "TestCloseFollowsTheBodyItEnds",
+        ],
+    ),
+    (
+        "Trailers: the trailer block sent without END_STREAM",
+        """	return w.enc.writeSection(w.id, fields, true)""",
+        """	return w.enc.writeSection(w.id, fields, false)""",
+        [
+            "TestATrailerSectionEndsTheStreamAfterTheBody",
+            "TestATrailerSectionNeedsNoBody",
+        ],
+    ),
+    (
+        "Trailers: the field list held to §8.3's header rules, so :status is allowed",
+        """	if err := checkSection(sectionTrailer, fields); err != nil {
+		return err
+	}
+	w.closed = true
+""",
+        """	if err := checkSection(sectionHeader, fields); err != nil {
+		return err
+	}
+	w.closed = true
+""",
+        [
+            "TestARefusedTrailerSectionLeavesTheStreamOpen",
+            "TestATrailerSectionEndsTheStreamAfterTheBody",
+        ],
+    ),
+
+    # --------------------------- writer.go: where the Encoder's lock is and is not held
+    (
+        "enqueue: a DATA frame outside the lock, so it lands inside a header burst",
+        """func (e *Encoder) enqueue(f frame.Frame) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.t.Enqueue(f)
+}""",
+        """func (e *Encoder) enqueue(f frame.Frame) error {
+	return e.t.Enqueue(f)
+}""",
+        ["TestNoHeaderSectionIsEncodedWhileADataFrameIsBeingEnqueued"],
+    ),
+    (
+        "Write: the reservation taken inside the lock, so one slow reader stalls them all",
+        """		n, err := w.credit.Reserve(w.id, min(len(p), w.enc.splitAt()))""",
+        """		w.enc.mu.Lock()
+		n, err := w.credit.Reserve(w.id, min(len(p), w.enc.splitAt()))
+		w.enc.mu.Unlock()""",
+        ["TestAnotherStreamsHeaderSectionGoesOutWhileOneWaitsForCredit"],
     ),
 ]
 
