@@ -27,9 +27,13 @@ mistakes. `zdh` builds the defenses in from the start:
   attack and asserts the server tears down with `ENHANCE_YOUR_CALM`.
 - **CVE-2023-45288 (HTTP/2 CONTINUATION Flood)** — `zdh` caps header-block
   bytes and CONTINUATION frame count; `internal/attack.TestContinuationFlood`
-  reproduces it. *(Verify this CVE ID maps to the Go/x/net/http2 CONTINUATION
-  advisory before quoting it to a security-literate judging panel — a wrong
-  number costs more than omitting it. CVE-2023-44487 is certain.)*
+  reproduces it. *(Verified against the upstream advisory
+  [golang/go#65051](https://github.com/golang/go/issues/65051): it affects
+  both `net/http` and `golang.org/x/net/http2`, and describes exactly this
+  shape — a peer forcing the server to Huffman-decode and process large
+  quantities of HEADERS/CONTINUATION data destined for rejection, without
+  a ceiling on how much superfluous header data it processes before giving
+  up. Both CVE numbers are confirmed correct.)*
 
 ## Substitutions, one per real dependency
 
