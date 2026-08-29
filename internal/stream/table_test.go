@@ -3,6 +3,7 @@ package stream
 import (
 	"errors"
 	"fmt"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -231,6 +232,37 @@ func (h *harness) open(id uint32, endStream bool) {
 	h.mustSend(request(id, endStream))
 }
 
+// sendAvailable is the credit left on stream id's send window, and fails the test
+// if the Sender has no window for that stream at all.
+//
+// Read through the Sender rather than off the Stream because the send direction is
+// deliberately not reachable from a *Stream: it is spent by a goroutine the table
+// does not own. See Table.sender.
+func (h *harness) sendAvailable(id uint32) int64 {
+	h.t.Helper()
+	n, ok := h.tab.Sender().Available(id)
+	if !ok {
+		h.t.Fatalf("stream %d has no send window", id)
+	}
+	return n
+}
+
+// spendSend takes n octets of stream id's send credit, which is what writing n
+// octets of its response body does.
+//
+// It cannot block in these tests: every caller has arranged for the credit to be
+// there, and a Reserve that returned short would fail here rather than deadlock.
+func (h *harness) spendSend(id uint32, n int) {
+	h.t.Helper()
+	got, err := h.tab.Sender().Reserve(id, n)
+	if err != nil {
+		h.t.Fatalf("reserving %d octets on stream %d: %v", n, id, err)
+	}
+	if got != n {
+		h.t.Fatalf("reserved %d of the %d octets asked for on stream %d", got, n, id)
+	}
+}
+
 // events is the recorder's log, formatted.
 func (h *harness) events() string { return h.reqs.String() }
 
@@ -357,7 +389,7 @@ func TestNewStartsBothConnectionWindowsAtTheProtocolInitialSize(t *testing.T) {
 	if got := h.tab.RecvWindow().Available(); got != flow.InitialWindowSize {
 		t.Errorf("connection receive window starts at %d, want %d", got, flow.InitialWindowSize)
 	}
-	if got := h.tab.SendWindow().Available(); got != flow.InitialWindowSize {
+	if got := h.tab.Sender().ConnAvailable(); got != flow.InitialWindowSize {
 		t.Errorf("connection send window starts at %d, want %d", got, flow.InitialWindowSize)
 	}
 	// §6.9.2 gives the connection window no other starting value and no way to be
@@ -365,6 +397,11 @@ func TestNewStartsBothConnectionWindowsAtTheProtocolInitialSize(t *testing.T) {
 	// credit could be set to something the peer did not assume.
 	if got := h.tab.RecvWindow().StreamID(); got != 0 {
 		t.Errorf("connection receive window belongs to stream %d, want 0", got)
+	}
+	// And the same for the size the next stream's send window will be opened at,
+	// which is the other half of §6.9.2's "both ends must assume".
+	if got := h.tab.Sender().InitialSize(); got != flow.InitialWindowSize {
+		t.Errorf("the initial stream send window is %d, want %d", got, flow.InitialWindowSize)
 	}
 }
 
@@ -405,7 +442,7 @@ func TestNewSizesNewStreamWindowsFromTheProtocolInitialSize(t *testing.T) {
 	if got := s.RecvWindow().Available(); got != flow.InitialWindowSize {
 		t.Errorf("stream receive window starts at %d, want %d", got, flow.InitialWindowSize)
 	}
-	if got := s.SendWindow().Available(); got != flow.InitialWindowSize {
+	if got := h.sendAvailable(1); got != flow.InitialWindowSize {
 		t.Errorf("stream send window starts at %d, want %d", got, flow.InitialWindowSize)
 	}
 	if got := s.RecvWindow().StreamID(); got != 1 {
@@ -846,6 +883,24 @@ func TestTheTableOnlyHoldsStreamsThatCountAsConcurrent(t *testing.T) {
 		if got := h.tab.Len(); got != len(h.tab.streams) {
 			t.Errorf("after %s: Len is %d, map holds %d", step, got, len(h.tab.streams))
 		}
+
+		// And the second map of streams — the send windows in the Sender — holds
+		// exactly the same identifiers, in both directions. Two maps updated from two
+		// places in this file is the cost of keeping the state machine out from
+		// behind the Sender's mutex, and this is what makes the cost visible: a send
+		// window left behind by a stream that closed is credit a WINDOW_UPDATE could
+		// still reach, and a stream in the table without one is a response that
+		// blocks for ever the first time it tries to reserve an octet. 7 is in the
+		// list and never opened, so a window invented for an identifier the peer
+		// never used shows up here too.
+		for _, id := range []uint32{1, 3, 5, 7} {
+			_, hasWindow := h.tab.Sender().Available(id)
+			_, live := h.tab.streams[id]
+			if hasWindow != live {
+				t.Errorf("after %s: stream %d is in the table (%v) but has a send window (%v)",
+					step, id, live, hasWindow)
+			}
+		}
 	}
 
 	h.open(1, false)
@@ -1258,7 +1313,7 @@ func TestWindowUpdateCreditsTheStreamsSendWindow(t *testing.T) {
 	h := newHarness(t, Config{})
 	h.open(1, false)
 	h.mustSend(frame.WindowUpdateFrame{StreamID: 1, Increment: 1000})
-	if got := h.tab.Stream(1).SendWindow().Available(); got != flow.InitialWindowSize+1000 {
+	if got := h.sendAvailable(1); got != flow.InitialWindowSize+1000 {
 		t.Errorf("stream send window is %d, want %d", got, flow.InitialWindowSize+1000)
 	}
 	// The receive window is ours to grant and is not touched by the peer's credit.
@@ -1290,7 +1345,7 @@ func TestWindowUpdateOnAHalfClosedStreamIsApplied(t *testing.T) {
 	h := newHarness(t, Config{})
 	h.open(1, true)
 	h.mustSend(frame.WindowUpdateFrame{StreamID: 1, Increment: 7})
-	if got := h.tab.Stream(1).SendWindow().Available(); got != flow.InitialWindowSize+7 {
+	if got := h.sendAvailable(1); got != flow.InitialWindowSize+7 {
 		t.Errorf("stream send window is %d, want %d", got, flow.InitialWindowSize+7)
 	}
 }
@@ -1309,7 +1364,7 @@ func TestConnWindowUpdateCreditsTheConnectionSendWindow(t *testing.T) {
 	if err := h.tab.ConnWindowUpdate(1000); err != nil {
 		t.Fatalf("crediting the connection window: %v", err)
 	}
-	if got := h.tab.SendWindow().Available(); got != flow.InitialWindowSize+1000 {
+	if got := h.tab.Sender().ConnAvailable(); got != flow.InitialWindowSize+1000 {
 		t.Errorf("connection send window is %d, want %d", got, flow.InitialWindowSize+1000)
 	}
 	if got := h.tab.RecvWindow().Available(); got != flow.InitialWindowSize {
@@ -1365,7 +1420,7 @@ func TestSetInitialWindowSizeSizesStreamsOpenedAfterwards(t *testing.T) {
 		t.Fatalf("SetInitialWindowSize: %v", err)
 	}
 	h.open(1, false)
-	if got := h.tab.Stream(1).SendWindow().Available(); got != 1000 {
+	if got := h.sendAvailable(1); got != 1000 {
 		t.Errorf("a stream opened after the setting has a send window of %d, want 1000", got)
 	}
 	// Our own grant is unaffected: the setting is the peer's, about the direction
@@ -1381,14 +1436,12 @@ func TestSetInitialWindowSizeAppliesADeltaToOpenStreams(t *testing.T) {
 	// 1000 short of the new size, not at it.
 	h := newHarness(t, Config{})
 	h.open(1, false)
-	if err := h.tab.Stream(1).SendWindow().Consume(1000); err != nil {
-		t.Fatalf("spending the send window: %v", err)
-	}
+	h.spendSend(1, 1000)
 	if err := h.tab.SetInitialWindowSize(70_000); err != nil {
 		t.Fatalf("SetInitialWindowSize: %v", err)
 	}
 	const want = flow.InitialWindowSize - 1000 + (70_000 - flow.InitialWindowSize)
-	if got := h.tab.Stream(1).SendWindow().Available(); got != want {
+	if got := h.sendAvailable(1); got != want {
 		t.Errorf("send window is %d, want %d (an assignment would give 70000)", got, want)
 	}
 }
@@ -1399,13 +1452,11 @@ func TestSetInitialWindowSizeCanTakeAStreamWindowNegative(t *testing.T) {
 	// to be carried. Clamping to zero would let the stream send that much again.
 	h := newHarness(t, Config{})
 	h.open(1, false)
-	if err := h.tab.Stream(1).SendWindow().Consume(1000); err != nil {
-		t.Fatalf("spending the send window: %v", err)
-	}
+	h.spendSend(1, 1000)
 	if err := h.tab.SetInitialWindowSize(0); err != nil {
 		t.Fatalf("SetInitialWindowSize: %v", err)
 	}
-	if got := h.tab.Stream(1).SendWindow().Available(); got != -1000 {
+	if got := h.sendAvailable(1); got != -1000 {
 		t.Errorf("send window is %d, want -1000", got)
 	}
 }
@@ -1421,7 +1472,7 @@ func TestSetInitialWindowSizeAppliesToEveryOpenStream(t *testing.T) {
 	// Every state the table holds, including the half-closed ones: this server may
 	// still be sending on any of them.
 	for _, id := range []uint32{1, 3} {
-		if got := h.tab.Stream(id).SendWindow().Available(); got != 100 {
+		if got := h.sendAvailable(id); got != 100 {
 			t.Errorf("stream %d's send window is %d, want 100", id, got)
 		}
 	}
@@ -1430,8 +1481,7 @@ func TestSetInitialWindowSizeAppliesToEveryOpenStream(t *testing.T) {
 func TestSetInitialWindowSizeOverflowEndsTheConnection(t *testing.T) {
 	h := newHarness(t, Config{})
 	h.open(1, false)
-	w := h.tab.Stream(1).SendWindow()
-	if err := w.Increase(flow.MaxWindowSize - flow.InitialWindowSize); err != nil {
+	if err := h.tab.Sender().CreditStream(1, flow.MaxWindowSize-flow.InitialWindowSize); err != nil {
 		t.Fatalf("crediting to the maximum: %v", err)
 	}
 	err := h.tab.SetInitialWindowSize(flow.InitialWindowSize + 1)
@@ -1451,7 +1501,7 @@ func TestSetInitialWindowSizeLeavesTheConnectionWindowAlone(t *testing.T) {
 	if err := h.tab.SetInitialWindowSize(1); err != nil {
 		t.Fatalf("SetInitialWindowSize: %v", err)
 	}
-	if got := h.tab.SendWindow().Available(); got != flow.InitialWindowSize {
+	if got := h.tab.Sender().ConnAvailable(); got != flow.InitialWindowSize {
 		t.Errorf("connection send window is %d, want %d", got, flow.InitialWindowSize)
 	}
 	if got := h.tab.RecvWindow().Available(); got != flow.InitialWindowSize {
@@ -1473,8 +1523,195 @@ func TestSetInitialWindowSizeWithNoStreamsOpenIsRemembered(t *testing.T) {
 	// 9, not 12 and not 6: the second call replaced the first rather than
 	// compounding with it, which is what a delta applied to a nonexistent stream
 	// would have done.
-	if got := h.tab.Stream(1).SendWindow().Available(); got != 9 {
+	if got := h.sendAvailable(1); got != 9 {
 		t.Errorf("send window is %d, want 9", got)
+	}
+}
+
+// --- the send half, and the seam to it -------------------------------------
+
+func TestTheSenderIsTakenFromConfigWhenOneIsGiven(t *testing.T) {
+	// The connection has to be able to reach Sender.Close during teardown, from
+	// whichever goroutine noticed the connection was over, and the table is not safe
+	// to touch from there. So the Sender is constructed outside and handed in, and
+	// this is the test that the table uses the one it was given rather than quietly
+	// making its own — which would leave the connection closing a Sender no writer
+	// was parked on, and every writer parked on one nothing would ever close.
+	sender := flow.NewSender()
+	h := newHarness(t, Config{Sender: sender})
+	if h.tab.Sender() != sender {
+		t.Fatalf("the table is using a Sender other than the one Config named")
+	}
+
+	h.open(1, false)
+	if _, ok := sender.Available(1); !ok {
+		t.Errorf("opening a stream did not give it a send window in the Sender from Config")
+	}
+	if err := h.tab.ConnWindowUpdate(100); err != nil {
+		t.Fatalf("ConnWindowUpdate: %v", err)
+	}
+	if got := sender.ConnAvailable(); got != flow.InitialWindowSize+100 {
+		t.Errorf("the connection window in Config's Sender is %d, want %d",
+			got, flow.InitialWindowSize+100)
+	}
+}
+
+func TestTheTableMakesItsOwnSenderWhenConfigHasNone(t *testing.T) {
+	// Nil is the ordinary case for a test and for any caller that has no teardown to
+	// wire up, and it must not be a nil dereference on the first request.
+	h := newHarness(t, Config{})
+	if h.tab.Sender() == nil {
+		t.Fatal("Sender is nil, so the first response body on this connection would panic")
+	}
+	h.open(1, false)
+	if got := h.sendAvailable(1); got != flow.InitialWindowSize {
+		t.Errorf("stream send window is %d, want %d", got, flow.InitialWindowSize)
+	}
+}
+
+func TestARefusedStreamNeverGetsASendWindow(t *testing.T) {
+	// A stream that never entered the table must not have entered the Sender either.
+	// The two maps are updated from two places, so the refusal paths are where they
+	// would drift: a window opened for a stream the table refused is credit that
+	// outlives the connection's own accounting of it, and Sender.Open panics on a
+	// repeat, so the identifier could not even be reused.
+	h := newHarness(t, Config{MaxConcurrent: 1})
+	h.open(1, false)
+	err := h.send(request(3, false))
+	assertStreamError(t, err, 3, h2.RefusedStream, "the stream past the concurrency limit")
+
+	if _, ok := h.tab.Sender().Available(3); ok {
+		t.Errorf("the refused stream 3 has a send window")
+	}
+	// And the identifier is spent, so nothing will open one later either.
+	h.assertState(3, StateClosed)
+}
+
+func TestClosingAStreamTakesAwayItsSendWindow(t *testing.T) {
+	// Every route to closed, because retire is called from four places — SendEnd, the
+	// trailers branch of completeBlock, data and rstStream — and a missing call in
+	// one of them is a leak the peer controls: a connection serving a million
+	// requests would hold a million send windows, which is the same shape of
+	// footprint the table itself refuses to have.
+	//
+	// Three of the four need our own END_STREAM as well as the peer's, because that
+	// is what closed means. Which of the two arrives last decides which site does the
+	// retiring, so both orders are here rather than one standing in for the other.
+	for _, tc := range []struct {
+		name  string
+		close func(h *harness)
+	}{
+		{"RST_STREAM from the peer", func(h *harness) {
+			h.mustSend(frame.RSTStreamFrame{StreamID: 1, ErrCode: h2.Cancel})
+		}},
+		{"the peer's END_STREAM last", func(h *harness) {
+			h.tab.SendEnd(h.tab.Stream(1))
+			h.mustSend(data(1, "body", true))
+		}},
+		{"our END_STREAM last", func(h *harness) {
+			h.mustSend(data(1, "body", true))
+			h.tab.SendEnd(h.tab.Stream(1))
+		}},
+		{"a trailer section last", func(h *harness) {
+			h.tab.SendEnd(h.tab.Stream(1))
+			h.mustSend(frame.HeadersFrame{
+				StreamID: 1, EndStream: true, EndHeaders: true,
+				Fragment: encodeFields(h2.Field{Name: "grpc-status", Value: "0"}),
+			})
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t, Config{})
+			h.open(1, false)
+			if _, ok := h.tab.Sender().Available(1); !ok {
+				t.Fatalf("stream 1 has no send window to lose")
+			}
+			tc.close(h)
+			h.assertState(1, StateClosed)
+			if _, ok := h.tab.Sender().Available(1); ok {
+				t.Errorf("stream 1 kept its send window after closing")
+			}
+		})
+	}
+}
+
+func TestAHalfClosedStreamKeepsItsSendWindow(t *testing.T) {
+	// The other half of the rule above, and the one that matters more: this server
+	// still owes a response on a stream the peer has finished sending on, so taking
+	// the window away when the *peer* ends its half would strand the response that
+	// is the whole point of the request.
+	//
+	// Both ways the peer can finish, because they retire from different places and
+	// the trailers branch is the one where it is easy to write recvEnd and retire
+	// next to each other without noticing that only one of them is conditional.
+	for _, tc := range []struct {
+		name string
+		done func(h *harness)
+	}{
+		{"END_STREAM on the request", func(h *harness) {
+			h.open(1, true)
+		}},
+		{"a trailer section", func(h *harness) {
+			h.open(1, false)
+			h.mustSend(frame.HeadersFrame{
+				StreamID: 1, EndStream: true, EndHeaders: true,
+				Fragment: encodeFields(h2.Field{Name: "grpc-status", Value: "0"}),
+			})
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t, Config{})
+			tc.done(h)
+			h.assertState(1, StateHalfClosedRemote)
+			if got := h.sendAvailable(1); got != flow.InitialWindowSize {
+				t.Errorf("stream send window is %d, want %d", got, flow.InitialWindowSize)
+			}
+		})
+	}
+}
+
+func TestResettingAStreamWakesTheGoroutineWritingItsResponse(t *testing.T) {
+	// The reason the send windows are in the Sender rather than on the Stream, in one
+	// test. A response body blocked for credit is parked in another goroutine
+	// entirely, and the RST_STREAM that ends its stream is read here — so unless
+	// retire reaches the Sender, that goroutine waits for a WINDOW_UPDATE the peer
+	// has no reason ever to send, for the life of the process.
+	h := newHarness(t, Config{})
+	h.open(1, false)
+
+	// Nothing left on the stream's window, so the next reservation has to park.
+	h.spendSend(1, flow.InitialWindowSize)
+
+	type result struct {
+		n   int
+		err error
+	}
+	out := make(chan result, 1)
+	go func() {
+		n, err := h.tab.Sender().Reserve(1, 1)
+		out <- result{n, err}
+	}()
+
+	// Parked, rather than merely started: the RST_STREAM has to arrive while the
+	// writer is asleep, because a writer that has not reached Reserve yet would find
+	// the stream already gone and return for a different reason.
+	deadline := time.Now().Add(5 * time.Second)
+	for h.tab.Sender().Waiters() == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("the writer never parked in Reserve")
+		}
+		runtime.Gosched()
+	}
+
+	h.mustSend(frame.RSTStreamFrame{StreamID: 1, ErrCode: h2.Cancel})
+
+	select {
+	case got := <-out:
+		if !errors.Is(got.err, flow.ErrStreamGone) {
+			t.Errorf("the writer returned %d, %v; want flow.ErrStreamGone", got.n, got.err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("RST_STREAM did not wake the writer within 5s; it would wait for the life of the process")
 	}
 }
 

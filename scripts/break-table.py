@@ -42,13 +42,32 @@ rather than what they remove.
 
 Every guard in the file has a break here, both scopes of every error that has a
 choice of scope, and every message has one that strips its section reference.
-All 114 are caught, and two of them are worth knowing about for how they are caught
-rather than that they are: removing the CONTINUATION-with-no-block guard and dropping
-the streams map from the constructor both produce a nil dereference rather than a
-failed assertion. Both still report as an ordinary failure of the named test, because
-the panic happens on the goroutine running that test and go test attributes it there
--- so neither needs the harness's crash outcome, which is for a break that takes the
-package down somewhere no test's name is attached to.
+All 115 are caught, and three of them are worth knowing about for how they are caught
+rather than that they are: removing the CONTINUATION-with-no-block guard, dropping
+the streams map from the constructor, and letting New skip making a Sender all
+produce a nil dereference rather than a failed assertion. All three still report as an
+ordinary failure of the named test, because the panic happens on the goroutine running
+that test and go test attributes it there -- so none of them needs the harness's crash
+outcome, which is for a break that takes the package down somewhere no test's name is
+attached to.
+
+Thirteen of the breaks were refused outright by preflight the first time this campaign
+was run after the send half of flow control moved out of this file and behind
+internal/flow's Sender, which is the outcome that arrangement was chosen for. Ten were
+re-anchored to the delegation that replaced the arithmetic and still name the same
+tests. Three had lost their subject entirely rather than moved it -- the connection
+send window's construction, the default a new stream's send window is opened at, and
+whether the peer's SETTINGS_INITIAL_WINDOW_SIZE is remembered across an empty table --
+and all three are now break-sender.py's, because that is where the code they were
+about now lives. Three took their place, and they are the breaks the seam makes
+possible: a table that ignores the Sender it was handed and makes its own, a table
+that makes none at all, and a stream that leaves the table without its send window
+going with it. A fourth, on data's stream-window debit, had to be rewritten rather
+than re-anchored: it used to swap the receive window for the send window, and a Stream
+no longer has a send window to swap in, so it now debits the connection's window twice
+instead. That the typo has become a compile error rather than a caught mistake is the
+whole return on the refactor, and it is worth more than the break that used to catch
+it.
 
 The campaign found four missing tests rather than four weak guards, which is the
 other outcome these files exist to produce. All four are now in table_test.go, and
@@ -154,30 +173,48 @@ BREAKS = [
     ),
     (
         "New makes the connection's receive window a stream window, so a connection fault resets stream 1",
-        """		connRecv:      flow.NewConnWindow(),""",
-        """		connRecv:      flow.NewStreamWindow(1, flow.InitialWindowSize),""",
+        """		connRecv: flow.NewConnWindow(),""",
+        """		connRecv: flow.NewStreamWindow(1, flow.InitialWindowSize),""",
         [
             "TestNewStartsBothConnectionWindowsAtTheProtocolInitialSize",
             "TestDataPastTheConnectionWindowEndsTheConnection",
         ],
     ),
     (
-        "New makes the connection's send window a stream window, so its overflow is one stream's fault",
-        """		connSend:      flow.NewConnWindow(),""",
-        """		connSend:      flow.NewStreamWindow(1, flow.InitialWindowSize),""",
-        ["TestConnWindowUpdateOverflowEndsTheConnection"],
+        "New ignores the Sender it was handed and makes its own, which nothing will ever close",
+        """		sender:   cfg.Sender,""",
+        """		sender:   flow.NewSender(),""",
+        ["TestTheSenderIsTakenFromConfigWhenOneIsGiven"],
     ),
     (
-        "New starts new streams' send windows at zero rather than the protocol's initial size",
-        """		peerInitialWindow: flow.InitialWindowSize,""",
-        """		peerInitialWindow: 0,""",
-        ["TestNewSizesNewStreamWindowsFromTheProtocolInitialSize"],
+        "New makes no Sender when Config has none, so the first response body dereferences nil",
+        """	if cfg.Sender == nil {
+		cfg.Sender = flow.NewSender()
+	}
+""",
+        "",
+        [
+            "TestTheTableMakesItsOwnSenderWhenConfigHasNone",
+            "TestNewStartsBothConnectionWindowsAtTheProtocolInitialSize",
+        ],
     ),
     (
         "New sizes the reset bucket from something other than the advisory's policy",
         """		resets: limits.NewResetBucket(cfg.Now()),""",
         """		resets: limits.NewBucket(1<<30, 1<<30, cfg.Now()),""",
         ["TestARstStreamFloodEndsTheConnection"],
+    ),
+
+    # --- the accessors the layers on either side reach through ---------------
+    (
+        "Sender answers with a new Sender every time, so every response body gets its own credit",
+        """func (t *Table) Sender() *flow.Sender { return t.sender }""",
+        """func (t *Table) Sender() *flow.Sender { return flow.NewSender() }""",
+        [
+            "TestTheSenderIsTakenFromConfigWhenOneIsGiven",
+            "TestTheTableOnlyHoldsStreamsThatCountAsConcurrent",
+            "TestClosingAStreamTakesAwayItsSendWindow",
+        ],
     ),
 
     # --- StateOf: the three-way distinction ----------------------------------
@@ -294,57 +331,57 @@ BREAKS = [
     # --- the connection-level frames the server forwards ---------------------
     (
         "ConnWindowUpdate credits our own receive window with the peer's grant",
-        """	return t.connSend.Increase(increment)""",
+        """	return t.sender.CreditConn(increment)""",
         """	return t.connRecv.Increase(increment)""",
         ["TestConnWindowUpdateCreditsTheConnectionSendWindow"],
     ),
     (
         "ConnWindowUpdate swallows an increment past the maximum window",
-        """	return t.connSend.Increase(increment)
+        """	return t.sender.CreditConn(increment)
 }""",
-        """	t.connSend.Increase(increment)
+        """	t.sender.CreditConn(increment)
 	return nil
 }""",
         ["TestConnWindowUpdateOverflowEndsTheConnection"],
     ),
     (
-        "SetInitialWindowSize does not reach the streams that are already open (RFC 9113 6.9.2)",
-        """	for _, s := range t.streams {""",
-        """	for _, s := range map[uint32]*Stream(nil) {""",
+        "SetInitialWindowSize drops the peer's setting (RFC 9113 6.9.2)",
+        """	return t.sender.SetInitialSize(n)""",
+        """	return nil""",
         [
             "TestSetInitialWindowSizeAppliesADeltaToOpenStreams",
             "TestSetInitialWindowSizeAppliesToEveryOpenStream",
             "TestSetInitialWindowSizeOverflowEndsTheConnection",
-        ],
-    ),
-    (
-        "SetInitialWindowSize does not remember the value, so streams opened later use the old one",
-        """	t.peerInitialWindow = n
-""",
-        "",
-        [
             "TestSetInitialWindowSizeSizesStreamsOpenedAfterwards",
             "TestSetInitialWindowSizeWithNoStreamsOpenIsRemembered",
         ],
     ),
     (
         "SetInitialWindowSize applies the peer's setting to our own grant instead of the peer's",
-        """		if err := s.send.SetInitialSize(n); err != nil {""",
-        """		if err := s.recv.SetInitialSize(n); err != nil {""",
+        """func (t *Table) SetInitialWindowSize(n uint32) error {
+	return t.sender.SetInitialSize(n)""",
+        """func (t *Table) SetInitialWindowSize(n uint32) error {
+	for _, s := range t.streams {
+		if err := s.recv.SetInitialSize(n); err != nil {
+			return err
+		}
+	}
+	return nil""",
         [
             "TestSetInitialWindowSizeAppliesADeltaToOpenStreams",
             "TestSetInitialWindowSizeAppliesToEveryOpenStream",
+            "TestSetInitialWindowSizeSizesStreamsOpenedAfterwards",
         ],
     ),
     (
         "SetInitialWindowSize applies the setting to the connection window too (RFC 9113 6.9.2)",
         """func (t *Table) SetInitialWindowSize(n uint32) error {
-	for _, s := range t.streams {""",
+	return t.sender.SetInitialSize(n)""",
         """func (t *Table) SetInitialWindowSize(n uint32) error {
-	if err := t.connSend.SetInitialSize(n); err != nil {
+	if err := t.connRecv.SetInitialSize(n); err != nil {
 		return err
 	}
-	for _, s := range t.streams {""",
+	return t.sender.SetInitialSize(n)""",
         ["TestSetInitialWindowSizeLeavesTheConnectionWindowAlone"],
     ),
 
@@ -718,16 +755,18 @@ BREAKS = [
     (
         "completeBlock sizes our own grant from the peer's setting (RFC 9113 6.9.2)",
         """		recv: flow.NewStreamWindow(b.id, flow.InitialWindowSize),""",
-        """		recv: flow.NewStreamWindow(b.id, t.peerInitialWindow),""",
+        """		recv: flow.NewStreamWindow(b.id, t.sender.InitialSize()),""",
         ["TestSetInitialWindowSizeSizesStreamsOpenedAfterwards"],
     ),
     (
-        "completeBlock ignores the peer's SETTINGS_INITIAL_WINDOW_SIZE for a new stream",
-        """		send: flow.NewStreamWindow(b.id, t.peerInitialWindow),""",
-        """		send: flow.NewStreamWindow(b.id, flow.InitialWindowSize),""",
+        "completeBlock opens the stream without a send window, so its response can never be written",
+        """	t.sender.Open(b.id)
+""",
+        "",
         [
+            "TestTheTableOnlyHoldsStreamsThatCountAsConcurrent",
+            "TestNewSizesNewStreamWindowsFromTheProtocolInitialSize",
             "TestSetInitialWindowSizeSizesStreamsOpenedAfterwards",
-            "TestSetInitialWindowSizeWithNoStreamsOpenIsRemembered",
         ],
     ),
     (
@@ -853,9 +892,9 @@ BREAKS = [
         ],
     ),
     (
-        "data debits the stream's send window with the peer's DATA",
+        "data debits the connection window twice instead of the stream's",
         """	if err := s.recv.Consume(n); err != nil {""",
-        """	if err := s.send.Consume(n); err != nil {""",
+        """	if err := t.connRecv.Consume(n); err != nil {""",
         [
             "TestPaddedDataIsFlowControlledByItsWholeLength",
             "TestDataRefusedByAStreamWindowIsStillCountedAgainstTheConnectionWindow",
@@ -1032,23 +1071,23 @@ BREAKS = [
         "windowUpdate refuses the credit 6.9 exempts by name, for a stream that is over",
         """		return nil
 	}
-	return s.send.Increase(f.Increment)""",
+	return t.sender.CreditStream(f.StreamID, f.Increment)""",
         """		return t.absent("WINDOW_UPDATE", f.StreamID)
 	}
-	return s.send.Increase(f.Increment)""",
+	return t.sender.CreditStream(f.StreamID, f.Increment)""",
         ["TestWindowUpdateOnAClosedStreamIsIgnored"],
     ),
     (
         "windowUpdate credits the window we grant the peer instead of the one it granted us",
-        """	return s.send.Increase(f.Increment)""",
-        """	return s.recv.Increase(f.Increment)""",
+        """	return t.sender.CreditStream(f.StreamID, f.Increment)""",
+        """	return t.streams[f.StreamID].recv.Increase(f.Increment)""",
         ["TestWindowUpdateCreditsTheStreamsSendWindow"],
     ),
     (
         "windowUpdate swallows an increment that takes a stream window past the maximum",
-        """	return s.send.Increase(f.Increment)
+        """	return t.sender.CreditStream(f.StreamID, f.Increment)
 }""",
-        """	s.send.Increase(f.Increment)
+        """	t.sender.CreditStream(f.StreamID, f.Increment)
 	return nil
 }""",
         ["TestWindowUpdateOverflowingAStreamWindowIsAStreamError"],
@@ -1099,6 +1138,17 @@ BREAKS = [
         [
             "TestTheTableOnlyHoldsStreamsThatCountAsConcurrent",
             "TestARefusedStreamDoesNotCountAgainstTheLimit",
+        ],
+    ),
+    (
+        "retire keeps the closed stream's send window, so its writer waits for the life of the process",
+        """		t.sender.Retire(s.id)
+""",
+        "",
+        [
+            "TestTheTableOnlyHoldsStreamsThatCountAsConcurrent",
+            "TestClosingAStreamTakesAwayItsSendWindow",
+            "TestResettingAStreamWakesTheGoroutineWritingItsResponse",
         ],
     ),
 

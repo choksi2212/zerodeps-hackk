@@ -115,6 +115,11 @@ type Sender struct {
 	//
 	// Two integer operations under a lock that is already held, and no production
 	// code reads it.
+	//
+	// Waiters exports it because the same guards are tested from internal/stream,
+	// which owns the map of streams this Sender's windows are keyed by and has its
+	// own reasons for a writer to be woken. Everything under internal/ is this
+	// module's own, so an accessor here commits nothing to anyone outside it.
 	waiting int
 }
 
@@ -389,8 +394,13 @@ func (s *Sender) Reserve(id uint32, want int) (int, error) {
 	}
 }
 
-// waiters is how many goroutines are parked in Reserve. See Sender.waiting.
-func (s *Sender) waiters() int {
+// Waiters is how many goroutines are parked in Reserve. See Sender.waiting.
+//
+// It counts a writer from before it waits until after it returns from waiting, so
+// a writer that has been broadcast to but has not yet re-acquired the lock is
+// still counted. A test can therefore use this to wait until a writer has reached
+// Reserve's park, and cannot use it to detect that a writer has been woken.
+func (s *Sender) Waiters() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.waiting

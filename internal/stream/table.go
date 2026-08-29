@@ -35,6 +35,17 @@ type Config struct {
 	// sleeps, and a test that sleeps is a test that is either slow or flaky
 	// depending on the machine.
 	Now func() time.Time
+
+	// Sender is the send half of this connection's flow control. Nil takes a fresh
+	// flow.NewSender.
+	//
+	// Accepted from the caller rather than only made here because it is the one
+	// piece of this table's state that outlives the reader goroutine's exclusive
+	// use of it: the connection has to reach Sender.Close during teardown, from
+	// whichever goroutine noticed, and a table that kept it entirely private would
+	// leave every parked writer waiting for the life of the process. It must not be
+	// shared between connections — the windows in it are one peer's grant.
+	Sender *flow.Sender
 }
 
 // Table is the stream table for one connection.
@@ -65,21 +76,25 @@ type Table struct {
 	// of the identifiers the peer skipped, which §5.1.1 closes implicitly.
 	highestRemote uint32
 
-	// connRecv is the connection's receive window, debited by every DATA frame
-	// that arrives. connSend is the peer's grant to us, credited by a stream-0
-	// WINDOW_UPDATE and spent by response bodies.
+	// connRecv is the connection's receive window, debited by every DATA frame that
+	// arrives.
 	//
-	// The connection windows live here rather than on the connection because this
-	// is where DATA is seen and where the streams that spend the send window are.
-	// internal/server holds neither and forwards the stream-0 WINDOW_UPDATE.
+	// It lives here rather than on the connection because this is where DATA is
+	// seen. internal/server holds no window at all and forwards the stream-0
+	// WINDOW_UPDATE.
 	connRecv *flow.Window
-	connSend *flow.Window
 
-	// peerInitialWindow is the peer's current SETTINGS_INITIAL_WINDOW_SIZE, which
-	// sizes the send window of every stream opened from now on. §6.9.2 applies a
-	// change to existing streams as a delta and to new ones as their starting
-	// size, so both the value and the deltas have to be kept.
-	peerInitialWindow uint32
+	// sender is the send half of the whole connection's flow control: the peer's
+	// grant to us for the connection, and the send window of every stream that is
+	// open. This table credits it from the reader goroutine; the goroutines writing
+	// responses spend it.
+	//
+	// It holds a second map of streams, keyed the same way as the one above, and
+	// keeping the two in step is this file's job: a stream is opened in it where it
+	// enters that map and retired where it leaves. The alternative — one map, with
+	// the state machine behind the Sender's mutex — would put every frame this
+	// package handles behind a lock that response bodies hold while they block.
+	sender *flow.Sender
 
 	// resets rate-limits RST_STREAM (CVE-2023-44487).
 	resets *limits.Bucket
@@ -142,19 +157,22 @@ func New(cfg Config) *Table {
 	if cfg.Now == nil {
 		cfg.Now = time.Now
 	}
+	if cfg.Sender == nil {
+		cfg.Sender = flow.NewSender()
+	}
 	return &Table{
 		codec:         cfg.Codec,
 		reqs:          cfg.Requests,
 		now:           cfg.Now,
 		maxConcurrent: cfg.MaxConcurrent,
 		streams:       make(map[uint32]*Stream),
-		connRecv:      flow.NewConnWindow(),
-		connSend:      flow.NewConnWindow(),
 
-		// The protocol's initial value, which both ends must assume until a
-		// SETTINGS frame says otherwise (§6.9.2). Not configurable, because the
-		// peer's setting arrives on the wire and ours governs the other direction.
-		peerInitialWindow: flow.InitialWindowSize,
+		// The protocol's initial value, which both ends must assume until a SETTINGS
+		// frame says otherwise (§6.9.2). Not configurable, because ours governs the
+		// direction the peer sends in and the peer's arrives on the wire — the
+		// Sender starts at the same value for the same reason.
+		connRecv: flow.NewConnWindow(),
+		sender:   cfg.Sender,
 
 		resets: limits.NewResetBucket(cfg.Now()),
 	}
@@ -164,9 +182,14 @@ func New(cfg Config) *Table {
 // those open or in either half-closed state.
 func (t *Table) Len() int { return len(t.streams) }
 
-// SendWindow is the connection's send window, which every response body is
-// debited from in addition to its own stream's (§6.9).
-func (t *Table) SendWindow() *flow.Window { return t.connSend }
+// Sender is the send half of this connection's flow control: the connection's
+// send window and the send window of every open stream, which every response body
+// is debited from (§6.9).
+//
+// The goroutine writing a response reserves credit through this rather than
+// touching a window directly, which is why no *flow.Window for the send direction
+// is reachable from this package at all.
+func (t *Table) Sender() *flow.Sender { return t.sender }
 
 // RecvWindow is the connection's receive window, which every DATA frame that
 // arrives has already been debited from.
@@ -212,10 +235,18 @@ func (t *Table) Stream(id uint32) *Stream { return t.streams[id] }
 // refuses new streams after exactly SETTINGS_MAX_CONCURRENT_STREAMS requests,
 // however long ago they finished.
 //
-// It takes the Stream rather than an identifier because the caller is the
-// goroutine writing that stream's response and already holds it, and because an
-// identifier would have to be looked up and found absent — which is not an error
-// worth a return value on a method whose whole job is bookkeeping.
+// It takes the Stream rather than an identifier because the caller already holds it
+// and because an identifier would have to be looked up and found absent — which is
+// not an error worth a return value on a method whose whole job is bookkeeping.
+//
+// Like every other method here it must be called from the connection's reader
+// goroutine, and that is worth saying explicitly because this is the one whose
+// cause is elsewhere: the news it records is made by the goroutine writing the
+// response, which is not the goroutine allowed to call this. The table has no lock
+// and is not going to get one — see the package comment on why the state machine
+// stays out from behind one — so the response side reports that it has finished and
+// the reader goroutine is what calls this. Wiring that up is internal/server's, and
+// until it exists nothing but the tests calls this at all.
 func (t *Table) SendEnd(s *Stream) {
 	if s.state == StateHalfClosedRemote {
 		// The peer had already finished, so this closes the stream outright.
@@ -267,31 +298,22 @@ func (t *Table) HandleFrame(f frame.Frame) error {
 // FLOW_CONTROL_ERROR, and internal/flow returns it at that scope because it is the
 // connection's window — this method adds nothing to the decision.
 func (t *Table) ConnWindowUpdate(increment uint32) error {
-	return t.connSend.Increase(increment)
+	return t.sender.CreditConn(increment)
 }
 
 // SetInitialWindowSize applies the peer's SETTINGS_INITIAL_WINDOW_SIZE (§6.9.2).
 //
 // §6.9.2 makes the change a delta on every stream that is already open and the
-// starting size for every stream opened afterwards, so both happen here. The
+// starting size for every stream opened afterwards, and flow.Sender does both. The
 // alternative — recording the value and letting each stream notice — is the bug
 // the RFC spends a paragraph warning about: a stream that applied the new size as
 // an assignment would hand itself back the credit it had already spent.
+//
+// An overflow on any one stream is connection-scoped, from internal/flow, because
+// the fault is in a SETTINGS frame and one frame can push any number of streams
+// over at once.
 func (t *Table) SetInitialWindowSize(n uint32) error {
-	for _, s := range t.streams {
-		if err := s.send.SetInitialSize(n); err != nil {
-			// Connection-scoped, from internal/flow, because the fault is in a
-			// SETTINGS frame. The streams iterated before this one keep the new
-			// size while the rest do not, and that is not worth unwinding: the
-			// connection is ending, and a map's iteration order makes "the rest"
-			// undefined anyway. peerInitialWindow below is left alone for the same
-			// reason — tidiness, not a guard, since no stream can be opened after
-			// a connection error to be sized from it.
-			return err
-		}
-	}
-	t.peerInitialWindow = n
-	return nil
+	return t.sender.SetInitialSize(n)
 }
 
 // headers begins a header block, either opening a stream or starting a trailer
@@ -507,11 +529,15 @@ func (t *Table) completeBlock() error {
 		// TestInitialSettingsDoesNotSetTheInitialWindowSize in internal/server
 		// fails if that ever stops being true without this following it.
 		recv: flow.NewStreamWindow(b.id, flow.InitialWindowSize),
-
-		// The peer's grant to us, at whatever it last advertised.
-		send: flow.NewStreamWindow(b.id, t.peerInitialWindow),
 	}
 	t.streams[b.id] = s
+
+	// The peer's grant to us, at whatever it last advertised, which the Sender is
+	// already holding. The two maps gain the stream together, and Open panics on an
+	// identifier that is already in it — which is the assertion that they have not
+	// drifted, since §5.1.1's strictly increasing identifiers make a repeat here
+	// impossible for any reason other than a bug in this file.
+	t.sender.Open(b.id)
 
 	// The state is settled before the request is delivered, so that a handler
 	// asking whether the body is finished gets the answer the wire gave rather
@@ -625,8 +651,7 @@ func (t *Table) priority(frame.PriorityFrame) error { return nil }
 
 // windowUpdate credits a stream's send window (§6.9).
 func (t *Table) windowUpdate(f frame.WindowUpdateFrame) error {
-	s := t.streams[f.StreamID]
-	if s == nil {
+	if t.streams[f.StreamID] == nil {
 		if t.StateOf(f.StreamID) == StateIdle {
 			return h2.ConnErrorf(h2.ProtocolError,
 				"WINDOW_UPDATE on idle stream %d (RFC 9113 §5.1)", f.StreamID)
@@ -635,9 +660,14 @@ func (t *Table) windowUpdate(f frame.WindowUpdateFrame) error {
 		// in the half-closed (remote) or closed state, because the peer sent it
 		// before it knew the stream was over, and "a receiver MUST NOT treat this
 		// as an error". There is no window left to credit.
+		//
+		// The Sender would drop it too, and for the same reason. It is decided here
+		// as well because the idle case above is not its to decide: telling an
+		// identifier that is over from one that was never used needs the state
+		// machine, and the Sender holds credit rather than states.
 		return nil
 	}
-	return s.send.Increase(f.Increment)
+	return t.sender.CreditStream(f.StreamID, f.Increment)
 }
 
 // absent is the error for a frame naming a stream that is not live: a connection
@@ -666,8 +696,15 @@ func (t *Table) absent(kind string, id uint32) error {
 // RST_STREAM sets the state directly, and recvEnd only reaches closed from
 // half-closed (local). Keeping the removal at the call sites is what makes the
 // map's invariant — nothing closed, nothing idle — one line to check.
+//
+// The stream's send window goes with it, which is what keeps the Sender's map in
+// step with this one. It also wakes whatever goroutine was writing that stream's
+// response, if the stream closed underneath it: a writer parked for credit on a
+// stream the peer has just reset would otherwise wait for a WINDOW_UPDATE the peer
+// has no reason to send.
 func (t *Table) retire(s *Stream) {
 	if s.state == StateClosed {
 		delete(t.streams, s.id)
+		t.sender.Retire(s.id)
 	}
 }

@@ -40,9 +40,9 @@ func waitForWaiters(t *testing.T, s *Sender, n int) {
 	t.Helper()
 
 	deadline := time.Now().Add(parkDeadline)
-	for s.waiters() < n {
+	for s.Waiters() < n {
 		if time.Now().After(deadline) {
-			t.Fatalf("waited %v for %d writers to park in Reserve; %d are", parkDeadline, n, s.waiters())
+			t.Fatalf("waited %v for %d writers to park in Reserve; %d are", parkDeadline, n, s.Waiters())
 		}
 		runtime.Gosched()
 	}
@@ -380,7 +380,7 @@ func TestReserveWaitsForAStreamWindowUpdate(t *testing.T) {
 	// what every wait in this file reads: one that only ever went up would make
 	// waitForWaiters return immediately for the rest of the run, and the tests that
 	// depend on a writer being asleep would be checking nothing.
-	if got := s.waiters(); got != 0 {
+	if got := s.Waiters(); got != 0 {
 		t.Errorf("%d writers are parked in Reserve after the last one returned, want 0", got)
 	}
 }
