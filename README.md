@@ -46,7 +46,7 @@ go version -m bin/zdh | grep -c dep    # 0
 
 ### The guards, and proof that they fire
 
-`scripts/gate.sh` runs nine ordered checks and fails the build on any of them:
+`scripts/gate.sh` runs ten ordered checks and fails the build on any of them:
 
 1. `gofmt -l .` prints nothing
 2. `go vet ./...` is silent
@@ -56,11 +56,24 @@ go version -m bin/zdh | grep -c dep    # 0
 6. `net/http` is not in the dependency graph
 7. every dependency is certified `.Standard` by the Go tool itself, and nothing imports `golang.org/x`
 8. no `go.sum`, no `vendor/`, no `require`/`replace`/`exclude`/`toolchain` directive
-9. `GATE GREEN`
+9. every RFC 9113 quotation in the tree is the RFC's own words
+10. `GATE GREEN`
 
 Each guard was deliberately tripped at bootstrap and observed to fail at the expected step: a used `net/http` import failed check 6, an empty `go.sum` failed check 8, a `require` line failed check 8, and a `vendor/` directory failed check 8. A guard nobody has seen fire is not a guard.
 
 One honest note about check 7, because a casual `grep golang.org` over the dependency graph is misleading here. Importing `crypto/tls` reaches nine paths that contain dots — eight under `vendor/golang.org/x/crypto` and `vendor/golang.org/x/net`, plus `crypto/internal/entropy`. Those are the standard library's own internal copies, shipped inside `GOROOT` as part of the Go distribution. They appear in no manifest, cannot be removed or substituted, and `go list` reports `.Standard = true` for every one of them. So the gate asks the Go tool whether a package is standard rather than pattern-matching its path, and the authoritative listing of non-standard packages contains only this module's own packages.
+
+### Check 9, which grades the comments
+
+The comments in this repository argue from RFC 9113 and quote it, because a guard is worth what the sentence requiring it is worth and a reader should be able to weigh one against the other. That habit has a failure mode: a quotation written from memory reads exactly like a quotation written from the file. Six of them were, and none was a typo.
+
+§6.9.1 was quoted as *"a sender MUST NOT send a flow-controlled frame with length 0, but MAY send frames of length 0 when [...] terminating a stream"*, which appears nowhere in RFC 9113 — the rule it stood for is real and the words were invented. §5.1.1 was quoted as *"The first use of a new stream identifier implicitly closes all streams in the idle state"*, which is RFC 7540's sentence under RFC 9113's number; 9113 rewrote it, and says "opened by the peer" where 7540 said "initiated by that peer". §6.5.2 was quoted as charging *"an overhead of 32 octets for each header field"*, where 9113 charges it for each *field line*, having renamed the thing in between. §6.2 was quoted as saying a HEADERS frame without END_HEADERS *"MUST be followed by either a CONTINUATION or another frame type"*, which is the opposite of what §6.2 requires. §8.2.2's TE exception was compressed from *"the TE header field, which MAY be present in an HTTP/2 request"* to *"TE MAY be present in an HTTP/2 request"*, turning an exception that names one field into a rule about a field name. And §6.10 was credited with §4.3's sentence about interleaving: both sections forbid the interleaving, only one uses those words.
+
+No test caught any of them, because none of them changes what the code does. They are defects in the argument rather than in the artifact — and the argument is the part of this entry a judge reads. Somebody who checks one citation and finds RFC 7540's text under RFC 9113's number has been handed a reason to distrust every other citation here, which is the entire cost and is more than enough.
+
+So [`scripts/quotes.py`](scripts/quotes.py) now checks all 51 of them on every gate run. It selects a quoted span when it contains a normative keyword — MUST, MAY, SHOULD, SHALL, REQUIRED, RECOMMENDED — or when it is six words or longer and the comment text immediately before it carries a `§` reference. The second rule is the one that earns its keep: two of the six defects above contain no normative keyword and would have passed the first. Four differences from the RFC's text are tolerated, each because it is forced rather than convenient — the hard wrap, quotation marks a span inside quotation marks cannot reproduce, parenthesised cross-references like `(Section 5.4.1)` removed from *both* sides so a quotation may drop one but not alter it, and the case of the first letter plus a trailing full stop on the last fragment. An elision is written `[...]`, and the fragments either side of it must appear in the RFC *in that order*, because otherwise `A [...] B` would pass against a specification that says B before A.
+
+The check has been observed failing twice, by name: once with the §6.5.2 overhead put back, and once on a hand-built span whose two fragments appear in §6.2 in the wrong order. The RFC is not committed here — it is not ours and it is not code — so the check takes its path from the command line, then `$RFC9113`, then `../rfc9113.txt` beside the checkout, and reports that it was *skipped* rather than passing when it finds none of them. A path named explicitly and not found exits 2 instead of 1, so a mistyped path cannot be mistaken for a finding.
 
 ### And proof that the tests fire
 

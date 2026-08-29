@@ -352,8 +352,8 @@ func TestNoAdvertisedHeaderListLimitAllowsAnySize(t *testing.T) {
 }
 
 func TestTheHeaderListSizeIsCountedTheWaySettingsDefinesIt(t *testing.T) {
-	// §6.5.2: "the uncompressed size of header fields, including the length of the
-	// name and value in octets plus an overhead of 32 octets for each header field".
+	// §6.5.2: "the uncompressed size of field lines, including the length of the name
+	// and value in units of octets plus an overhead of 32 octets for each field line".
 	// So the two fields below cost their octets plus 64, and the pair of subtests is
 	// the boundary either side of that number — which is the only way to tell the
 	// accounting from one that forgot the overhead, or charged it once, or measured

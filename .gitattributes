@@ -8,6 +8,7 @@
 *.go   text eol=lf
 *.md   text eol=lf
 *.sh   text eol=lf
+*.py   text eol=lf
 *.pem  text eol=lf
 
 # Byte-exact protocol fixtures must never be touched by any line-ending

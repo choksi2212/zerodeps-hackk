@@ -461,9 +461,9 @@ func TestStateOfIsIdleForAnIdentifierNobodyHasUsed(t *testing.T) {
 func TestStateOfIsClosedForAnIdentifierThePeerSkipped(t *testing.T) {
 	h := newHarness(t, Config{})
 	h.open(5, false)
-	// §5.1.1: "The first use of a new stream identifier implicitly closes all
-	// streams in the idle state that might have been initiated by that peer with a
-	// lower-valued stream identifier."
+	// §5.1.1: "When a stream transitions out of the idle state, all streams in the
+	// idle state that might have been opened by the peer with a lower-valued stream
+	// identifier immediately transition to closed."
 	h.assertState(1, StateClosed)
 	h.assertState(3, StateClosed)
 	h.assertState(5, StateOpen)
@@ -1161,11 +1161,11 @@ func TestDataPastTheConnectionWindowEndsTheConnection(t *testing.T) {
 }
 
 func TestAnEmptyDataFrameWithEndStreamClosesAnExhaustedStream(t *testing.T) {
-	// §6.9.1's exemption, end to end: "A sender MUST NOT allow a flow-control
-	// window to exceed 2^31-1 octets... A sender that has no credit MAY send a
-	// zero-length frame with the END_STREAM flag set." A server that refused this
-	// would park a finished stream behind a WINDOW_UPDATE nobody has a reason to
-	// send, and the stream would stay open until the idle timeout.
+	// §6.9.1's exemption, end to end: "Frames with zero length with the END_STREAM
+	// flag set (that is, an empty DATA frame) MAY be sent if there is no available
+	// space in either flow-control window." A server that refused this would park a
+	// finished stream behind a WINDOW_UPDATE nobody has a reason to send, and the
+	// stream would stay open until the idle timeout.
 	h := newHarness(t, Config{})
 	h.open(1, false)
 	// Spend the stream's whole receive window, and the connection's with it.

@@ -324,11 +324,11 @@ func (s *Sender) Close(err error) {
 // windows.
 //
 // want must be positive. Zero is not a request this type can answer, and it is not
-// a request a correct caller makes: §6.9.1 exempts an empty DATA frame from flow
-// control altogether — "a sender MUST NOT send a flow-controlled frame with length
-// 0, but MAY send frames of length 0 when [...] terminating a stream" — so a caller
-// with nothing to send must send it without reserving anything, rather than
-// reserving nothing and treating the result as permission.
+// a request a correct caller makes: §6.9.1 exempts the empty DATA frame from both
+// windows — "Frames with zero length with the END_STREAM flag set (that is, an empty
+// DATA frame) MAY be sent if there is no available space in either flow-control
+// window" — so a caller with nothing to send must send it without reserving
+// anything, rather than reserving nothing and treating the result as permission.
 //
 // Errors are the end of writing, not a smaller reservation to retry: ErrStreamGone
 // if the stream was retired while waiting, or Close's reason if the connection

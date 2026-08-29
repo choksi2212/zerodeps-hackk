@@ -265,12 +265,15 @@ func checkBlock(t *testing.T, fs []frame.Frame, id uint32, endStream bool, max i
 // blocks cuts a recorded frame stream into header blocks, failing the test if any of
 // them was interleaved with another.
 //
-// This is §6.10 as an assertion: "A HEADERS frame without the END_HEADERS flag set
-// MUST be followed by either a CONTINUATION or another frame type [...] An endpoint
-// MUST treat the receipt of any frames that interleave with the frame sequence [...]
-// as a connection error". A HEADERS frame opens a block; only CONTINUATION frames on
-// the same stream may follow until one sets END_HEADERS; anything else — a frame on
-// another stream, or a second HEADERS — means the burst was not enqueued as a unit.
+// This is §6.2 and §4.3 as an assertion: "A HEADERS frame without the END_HEADERS
+// flag set MUST be followed by a CONTINUATION frame for the same stream. A receiver
+// MUST treat the receipt of any other type of frame or a frame on a different stream
+// as a connection error [...] of type PROTOCOL_ERROR", and §4.3's requirement that a
+// field block be "transmitted as a contiguous sequence of frames, with no interleaved
+// frames of any other type or from any other stream". A HEADERS frame opens a block;
+// only CONTINUATION frames on the same stream may follow until one sets END_HEADERS;
+// anything else — a frame on another stream, or a second HEADERS — means the burst was
+// not enqueued as a unit.
 func blocks(t *testing.T, fs []frame.Frame) [][]frame.Frame {
 	t.Helper()
 

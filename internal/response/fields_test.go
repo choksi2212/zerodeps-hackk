@@ -142,10 +142,10 @@ func TestEveryRuleAResponseFieldListIsHeldTo(t *testing.T) {
 		{"upgrade", header, []h2.Field{status("200"), field("upgrade", "websocket")},
 			`"upgrade" (RFC 9113 §8.2.2)`},
 		{"te", header, []h2.Field{status("200"), field("te", "trailers")},
-			// The one that differs from the request side. §8.2.2's exception reads "TE
-			// MAY be present in an HTTP/2 request", so a response carrying TE — even
-			// with the value "trailers", which is the only value that exception allows —
-			// is not covered by it.
+			// The one that differs from the request side. §8.2.2's exception is written
+			// as "the TE header field, which MAY be present in an HTTP/2 request", so a
+			// response carrying TE — even with the value "trailers", which is the only
+			// value that exception allows — is not covered by it.
 			`the connection-specific header field "te" (RFC 9113 §8.2.2)`},
 		{"a connection-specific field in a trailer section", trailer,
 			[]h2.Field{field("transfer-encoding", "chunked")},

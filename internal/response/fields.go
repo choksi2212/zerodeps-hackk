@@ -191,9 +191,10 @@ func checkFieldLine(f h2.Field) error {
 // meaning belongs to one hop of an HTTP/1.1 connection.
 //
 // Six names rather than the request side's five, and the sixth is the interesting one.
-// §8.2.2's TE exception reads "TE MAY be present in an HTTP/2 request", so a TE field
-// in a response is not covered by it and is a connection-specific field like the rest —
-// the request-side check that accepts TE with the value "trailers" would be wrong here.
+// §8.2.2's TE exception is written as "the TE header field, which MAY be present in an
+// HTTP/2 request", so a TE field in a response is not covered by it and is a
+// connection-specific field like the rest — the request-side check that accepts TE with
+// the value "trailers" would be wrong here.
 // The field a response uses to announce a trailer section is Trailer (§6.6.2 of RFC
 // 9110), which is a regular field and needs no exception.
 func checkRegular(f h2.Field) error {

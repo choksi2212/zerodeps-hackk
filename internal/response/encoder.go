@@ -73,11 +73,10 @@ type Transport interface {
 }
 
 // fieldOverhead is what §6.5.2 charges for a field line on top of its name and
-// value: "an overhead of 32 octets for each header field", which stands for the
-// space an implementation needs to hold the field rather than for anything on the
-// wire. It is the reason SETTINGS_MAX_HEADER_LIST_SIZE cannot be checked against the
-// encoded block — the number the peer advertised is about a list, not about octets we
-// send.
+// value: "an overhead of 32 octets for each field line", which stands for the space
+// an implementation needs to hold the field rather than for anything on the wire. It
+// is the reason SETTINGS_MAX_HEADER_LIST_SIZE cannot be checked against the encoded
+// block — the number the peer advertised is about a list, not about octets we send.
 const fieldOverhead = 32
 
 // noHeaderListLimit is maxList when the peer has advertised no
@@ -114,11 +113,12 @@ var ErrHeaderListTooLarge = errors.New("response: header list exceeds the peer's
 // §4.3 of RFC 7541 states the requirement as being about a decoder processing blocks
 // "in the same order in which they were encoded".
 //
-// §6.10 adds a second reason on top of the first, and it applies even to a
-// connection with one stream: a HEADERS frame that does not set END_HEADERS must be
-// followed by CONTINUATION frames "with no interleaved frames of any other type or
-// from any other stream". The whole burst is therefore enqueued under this lock, so
-// that no other stream's DATA can land in the middle of it.
+// §4.3 adds a second reason on top of the first, and it applies even to a connection
+// with one stream: a field block "MUST be transmitted as a contiguous sequence of
+// frames, with no interleaved frames of any other type or from any other stream", and
+// §6.10 makes a receiver treat anything that does interleave as a connection error of
+// type PROTOCOL_ERROR. The whole burst is therefore enqueued under this lock, so that
+// no other stream's DATA can land in the middle of it.
 //
 // The cost is that a stream whose Enqueue blocks — a peer that has stopped reading,
 // with the writer's queue full — holds up every other stream's header section for as
