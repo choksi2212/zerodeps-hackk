@@ -52,10 +52,17 @@ type Config struct {
 	//
 	// Accepted from the caller rather than only made here because it is the one
 	// piece of this table's state that outlives the reader goroutine's exclusive
-	// use of it: the connection has to reach Sender.Close during teardown, from
-	// whichever goroutine noticed, and a table that kept it entirely private would
-	// leave every parked writer waiting for the life of the process. It must not be
-	// shared between connections — the windows in it are one peer's grant.
+	// use of it, and the one every goroutine writing a response holds: it is what
+	// they reserve credit through. That makes it needed a moment before this table
+	// exists — whatever turns a request into a goroutine has to be given it, and
+	// that thing is itself Config.Requests, so a table that made its own Sender and
+	// only handed it out afterwards would be a construction cycle rather than an
+	// arrangement.
+	//
+	// Close is reached through Table.Close, from the connection's teardown, and a
+	// table that kept the Sender entirely private would still leave every parked
+	// writer waiting for the life of the process. It must not be shared between
+	// connections — the windows in it are one peer's grant.
 	Sender *flow.Sender
 }
 
@@ -85,9 +92,10 @@ type Encoder interface {
 //
 // It satisfies internal/server's stream-handler interface: HandleFrame for the
 // frames that name a stream, ConnWindowUpdate and SetInitialWindowSize for the two
-// connection-level frames whose effect is entirely on streams, and
+// connection-level frames whose effect is entirely on streams,
 // SetHeaderTableSize and SetMaxHeaderListSize for the two SETTINGS parameters whose
-// effect is entirely on the responses this connection encodes.
+// effect is entirely on the responses this connection encodes, and Close for the
+// connection's ending reaching the goroutines that are waiting for send credit.
 type Table struct {
 	codec h2.HeaderCodec
 	reqs  Requests
@@ -389,6 +397,29 @@ func (t *Table) SetHeaderTableSize(n uint32) {
 // send, which is absurd and is still its own business.
 func (t *Table) SetMaxHeaderListSize(n uint32) {
 	t.enc.SetMaxHeaderListSize(n)
+}
+
+// Close records why the connection is over and wakes every goroutine parked for send
+// credit, each of which returns err (§6.9).
+//
+// The whole of it is flow control's, because flow control holds the only thing on a
+// connection that a goroutine waits for indefinitely. A stream's receive window is
+// credited by this table and read by nobody who blocks; a response's send window is
+// waited on by the goroutine writing that response, on a condition variable, which no
+// socket close and no stopped writer reaches. Nothing else here has anyone waiting on
+// it: the streams map, the reset bucket and the deferred verdict all belong to the
+// reader goroutine, and the reader goroutine is the one calling this.
+//
+// So the streams are not retired and the table is not emptied. Retiring them would
+// take away the send windows the parked goroutines are about to be woken from, and the
+// table is not read again after this — internal/server calls it as the last thing it
+// does, once, with the connection's read loop already stopped.
+//
+// A nil err panics, from flow.Sender.Close, which needs a non-nil reason to give the
+// writers it wakes. Not re-checked here: a second guard on the same argument one call
+// deeper would report the same mistake in a less specific message.
+func (t *Table) Close(err error) {
+	t.sender.Close(err)
 }
 
 // headers begins a header block, either opening a stream or starting a trailer

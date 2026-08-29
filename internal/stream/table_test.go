@@ -294,6 +294,48 @@ func (h *harness) spendSend(id uint32, n int) {
 	}
 }
 
+// sendResult is what a goroutine that was reserving send credit came back with.
+type sendResult struct {
+	n   int
+	err error
+}
+
+// reserveInBackground starts a goroutine reserving want octets on stream id, the way
+// the goroutine writing that stream's response body would, and hands back the one
+// value it will ever produce.
+//
+// The channel is buffered so that a test which gives up waiting does not leave the
+// goroutine blocked on a send nobody will receive.
+func (h *harness) reserveInBackground(id uint32, want int) chan sendResult {
+	out := make(chan sendResult, 1)
+	go func() {
+		n, err := h.tab.Sender().Reserve(id, want)
+		out <- sendResult{n, err}
+	}()
+	return out
+}
+
+// awaitParkedWriters waits until n goroutines are asleep inside Reserve.
+//
+// Parked, rather than merely started: a test about waking writers has to arrive while
+// they are asleep, because one that has not reached the park yet would return for
+// whatever it found on the way in rather than for the thing being tested, and would
+// pass whether or not the wake-up works.
+//
+// The spin is the only way to see this. Sender.Waiters counts a writer from before it
+// waits until after it returns from waiting, so it cannot be used the other way round
+// to detect a writer that has been woken; time.Sleep would be a guess.
+func (h *harness) awaitParkedWriters(n int) {
+	h.t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for h.tab.Sender().Waiters() < n {
+		if time.Now().After(deadline) {
+			h.t.Fatalf("only %d of %d writers parked in Reserve within 5s", h.tab.Sender().Waiters(), n)
+		}
+		runtime.Gosched()
+	}
+}
+
 // events is the recorder's log, formatted.
 func (h *harness) events() string { return h.reqs.String() }
 
@@ -1830,27 +1872,12 @@ func TestResettingAStreamWakesTheGoroutineWritingItsResponse(t *testing.T) {
 
 	// Nothing left on the stream's window, so the next reservation has to park.
 	h.spendSend(1, flow.InitialWindowSize)
+	out := h.reserveInBackground(1, 1)
 
-	type result struct {
-		n   int
-		err error
-	}
-	out := make(chan result, 1)
-	go func() {
-		n, err := h.tab.Sender().Reserve(1, 1)
-		out <- result{n, err}
-	}()
-
-	// Parked, rather than merely started: the RST_STREAM has to arrive while the
-	// writer is asleep, because a writer that has not reached Reserve yet would find
-	// the stream already gone and return for a different reason.
-	deadline := time.Now().Add(5 * time.Second)
-	for h.tab.Sender().Waiters() == 0 {
-		if time.Now().After(deadline) {
-			t.Fatal("the writer never parked in Reserve")
-		}
-		runtime.Gosched()
-	}
+	// The RST_STREAM has to arrive while the writer is asleep, because a writer that
+	// has not reached Reserve yet would find the stream already gone and return for a
+	// different reason.
+	h.awaitParkedWriters(1)
 
 	h.mustSend(frame.RSTStreamFrame{StreamID: 1, ErrCode: h2.Cancel})
 
@@ -1862,6 +1889,92 @@ func TestResettingAStreamWakesTheGoroutineWritingItsResponse(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("RST_STREAM did not wake the writer within 5s; it would wait for the life of the process")
 	}
+}
+
+// --- the connection's ending -----------------------------------------------
+
+func TestCloseWakesEveryGoroutineParkedForSendCredit(t *testing.T) {
+	// The leak that closing a socket does not fix. A writer parked for credit is
+	// asleep on a condition variable, not on the connection, so nothing the transport
+	// or the writer goroutine does reaches it: only this does.
+	//
+	// Three streams rather than one, because the loop that wakes them is one place a
+	// mistake can stop early, and because the reason has to reach the last of them as
+	// well as the first.
+	gone := errors.New("the peer hung up mid-download")
+
+	h := newHarness(t, Config{})
+	ids := []uint32{1, 3, 5}
+
+	// The connection's send window is shared between the streams and starts at the
+	// same 65535 one stream's does, so draining three stream windows costs three times
+	// that. Without this credit the *first* stream's writer would empty the connection
+	// and the second one would park during the setup rather than in the test, which is
+	// a deadlock in spendSend and not a failure. A peer sends exactly this
+	// WINDOW_UPDATE, for the same arithmetic, on any download larger than a window.
+	if err := h.tab.ConnWindowUpdate(uint32(len(ids)) * flow.InitialWindowSize); err != nil {
+		t.Fatalf("crediting the connection's send window: %v", err)
+	}
+
+	outs := make([]chan sendResult, 0, len(ids))
+	for _, id := range ids {
+		h.open(id, false)
+		h.spendSend(id, flow.InitialWindowSize)
+		outs = append(outs, h.reserveInBackground(id, 1))
+	}
+	h.awaitParkedWriters(len(ids))
+
+	h.tab.Close(gone)
+
+	for i, out := range outs {
+		select {
+		case got := <-out:
+			// The connection's own reason, not a substitute for it: what wakes
+			// these writers is also what their callers will log, and a generic
+			// error there is a support case nobody can answer.
+			if !errors.Is(got.err, gone) {
+				t.Errorf("the writer on stream %d returned %d, %v; want %v", ids[i], got.n, got.err, gone)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("the writer on stream %d was not woken within 5s; it would wait for the life of the process", ids[i])
+		}
+	}
+}
+
+func TestCloseLeavesTheStreamsWhereTheyAre(t *testing.T) {
+	// Close wakes the writers; it does not retire the streams they are writing, and
+	// the two cannot be combined. Retiring takes a stream's send window away, so a
+	// teardown that emptied the table as it went would be racing itself: whether a
+	// woken writer saw the connection's reason or flow.ErrStreamGone would come down
+	// to which of the two reached it first.
+	//
+	// Nothing reads the table after this either — internal/server calls it as the last
+	// thing it does, with the read loop already stopped — so emptying it would buy
+	// nothing in exchange.
+	h := newHarness(t, Config{})
+	h.open(1, false)
+	h.open(3, false)
+
+	h.tab.Close(errors.New("the peer hung up mid-download"))
+
+	if got := h.tab.Len(); got != 2 {
+		t.Errorf("the table holds %d streams after the connection ended, want the 2 that were open", got)
+	}
+	h.assertState(1, StateOpen)
+	h.assertState(3, StateOpen)
+	if _, ok := h.tab.Sender().Available(1); !ok {
+		t.Error("stream 1 lost its send window, which is what a woken writer reads its error through")
+	}
+}
+
+func TestClosePanicsWithoutAReason(t *testing.T) {
+	// The guard belongs to flow.Sender.Close, which has to hand the writers it wakes
+	// something to return; a nil there would be indistinguishable from a reservation
+	// that succeeded. Asserted from up here because delegating is the whole of this
+	// method, and a Close that quietly stopped delegating would take the guard with it
+	// — this test is the second thing such a change breaks.
+	h := newHarness(t, Config{})
+	assertPanics(t, "Table.Close with no reason", func() { h.tab.Close(nil) })
 }
 
 // --- dispatch and error propagation ---------------------------------------

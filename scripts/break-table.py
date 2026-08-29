@@ -59,9 +59,21 @@ peer offering more encoding context than this server wants is offering, and decl
 is free; a peer offering less, or none, is stating what its own decoder will keep, and
 there is nothing there to decline.
 
+Close is about no frame at all, and its three breaks are the three ways a teardown
+goes wrong: saying nothing, saying something else, and tidying up on the way out. All
+three are invisible to a suite that only sends frames, because what they damage is a
+goroutine that is not in this package and is asleep. Saying nothing leaks a request, a
+response and a stack per parked writer, for the life of the process, on the ordinary
+event of a peer hanging up mid-download. Saying something else — a stand-in error in
+place of the connection's own — reaches the writer, so nothing leaks, and the operator
+reading its log is told the stream was gone when in fact the peer went away. Retiring
+the streams on the way out looks like housekeeping and is a race: retire takes a
+stream's send window with it, so whether a woken writer sees the connection's reason or
+flow.ErrStreamGone comes down to which reached it first.
+
 Every guard in the file has a break here, both scopes of every error that has a
 choice of scope, and every message has one that strips its section reference.
-All 125 are caught, and three of them are worth knowing about for how they are caught
+All 128 are caught, and three of them are worth knowing about for how they are caught
 rather than that they are: removing the CONTINUATION-with-no-block guard, dropping
 the streams map from the constructor, and letting New skip making a Sender all
 produce a nil dereference rather than a failed assertion. All three still report as an
@@ -488,6 +500,43 @@ BREAKS = [
             "TestSetHeaderTableSizeReachesTheEncoder",
             "TestTheTwoHeaderSettingsAreNotCrossed",
         ],
+    ),
+
+    # --- Close: the connection's ending reaching flow control ----------------
+    (
+        "Close tells flow control nothing, so every parked writer waits for the life of the process",
+        """func (t *Table) Close(err error) {
+	t.sender.Close(err)
+}""",
+        """func (t *Table) Close(err error) {
+}""",
+        [
+            "TestCloseWakesEveryGoroutineParkedForSendCredit",
+            "TestClosePanicsWithoutAReason",
+        ],
+    ),
+    (
+        "Close hands flow control a stand-in reason instead of the one the connection ended for",
+        """	t.sender.Close(err)""",
+        """	t.sender.Close(flow.ErrStreamGone)""",
+        [
+            "TestCloseWakesEveryGoroutineParkedForSendCredit",
+            "TestClosePanicsWithoutAReason",
+        ],
+    ),
+    (
+        "Close retires the streams as it wakes their writers, taking away the windows they wake on",
+        """func (t *Table) Close(err error) {
+	t.sender.Close(err)
+}""",
+        """func (t *Table) Close(err error) {
+	for _, s := range t.streams {
+		s.state = StateClosed
+		t.retire(s)
+	}
+	t.sender.Close(err)
+}""",
+        ["TestCloseLeavesTheStreamsWhereTheyAre"],
     ),
 
     # --- headers: which of the two kinds of block this is --------------------

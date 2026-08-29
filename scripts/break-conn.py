@@ -25,6 +25,18 @@ been sent. Both breaks are that skip, and TestServeForwardsAHeaderSettingOfZero 
 test that notices; nothing else in the suite does, because every other setting in it is
 non-zero on purpose.
 
+A sixth is not about a frame at all. Serve tells the stream layer why the connection
+ended, and the reason that hook exists is a goroutine writing a response body: it is
+parked on a condition variable inside flow control, so closing the socket does not reach
+it and neither does stopping the writer. The break that deletes the call leaks a
+request, a response and a stack per parked writer for the life of the process, on the
+ordinary event of a peer hanging up mid-download, and a suite that only looks at the
+wire cannot see it. Two more are about *when*: called sequentially after the read loop
+instead of deferred, it is skipped entirely when the read loop panics -- which is the
+one ending a server survives, because runConn recovers it -- and it runs before the
+writer has stopped, so a writer this call wakes may put a frame on the wire behind the
+GOAWAY that has already gone out.
+
 Two guards in discard have no break, and both are named rather than quietly skipped.
 
   * c.w.Close(). Removing it does not fail a test, it deadlocks one: the writer sits
@@ -204,6 +216,57 @@ BREAKS = [
         """		sendErr = c.farewell(ce.Code, ce.Reason)""",
         """		c.w.Close()""",
         ["TestServeRejectsAnHTTP1Request", "TestServeStopsOnAConnectionErrorFromTheHandler"],
+    ),
+
+    (
+        "Serve: the stream layer is never told the connection ended, so a writer parked for credit waits for the life of the process",
+        """	ended := errReadLoopPanicked
+	defer func() { c.handler.Close(ended) }()
+
+	err := c.run()
+	ended = err
+""",
+        """	err := c.run()
+""",
+        [
+            "TestServeAlwaysTellsTheStreamLayerWhyTheConnectionEnded",
+            "TestServeWakesTheStreamLayerWhenTheReadLoopPanics",
+            "TestServeClosesTheStreamLayerAfterTheWriterHasStopped",
+        ],
+    ),
+    (
+        "Serve: the stream layer is told the read loop panicked whatever actually ended the connection",
+        """	err := c.run()
+	ended = err
+""",
+        """	err := c.run()
+""",
+        [
+            "TestServeAlwaysTellsTheStreamLayerWhyTheConnectionEnded",
+            "TestServeStopsOnAConnectionErrorFromTheHandler",
+        ],
+    ),
+    (
+        "Serve: the stream layer is closed as soon as the read loop stops, so a woken writer can queue a frame behind the GOAWAY",
+        """	ended := errReadLoopPanicked
+	defer func() { c.handler.Close(ended) }()
+
+	err := c.run()
+	ended = err
+""",
+        """	err := c.run()
+	c.handler.Close(err)
+""",
+        [
+            "TestServeClosesTheStreamLayerAfterTheWriterHasStopped",
+            "TestServeWakesTheStreamLayerWhenTheReadLoopPanics",
+        ],
+    ),
+    (
+        "Serve: a read loop that panicked wakes its writers with no reason at all",
+        """	ended := errReadLoopPanicked""",
+        """	var ended error""",
+        ["TestServeWakesTheStreamLayerWhenTheReadLoopPanics"],
     ),
 
     # --- discard -------------------------------------------------------------

@@ -135,6 +135,34 @@ type StreamHandler interface {
 	// nothing to range-check either: a peer that sets it to zero has asked for a
 	// connection on which every response is refused, and it is entitled to.
 	SetMaxHeaderListSize(n uint32)
+
+	// Close says the connection is over and why, and is the one method here that is
+	// about no frame at all.
+	//
+	// The reason exists to be handed to goroutines that are parked waiting for
+	// something this connection can no longer produce. The one that matters is send
+	// credit: a goroutine writing a response body waits on a condition variable
+	// inside flow control, not on the socket, so closing the socket does not reach it
+	// and neither does stopping the writer. Without this it waits for the life of the
+	// process, holding a request, a response and a stack — which is a leak an
+	// ordinary peer causes by hanging up mid-download.
+	//
+	// err is never nil, and is whatever ended the connection: one of this file's four
+	// sentinels, an h2.ConnError, a transport error, or the read loop panicking. A
+	// parked writer is owed the actual reason rather than a generic one, because the
+	// reason is what its own caller will log.
+	//
+	// Called exactly once per connection, from the reader goroutine, as the last
+	// thing Serve does — after the writer has stopped, so a writer this call wakes
+	// can no longer put a frame on the wire behind the GOAWAY that has already gone
+	// out. Deferred rather than sequential, so a read loop that panicked wakes them
+	// too; that panic is recovered one frame up and would otherwise leave every
+	// parked writer behind.
+	//
+	// Implementations may be called while other goroutines are still inside them —
+	// that is the entire point — so this is the one method here with no exclusive
+	// access to anything.
+	Close(err error)
 }
 
 // The four ways a connection ends with nobody at fault.
@@ -152,6 +180,16 @@ var (
 	errIdle         = errors.New("connection idle")
 	errShuttingDown = errors.New("server shutting down")
 )
+
+// errReadLoopPanicked is what goroutines parked in flow control are told when the
+// read loop panicked rather than returned.
+//
+// Separate from the four above because it is not an ending with nobody at fault, and
+// separate from the errors they are otherwise given because there is no error to give:
+// a panic is a value, and by the time StreamHandler.Close is reached it belongs to the
+// recover one frame up, in runConn, which logs it with its stack. All this has to do is
+// be non-nil and say which of the connection's endings this was.
+var errReadLoopPanicked = errors.New("connection read loop panicked")
 
 // readDeadlineKind says which of the connection's read deadlines the current read
 // is running under.
@@ -301,7 +339,23 @@ func initialSettings() frame.SettingsFrame {
 func (c *conn) Serve() error {
 	defer c.sock.Close()
 
+	// ended is the reason this connection is over, as the goroutines writing
+	// responses will be told it, and it is a variable closed over by a defer rather
+	// than an argument for one reason: a panic in the read loop has to reach flow
+	// control too. That panic is recovered by runConn, so the process survives it and
+	// every goroutine parked for send credit on this connection does not — it waits
+	// on a condition variable no surviving goroutine will signal.
+	//
+	// Registered after the socket's close and therefore run before it, and run after
+	// the writer has been waited for, which is what stops a writer woken here from
+	// enqueueing a frame behind the GOAWAY. Nothing below is allowed to nil it: the
+	// four sentinel endings are set to nil in err so Serve does not report them as
+	// failures, and a parked writer still needs to be told which one it was.
+	ended := errReadLoopPanicked
+	defer func() { c.handler.Close(ended) }()
+
 	err := c.run()
+	ended = err
 
 	// sendErr is a failure to deliver the final GOAWAY, kept apart from err
 	// because it is a consequence of the ending rather than the ending itself.
@@ -390,6 +444,13 @@ func (c *conn) Serve() error {
 // Both errors are returned together rather than one being chosen. They describe
 // different halves of the same teardown, and a caller logging this wants whichever of
 // them is not nil without having to ask twice.
+//
+// The stream handler is deliberately not closed here, and this is the only path on
+// which it is not. StreamHandler.Close exists to hand a reason to goroutines parked
+// waiting for something the connection can no longer produce, and on this path there
+// are none: no frame has been dispatched, so nothing has been given a response to
+// write or credit to wait for. Serve is where a connection acquires goroutines and
+// Serve is where they are woken.
 func (c *conn) discard() error {
 	c.w.Close()
 	return errors.Join(c.w.Wait(), c.sock.Close())
