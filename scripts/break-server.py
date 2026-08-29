@@ -26,6 +26,25 @@ oversights:
   test. The close is also what keeps every other path out of Serve safe as more
   are added.
 
+One break is worth reading for what it measured rather than for what it caught.
+Deleting runConn's whole handshake step leaves a well-behaved client served
+correctly: TestServeTLSServesHTTP2ToAClientThatNegotiatesIt passes. That is not a
+hole in the suite, it is the truth about the guard. ServeTLS hands runConn a
+*tls.Conn from tls.NewListener, and crypto/tls handshakes lazily on the first Read
+— which arrives a moment later inside conn.Serve — negotiating h2 from the server's
+own NextProtos with no help from this package. A good client cannot tell the
+difference, and the happy-path test was named on that break in the belief that it
+could. It was wrong, and the break now names only the two tests that do fail.
+
+What the explicit handshake is worth is therefore entirely in the connections that
+are not well-behaved, and those are exactly what the other two tests hold: a client
+that negotiates no protocol is refused rather than answered with SETTINGS, and a
+client that never sends a ClientHello is timed out on Timeouts.TLSHandshake instead
+of sitting on the preface clock. Both fire. Written down because the same reasoning
+would otherwise recur as "the eager handshake buys nothing, so move it back into
+Serve" — it buys nothing on the path that works and everything on the two that
+don't.
+
 Run from the repository root. Restores the file on the way out, including on error.
 """
 
@@ -267,9 +286,79 @@ BREAKS = [
     ),
     (
         "runConn: a connection that failed is logged without the peer or the reason",
-        """		s.logf("connection from %v: %v", nc.RemoteAddr(), err)""",
-        """		s.logf("a connection ended")""",
+        """	if err := c.Serve(); err != nil {
+		s.logf("connection from %v: %v", nc.RemoteAddr(), err)
+	}""",
+        """	if err := c.Serve(); err != nil {
+		s.logf("a connection ended")
+	}""",
         ["TestServerLogsWhyAConnectionEnded"],
+    ),
+
+    # --- the TLS handshake step ----------------------------------------------
+    #
+    # The handshake itself is broken in scripts/break-tls.py, against the file it
+    # lives in. What is broken here is runConn's use of it: whether it happens at
+    # all, whether a refusal is reported, and whether a connection that was refused
+    # is actually taken down rather than served.
+    (
+        "runConn: TLS is never negotiated, so every h2 client is answered in cleartext",
+        """	if err := s.handshake(nc); err != nil {
+		s.logf("connection from %v: %v", nc.RemoteAddr(), err)
+		if derr := c.discard(); derr != nil {
+			s.logf("connection from %v: closing it after the failed handshake: %v", nc.RemoteAddr(), derr)
+		}
+		return
+	}
+
+""",
+        "",
+        [
+            # Deliberately not TestServeTLSServesHTTP2ToAClientThatNegotiatesIt. It
+            # passes with this whole block removed, and that is the finding rather than
+            # a hole: see the note in the docstring.
+            "TestServeTLSRefusesAClientThatNegotiatesNoProtocol",
+            "TestServeTLSDropsAClientThatNeverSendsAClientHello",
+        ],
+    ),
+    (
+        "runConn: a refused handshake is silent, so a misconfigured client is undiagnosable",
+        """		s.logf("connection from %v: %v", nc.RemoteAddr(), err)
+		if derr := c.discard(); derr != nil {""",
+        """		if derr := c.discard(); derr != nil {""",
+        [
+            "TestServeTLSRefusesAClientThatNegotiatesNoProtocol",
+            "TestServeTLSDropsAClientThatNeverSendsAClientHello",
+            "TestServeTLSRefusesAClientThatOffersAProtocolNobodyShares",
+        ],
+    ),
+    (
+        "runConn: a refused connection is returned from without closing its socket",
+        """		if derr := c.discard(); derr != nil {
+			s.logf("connection from %v: closing it after the failed handshake: %v", nc.RemoteAddr(), derr)
+		}
+		return""",
+        """		return""",
+        [
+            "TestServeTLSDropsAClientThatNeverSendsAClientHello",
+            "TestServeTLSRefusesAClientThatNegotiatesNoProtocol",
+        ],
+    ),
+    (
+        "runConn: a refused connection falls through and is served HTTP/2 anyway",
+        """		if derr := c.discard(); derr != nil {
+			s.logf("connection from %v: closing it after the failed handshake: %v", nc.RemoteAddr(), derr)
+		}
+		return
+	}""",
+        """		if derr := c.discard(); derr != nil {
+			s.logf("connection from %v: closing it after the failed handshake: %v", nc.RemoteAddr(), derr)
+		}
+	}""",
+        [
+            "TestServeTLSRefusesAClientThatNegotiatesNoProtocol",
+            "TestServeTLSDropsAClientThatNeverSendsAClientHello",
+        ],
     ),
     (
         "logf: a server with no log dereferences it anyway",

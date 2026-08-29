@@ -396,6 +396,26 @@ func assertLogged(t *testing.T, rec *logRecorder, want string) {
 	}
 }
 
+// assertLoggedLines checks the log has exactly n lines in it.
+//
+// A count rather than a substring, because one of the things that can go wrong on a
+// refused connection is *extra* correctness-shaped noise. A runConn that logs the
+// refusal and then carries on into Serve produces a second line — the connection
+// failing on a socket it has already closed — and every substring assertion in the
+// suite still holds, because the line it was looking for is there. What changed is
+// that the server did more work on a connection it had decided to drop.
+//
+// Call it after the server has stopped. Before that the count is a race: the line is
+// written by the connection's own goroutine.
+func assertLoggedLines(t *testing.T, rec *logRecorder, n int) {
+	t.Helper()
+	text := rec.text()
+	got := strings.Count(text, "\n")
+	if got != n {
+		t.Errorf("the log has %d lines, want exactly %d:\n%s", got, n, text)
+	}
+}
+
 // poll waits for cond, failing with why if it has not come true within limit.
 func poll(t *testing.T, limit time.Duration, cond func() bool, why func() string) {
 	t.Helper()

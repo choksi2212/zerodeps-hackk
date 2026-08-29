@@ -16,6 +16,26 @@ flag and the loop arming the deadline for its next read. Removing it leaves a
 server that answers a shutdown when the connection next hears from its peer, which
 on an idle connection is a minute later and on an abandoned one is never.
 
+Two guards in discard have no break, and both are named rather than quietly skipped.
+
+  * c.w.Close(). Removing it does not fail a test, it deadlocks one: the writer sits
+    on its queue for ever and the c.w.Wait() on the next line never returns. A
+    deadlock is not a detection — this harness would report it as a hang, which it
+    counts as a hole, and rightly, because nothing in the suite would have said what
+    was wrong.
+
+  * The waiting itself, as distinct from the error it collects. Dropping the error
+    is broken below and caught. Dropping the wait while keeping the Close is not
+    observable here: the writer's queue is always empty on this path, because discard
+    runs before Serve and therefore before anything has been enqueued, so the
+    goroutine returns as soon as it is signalled whether or not anyone waits. The
+    goroutine-leak assertion polls, so it would come back green either way.
+
+Related, and for the same reason: c.w.Close() and c.w.Shutdown() are
+indistinguishable on this path. Shutdown flushes what is queued, Close does not, and
+with an empty queue those are the same thing. The distinction matters in Serve, where
+it is broken and caught.
+
 Run from the repository root. Restores the file on the way out, including on error.
 """
 
@@ -138,6 +158,30 @@ BREAKS = [
         """		sendErr = c.farewell(ce.Code, ce.Reason)""",
         """		c.w.Close()""",
         ["TestServeRejectsAnHTTP1Request", "TestServeStopsOnAConnectionErrorFromTheHandler"],
+    ),
+
+    # --- discard -------------------------------------------------------------
+    #
+    # The teardown for a connection that never became one: a TLS handshake that
+    # failed, or one that succeeded and negotiated something this server does not
+    # speak. Serve never ran, so nothing else is going to close the socket, and
+    # there is no HTTP/2 session to send a GOAWAY over.
+    (
+        "discard: the socket is left open, so every refused handshake leaks a descriptor",
+        """	return errors.Join(c.w.Wait(), c.sock.Close())""",
+        """	return c.w.Wait()""",
+        [
+            "TestDiscardClosesTheSocketWithoutWritingToIt",
+            "TestDiscardReportsBothHalvesOfTheTeardown",
+            "TestServeTLSDropsAClientThatNeverSendsAClientHello",
+        ],
+    ),
+    (
+        "discard: the writer is never waited for, so its failure is discarded with it",
+        """	return errors.Join(c.w.Wait(), c.sock.Close())""",
+        """	c.w.Wait()
+	return c.sock.Close()""",
+        ["TestDiscardReportsBothHalvesOfTheTeardown"],
     ),
     (
         "Serve: a broken socket is sent a GOAWAY, whose failure competes with the real error",
