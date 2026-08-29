@@ -122,6 +122,20 @@ func (w *frameWriter) SetMaxFrameSize(size uint32) {
 	w.fw.SetMaxFrameSize(size)
 }
 
+// MaxFrameSize is the largest payload this writer will send, which is the peer's
+// SETTINGS_MAX_FRAME_SIZE or §6.5.2's 16384, whichever is larger.
+//
+// Safe to call from any goroutine, and read fresh on every call rather than once
+// per response: the value a stream goroutine gets is whatever the peer's most
+// recent SETTINGS said, and two calls a moment apart may disagree. That is not a
+// race to be closed but the protocol working as specified — a response split at the
+// old cap is still legal, because §6.5.3 makes the acknowledgement the point from
+// which the new value binds and this writer sends nothing between the two reads
+// that depends on them agreeing.
+func (w *frameWriter) MaxFrameSize() uint32 {
+	return w.fw.MaxFrameSize()
+}
+
 // Enqueue hands f to the writer goroutine, blocking while the queue is full.
 //
 // Blocking is correct here, and is the backpressure the connection is built on. A

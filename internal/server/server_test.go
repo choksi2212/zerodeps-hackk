@@ -315,12 +315,12 @@ func (r *logRecorder) text() string {
 
 // testServer returns a server logging into a recorder. A nil factory gets
 // rejectingHandler, which fails the test if any frame reaches the stream layer.
-func testServer(t *testing.T, cfg Config, newHandler func(FrameEnqueuer) StreamHandler) (*Server, *logRecorder) {
+func testServer(t *testing.T, cfg Config, newHandler func(ConnWriter) StreamHandler) (*Server, *logRecorder) {
 	t.Helper()
 	rec := &logRecorder{}
 	cfg.ErrorLog = log.New(rec, "", 0)
 	if newHandler == nil {
-		newHandler = func(FrameEnqueuer) StreamHandler { return rejectingHandler(t) }
+		newHandler = func(ConnWriter) StreamHandler { return rejectingHandler(t) }
 	}
 	return New(newHandler, cfg), rec
 }
@@ -530,7 +530,7 @@ func TestServerBoundsConcurrentConnections(t *testing.T) {
 // config empty, because both are security-relevant and both fail silently: an
 // unbounded connection count and a set of zero deadlines that expire immediately.
 func TestServerFillsUnsetConfig(t *testing.T) {
-	s := New(func(FrameEnqueuer) StreamHandler { return rejectingHandler(t) }, Config{})
+	s := New(func(ConnWriter) StreamHandler { return rejectingHandler(t) }, Config{})
 
 	if got := cap(s.slots); got != limits.MaxConns {
 		t.Errorf("an empty Config gives room for %d connections, want limits.MaxConns = %d",
@@ -569,7 +569,7 @@ func TestServerNewRequiresAHandlerFactory(t *testing.T) {
 // of answering.
 type taggedHandler struct {
 	StreamHandler
-	w FrameEnqueuer
+	w ConnWriter
 }
 
 // TestServerBuildsAHandlerPerConnection is the claim on Server.newHandler, and it is
@@ -589,7 +589,7 @@ func TestServerBuildsAHandlerPerConnection(t *testing.T) {
 
 	var mu sync.Mutex
 	var handlers []*taggedHandler
-	newHandler := func(w FrameEnqueuer) StreamHandler {
+	newHandler := func(w ConnWriter) StreamHandler {
 		h := &taggedHandler{StreamHandler: rejectingHandler(t), w: w}
 		mu.Lock()
 		handlers = append(handlers, h)
@@ -997,11 +997,11 @@ func TestServerShutdownForcesAStalledConnectionPastTheGrace(t *testing.T) {
 // that is not blocked on the socket. Both Shutdown and Close have to give up on it and
 // say so, which is what the two tests below check — and it is not a contrived state:
 // any handler that waits on a backend, a lock, or a disk can be in it.
-func wedgedHandler() (newHandler func(FrameEnqueuer) StreamHandler, entered <-chan struct{}, release func()) {
+func wedgedHandler() (newHandler func(ConnWriter) StreamHandler, entered <-chan struct{}, release func()) {
 	in := make(chan struct{})
 	out := make(chan struct{})
 	var once sync.Once
-	factory := func(FrameEnqueuer) StreamHandler {
+	factory := func(ConnWriter) StreamHandler {
 		return handlerFunc(func(frame.Frame) error {
 			once.Do(func() { close(in) })
 			<-out
@@ -1239,7 +1239,7 @@ func TestServerShutdownReachesAConnectionAcceptedInTheRace(t *testing.T) {
 func TestServerRecoversFromAPanickingHandler(t *testing.T) {
 	baseline := goroutineBaseline()
 
-	handler := func(FrameEnqueuer) StreamHandler {
+	handler := func(ConnWriter) StreamHandler {
 		return handlerFunc(func(frame.Frame) error {
 			panic("a bug reached through a peer's frame")
 		})
@@ -1321,7 +1321,7 @@ func TestServerWithNoLogDiscardsEveryLine(t *testing.T) {
 
 	boom := errors.New("accept: too many open files")
 	l := newTestListener(boom, nil)
-	s := New(func(FrameEnqueuer) StreamHandler { return rejectingHandler(t) }, Config{Timeouts: serverTimeouts()})
+	s := New(func(ConnWriter) StreamHandler { return rejectingHandler(t) }, Config{Timeouts: serverTimeouts()})
 	done := serverInBackground(s, l)
 
 	awaitPeers(t, l, 1)

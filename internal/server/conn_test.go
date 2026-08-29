@@ -289,8 +289,8 @@ func rejectingHandler(t *testing.T) StreamHandler {
 // exactly what a server must not do — see Server.newHandler — and is harmless here
 // because each of these tests builds one connection. A test about the factory being
 // a factory writes its own: TestServerBuildsAHandlerPerConnection.
-func always(h StreamHandler) func(FrameEnqueuer) StreamHandler {
-	return func(FrameEnqueuer) StreamHandler { return h }
+func always(h StreamHandler) func(ConnWriter) StreamHandler {
+	return func(ConnWriter) StreamHandler { return h }
 }
 
 // testTimeouts is the timeouts for a test that is not testing a timeout.
@@ -372,7 +372,7 @@ func serve(t *testing.T, ts *testSocket, h StreamHandler, to limits.Timeouts) er
 
 // serveWith is serve for a test that cares which write half its handler was handed,
 // and so has to build the handler inside the factory rather than before it.
-func serveWith(t *testing.T, ts *testSocket, newHandler func(FrameEnqueuer) StreamHandler, to limits.Timeouts) error {
+func serveWith(t *testing.T, ts *testSocket, newHandler func(ConnWriter) StreamHandler, to limits.Timeouts) error {
 	t.Helper()
 	return awaitServe(t, serveInBackground(newConn(ts, newHandler, to)))
 }
@@ -1941,7 +1941,7 @@ func TestNewConnRejectsAFactoryThatReturnsNoHandler(t *testing.T) {
 				t.Errorf("the panic says %v, want it to name what the factory did", r)
 			}
 		}()
-		newConn(newTestSocket(&testTarget{}), func(FrameEnqueuer) StreamHandler { return nil }, testTimeouts())
+		newConn(newTestSocket(&testTarget{}), func(ConnWriter) StreamHandler { return nil }, testTimeouts())
 	}()
 
 	assertNoGoroutineLeak(t, baseline)
@@ -1961,7 +1961,7 @@ func TestNewConnGivesTheStreamHandlerAWritePath(t *testing.T) {
 		script(append(clientHello(t), encodeFrames(t, frame.RSTStreamFrame{StreamID: 1, ErrCode: h2.Cancel})...)).
 		atEOF()
 
-	newHandler := func(w FrameEnqueuer) StreamHandler {
+	newHandler := func(w ConnWriter) StreamHandler {
 		return handlerFunc(func(frame.Frame) error {
 			return w.Enqueue(frame.DataFrame{StreamID: 1, Data: body, EndStream: true})
 		})
@@ -1981,6 +1981,40 @@ func TestNewConnGivesTheStreamHandlerAWritePath(t *testing.T) {
 	}
 	t.Errorf("the peer received %s, with no DATA frame among it: the handler was given a write "+
 		"path it could not write to", describe(got))
+}
+
+// TestTheWritePathAHandlerIsGivenReportsThePeersFrameSizeCap is the other half of
+// what a handler needs from that write path, and the half that is easy to leave
+// behind. A response's header list has to be split into a HEADERS frame and however
+// many CONTINUATION frames the peer's SETTINGS_MAX_FRAME_SIZE requires (§4.2), and
+// the layer doing the splitting is on the other side of this interface — so the cap
+// has to be readable through it, and it has to be the connection's live value rather
+// than a copy taken when the handler was built. The peer here raises it after the
+// handler already exists, which is the ordinary case: SETTINGS arrives before the
+// first request, and the handler is built before any frame is read.
+func TestTheWritePathAHandlerIsGivenReportsThePeersFrameSizeCap(t *testing.T) {
+	const raised = 1 << 15
+
+	ts := newTestSocket(&testTarget{}).
+		script(clientHello(t, frame.Setting{ID: frame.SettingMaxFrameSize, Value: raised})).
+		atEOF()
+
+	var given ConnWriter
+	newHandler := func(w ConnWriter) StreamHandler {
+		given = w
+		return rejectingHandler(t)
+	}
+	if err := serveWith(t, ts, newHandler, testTimeouts()); err != nil {
+		t.Fatalf("Serve: %v", err)
+	}
+
+	if given == nil {
+		t.Fatal("the factory was never called, so nothing was given a write path")
+	}
+	if got := given.MaxFrameSize(); got != raised {
+		t.Errorf("the handler's write path reports a cap of %d, want the %d the peer advertised: "+
+			"a response would be split at the wrong size", got, uint32(raised))
+	}
 }
 
 // TestNewConnFillsUnsetTimeouts is the check that a caller cannot get a connection

@@ -28,19 +28,31 @@ type connSocket interface {
 	Close() error
 }
 
-// FrameEnqueuer is the connection's write half as a stream sees it: one method,
-// which hands a frame to the writer goroutine and returns.
+// ConnWriter is the connection's write half as a stream sees it: two methods, one
+// that hands a frame to the writer goroutine and one that reports the largest
+// payload the peer is willing to receive.
 //
 // It is deliberately narrower than *frameWriter, which also flushes, shuts down and
 // waits. Those belong to the connection's own lifecycle — a stream goroutine
 // calling Shutdown mid-request would take every other stream's reply down with it —
-// and Enqueue is in any case the only method on the writer that is safe to call
-// from every stream goroutine at once.
-type FrameEnqueuer interface {
+// and these two are the only methods on the writer that are safe to call from every
+// stream goroutine at once.
+//
+// Both are needed to write one response. §4.2 caps a frame's payload at the peer's
+// SETTINGS_MAX_FRAME_SIZE, so the layer that turns a header list into HEADERS and
+// CONTINUATION frames has to know the cap before it can decide where to split, and
+// the cap is the connection's rather than the stream's — a stream that read it from
+// its own copy would send an oversized frame the first time the peer raised or
+// lowered it mid-connection.
+type ConnWriter interface {
 	// Enqueue hands f to the writer goroutine. It returns when the frame is queued,
 	// not when it reaches the wire, and it fails only once the write half is
 	// finished: see frameWriter.Enqueue.
 	Enqueue(f frame.Frame) error
+
+	// MaxFrameSize is the peer's SETTINGS_MAX_FRAME_SIZE, never below §6.5.2's
+	// 16384. It may change between two calls: see frameWriter.MaxFrameSize.
+	MaxFrameSize() uint32
 }
 
 // StreamHandler receives the frames that belong to a stream rather than to the
@@ -181,7 +193,7 @@ type conn struct {
 // at construction. The alternative is a nil method call on the first HEADERS frame of
 // the first request, which is the same bug reported later, from a goroutine further
 // away, with a peer's traffic mixed into the stack trace.
-func newConn(sock connSocket, newHandler func(FrameEnqueuer) StreamHandler, t limits.Timeouts) *conn {
+func newConn(sock connSocket, newHandler func(ConnWriter) StreamHandler, t limits.Timeouts) *conn {
 	if newHandler == nil {
 		panic("server: newConn requires a stream handler factory")
 	}

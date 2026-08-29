@@ -67,7 +67,7 @@ type Server struct {
 	// peer's identifiers collide with another's. The enqueuer settles it even where
 	// the table would not — it writes to one socket, so a handler kept from a
 	// previous connection would answer this peer's requests down someone else's.
-	newHandler func(FrameEnqueuer) StreamHandler
+	newHandler func(ConnWriter) StreamHandler
 
 	timeouts limits.Timeouts
 	log      *log.Logger
@@ -106,7 +106,7 @@ type Server struct {
 // A nil factory panics, for the same reason newConn does: the alternative is a
 // server that starts, listens, accepts, and then panics on the first connection
 // with a peer's traffic in the stack trace.
-func New(newHandler func(FrameEnqueuer) StreamHandler, cfg Config) *Server {
+func New(newHandler func(ConnWriter) StreamHandler, cfg Config) *Server {
 	if newHandler == nil {
 		panic("server: New requires a handler factory")
 	}

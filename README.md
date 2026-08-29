@@ -14,7 +14,7 @@ This section is kept honest as the build proceeds; nothing is claimed here befor
 | Shared `internal/h2` contract | frozen |
 | Frame layer (RFC 9113 §4, §6) | working — all 10 frame types, 198 tests, 5 fuzz targets |
 | Connection timeouts and peer bounds (`internal/limits`) | working — six timeouts, 36 tests; the reset bucket is not yet wired to a connection |
-| Connection lifecycle, SETTINGS, PING, GOAWAY | working — 73 tests, and 64 guards each observed failing |
+| Connection lifecycle, SETTINGS, PING, GOAWAY | working — 75 tests, and 65 guards each observed failing |
 | Accept loop, connection bound, graceful shutdown | working — 28 tests, and 38 guards each observed failing |
 | Streams and flow control (§5) | working — 151 tests, and 223 guards each observed failing; both halves of flow control are wired to the stream table, and none of it is reachable from `cmd/zdh` |
 | HPACK (RFC 7541) | in progress, separate author |
@@ -71,7 +71,7 @@ So every security bound, deadline and protocol rule in this server has a *break*
 python scripts/break-conn.py     # 51 breaks, all 51 caught
 python scripts/break-server.py   # 38 breaks, all 38 caught
 python scripts/break-tls.py      # 31 breaks, all 31 caught
-python scripts/break-writer.py   # 13 breaks, all 13 caught
+python scripts/break-writer.py   # 14 breaks, all 14 caught
 python scripts/break-certgen.py  # 39 breaks, all 39 caught
 python scripts/break-flow.py     # 39 breaks, all 39 caught
 python scripts/break-sender.py   # 53 breaks, all 53 caught
@@ -87,7 +87,7 @@ The harness checks each campaign before it runs any of it, and refuses with a di
 
 The second refusal was the more valuable one, because nobody was looking for it. `break-conn.py` held a break anchored on `handleSettings`'s loop body, and that loop had since grown an error check — the connection began routing `SETTINGS_INITIAL_WINDOW_SIZE` to the stream layer, which gave `applySetting` an error to return. The anchor matched nothing, so the campaign was refused with exit 2 and nothing ran. Without the check it would have removed nothing, reported its test as green, and read as coverage of a rule it was no longer touching. Asking why then turned up the real gap behind it: the three routing behaviours added in that same commit had no breaks at all. This campaign is 51 rather than 45 because of what one stale anchor led to.
 
-Three of the five hundred and twenty-seven are the reason the campaigns are run rather than read. Recomputing the SETTINGS-acknowledgement deadline on each read passes the silent-peer test and still lets a peer hold a connection open for ever. Taking the connection slot after `Accept` instead of before it leaves a server that honours its bound and still spends a descriptor and a handshake per refused peer. Dropping the backoff reset after a successful accept leaves a server that recovers from a rough patch on paper and carries a one-second pause before every connection for the rest of the week. None of the three is visible in a green suite.
+Three of the five hundred and twenty-eight are the reason the campaigns are run rather than read. Recomputing the SETTINGS-acknowledgement deadline on each read passes the silent-peer test and still lets a peer hold a connection open for ever. Taking the connection slot after `Accept` instead of before it leaves a server that honours its bound and still spends a descriptor and a handshake per refused peer. Dropping the backoff reset after a successful accept leaves a server that recovers from a rough patch on paper and carries a one-second pause before every connection for the rest of the week. None of the three is visible in a green suite.
 
 `break-table.py` is the largest of the eleven at 115 breaks, and two of them are why the stream table is worth that many. Returning a refused stream's verdict *before* its header block is decoded leaves a server that is correct for every request a client sends until one of them is refused — and from that moment the HPACK dynamic table is one insertion behind the peer's, so every later request on the connection decodes into header fields nobody sent. §5.1 requires the compression state to be updated for a stream that is closed or refused, and that break is the demonstration of why. Moving the connection-window debit in `data` below the stream lookup is the same shape: flow control that is exactly right for every frame it accepts and silently wrong for every frame it refuses, after which the two ends disagree about the connection's credit by the size of whatever was dropped, permanently. Neither break produces a symptom anywhere near its cause.
 
