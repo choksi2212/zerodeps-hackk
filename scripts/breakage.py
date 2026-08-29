@@ -12,6 +12,10 @@ a test that hangs until the timeout has detected the break and told nobody, and 
 test whose binary panics has detected it legibly but has not reported it through
 the suite. See outcome() for the full taxonomy.
 
+Every campaign is checked before any of it is run — see preflight — because a
+malformed break is silent in the worst way: it reports the tests it named as passing,
+which reads as a hole in the suite rather than a typo in the campaign.
+
 This module holds no campaign of its own. It exists because the second campaign
 would otherwise have been a copy of the first, and two copies of a harness drift:
 the taxonomy the reports are read against has to be one taxonomy.
@@ -126,6 +130,38 @@ def first_matching(lines, pred):
     return ""
 
 
+def preflight(original, breaks):
+    """Check every break before any of them is run, and report what cannot work.
+
+    Up front rather than as each break comes round, which is where this check used to
+    live. A campaign is thirty to forty breaks and each one is several `go test`
+    processes, so a bad anchor on the last break was twenty minutes of waiting to be
+    told about a typo. Everything checked here is a property of the campaign and of
+    the file it edits, both of which are known before the first test runs.
+
+    An anchor that matches twice removes a different guard than the one named. One
+    that matches none tests nothing while every expected test reports a pass, which
+    reads as a suite full of holes. A break whose replacement equals its anchor is a
+    no-op with the same symptom. A break with no expected tests can never fail. Two
+    breaks sharing a name make the hole list ambiguous, which matters because that
+    list is what gets acted on.
+    """
+    problems = []
+    seen = set()
+    for name, old, new, expect in breaks:
+        n = original.count(old)
+        if n != 1:
+            problems.append("%s: the anchor matched %d times, not once" % (name, n))
+        if old == new:
+            problems.append("%s: the replacement is identical to the anchor" % name)
+        if not expect:
+            problems.append("%s: no tests are named as having to fail" % name)
+        if name in seen:
+            problems.append("%s: two breaks share this name" % name)
+        seen.add(name)
+    return problems
+
+
 def campaign(source, package, breaks):
     """Run every break in turn and report. Returns a process exit status.
 
@@ -133,20 +169,26 @@ def campaign(source, package, breaks):
     breaks a list of (name, old, new, tests) tuples. The file is restored on the
     way out, including on error: a campaign that left the tree modified would be
     indistinguishable from a campaign that found a bug.
+
+    Exit status 0 if every break was caught, 1 if any went unnoticed, and 2 if the
+    campaign itself is malformed. The last is separate on purpose: a campaign that
+    cannot run has found nothing, and reporting it as holes would say the suite is
+    weak when what is wrong is the file describing it.
     """
     src = pathlib.Path(source)
     original = read(src)
+
+    problems = preflight(original, breaks)
+    if problems:
+        say("%d of %d breaks cannot be run as written, and nothing was tested:"
+            % (len(problems), len(breaks)))
+        for p in problems:
+            say("  - " + p)
+        return 2
+
     holes = []
     try:
         for name, old, new, expect in breaks:
-            # An anchor that matches twice would remove a different guard than the
-            # one named, and an anchor that matches none would test nothing while
-            # reporting a pass. Both are the campaign's bug, so both are holes.
-            if original.count(old) != 1:
-                say("SKIP  %s\n      (the anchor matched %d times, not once)"
-                    % (name, original.count(old)))
-                holes.append(name + " [anchor did not match]")
-                continue
             write(src, original.replace(old, new, 1))
 
             results = [(test,) + outcome(test, package) for test in expect]
