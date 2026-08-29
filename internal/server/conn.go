@@ -270,6 +270,22 @@ func (c *conn) Serve() error {
 	}
 }
 
+// discard ends a connection that never began, without writing to it.
+//
+// Reached when TLS fails or negotiates something other than h2. There is no HTTP/2
+// connection to say goodbye on — a GOAWAY needs a peer that reads frames, and this
+// peer either has no TLS session or is not speaking this protocol — so the writer is
+// stopped rather than flushed. The socket is closed here because Serve, which is what
+// normally closes it, was never called.
+//
+// Both errors are returned together rather than one being chosen. They describe
+// different halves of the same teardown, and a caller logging this wants whichever of
+// them is not nil without having to ask twice.
+func (c *conn) discard() error {
+	c.w.Close()
+	return errors.Join(c.w.Wait(), c.sock.Close())
+}
+
 // farewell enqueues the final GOAWAY and asks the writer to flush what is queued
 // and stop.
 //

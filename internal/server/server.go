@@ -215,7 +215,8 @@ func (s *Server) serveConn(nc net.Conn) {
 	}()
 }
 
-// runConn serves one connection to completion, and is where a panic stops.
+// runConn negotiates TLS if there is any, serves one connection to completion, and is
+// where a panic stops.
 //
 // A panic on this goroutine is a bug in this server reached through a peer's input,
 // and the peer's other victims would be the several hundred connections that go down
@@ -244,6 +245,17 @@ func (s *Server) runConn(c *conn, nc net.Conn) {
 			s.logf("connection from %v: stopping the writer after the panic: %v", nc.RemoteAddr(), err)
 		}
 	}()
+
+	// TLS first, on this goroutine, before anything is written. A connection that does
+	// not get through this is closed without a frame: there is no protocol on it to
+	// send one over. See handshake for why the accept loop is the wrong place for it.
+	if err := s.handshake(nc); err != nil {
+		s.logf("connection from %v: %v", nc.RemoteAddr(), err)
+		if derr := c.discard(); derr != nil {
+			s.logf("connection from %v: closing it after the failed handshake: %v", nc.RemoteAddr(), derr)
+		}
+		return
+	}
 
 	if err := c.Serve(); err != nil {
 		s.logf("connection from %v: %v", nc.RemoteAddr(), err)
