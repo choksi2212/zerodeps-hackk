@@ -12,9 +12,9 @@ This section is kept honest as the build proceeds; nothing is claimed here befor
 |---|---|
 | Build gate, zero-dependency guards, reproducible build | working |
 | Shared `internal/h2` contract | frozen |
-| Frame layer (RFC 9113 §4, §6) | working — all 10 frame types, 477 tests, 4 fuzz targets |
-| Connection timeouts and peer bounds (`internal/limits`) | in progress |
-| Connection lifecycle, SETTINGS, PING, GOAWAY | not started |
+| Frame layer (RFC 9113 §4, §6) | working — all 10 frame types, 478 tests, 4 fuzz targets |
+| Connection timeouts and peer bounds (`internal/limits`) | working — six timeouts, 48 tests; the reset bucket is not yet wired to a connection |
+| Connection lifecycle, SETTINGS, PING, GOAWAY | working — 67 tests, and 37 guards each observed failing |
 | Streams and flow control (§5) | not started |
 | HPACK (RFC 7541) | in progress, separate author |
 | Request semantics (§8), static file handler | not started |
