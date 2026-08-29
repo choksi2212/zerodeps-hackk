@@ -136,6 +136,12 @@ func TestBoundsArePlausible(t *testing.T) {
 			tooHigh: "each stream is a goroutine and a set of buffers one peer can hold",
 		},
 		{
+			name: "MaxConns", got: MaxConns,
+			floor: 16, ceiling: 8192,
+			tooLow:  "a browser opens one connection per origin and a load balancer opens several",
+			tooHigh: "the process runs out of file descriptors before it runs out of memory",
+		},
+		{
 			name: "ResetBurst", got: ResetBurst,
 			floor: MaxConcurrentStreams, ceiling: 10_000,
 			tooLow:  "cancelling a full page of requests is ordinary",
@@ -155,6 +161,30 @@ func TestBoundsArePlausible(t *testing.T) {
 		if tc.got > tc.ceiling {
 			t.Errorf("%s = %d, above the ceiling of %d: %s", tc.name, tc.got, tc.ceiling, tc.tooHigh)
 		}
+	}
+}
+
+// TestMaxConnsLeavesDescriptorHeadroom is the reasoning in MaxConns' comment,
+// written down as an assertion.
+//
+// The bound is chosen against file descriptors, not memory, and the failure it
+// avoids is specific: a process that accepts as many connections as it has
+// descriptors spends the last of them on a peer and then cannot open anything else —
+// no accept, no log rotation, no certificate reload. The symptom is a server that
+// answers requests it already has and refuses everything new, under load, with
+// nothing in the log to say why.
+//
+// The commonest soft limit is 1024, and half of it is the headroom. Raising MaxConns
+// past that is defensible, but only together with raising the process limit — which
+// is a deployment decision this repository cannot make, so it fails here instead.
+func TestMaxConnsLeavesDescriptorHeadroom(t *testing.T) {
+	// The soft RLIMIT_NOFILE a process on Linux typically starts with.
+	const commonDescriptorLimit = 1024
+
+	if MaxConns > commonDescriptorLimit/2 {
+		t.Errorf("MaxConns = %d is more than half of the usual %d descriptor limit; "+
+			"at that many connections the process has no descriptors left for the "+
+			"listener, the certificate or the log", MaxConns, commonDescriptorLimit)
 	}
 }
 

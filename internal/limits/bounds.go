@@ -64,6 +64,29 @@ const (
 // Enforced in internal/stream, which owns the stream table.
 const MaxConcurrentStreams = 100
 
+// MaxConns is how many connections this server serves at once.
+//
+// It is the outermost bound, and the one the others are multiplied by: every
+// per-connection cost in this file — a 16 KiB read buffer, a 4 KiB write buffer,
+// two goroutines, and transiently up to MaxHeaderBlockSize while a header block is
+// being assembled — is paid once per connection here. 512 connections is about
+// 10 MiB of steady buffers and, in the worst case a peer can arrange, 64 MiB of
+// header blocks.
+//
+// The number is chosen against file descriptors rather than memory, because that
+// is the limit reached first. A process on Linux typically starts with a soft limit
+// of 1024 descriptors, shared with the listener, the certificate, the log and
+// whatever the runtime holds; a server that accepted a thousand connections would
+// spend its last descriptors and then fail to accept anything, which is an outage
+// arriving as a load spike. Half the commonest limit leaves that headroom.
+//
+// The bound is enforced by not accepting rather than by accepting and closing.
+// A refused connection sits in the kernel's backlog, where it is either served a
+// moment later or times out at the client as a connection that was never
+// established — which is the truth. Accept-then-close spends the descriptor, the
+// TLS handshake and the peer's trust in a connection it was told it had.
+const MaxConns = 512
+
 // The rapid-reset bounds, which answer CVE-2023-44487.
 //
 // The attack is a client that opens a stream and resets it immediately, over and
