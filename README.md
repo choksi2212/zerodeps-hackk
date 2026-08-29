@@ -16,15 +16,16 @@ This section is kept honest as the build proceeds; nothing is claimed here befor
 | Connection timeouts and peer bounds (`internal/limits`) | working — six timeouts, 36 tests; the reset bucket is not yet wired to a connection |
 | Connection lifecycle, SETTINGS, PING, GOAWAY | working — 75 tests, and 65 guards each observed failing |
 | Accept loop, connection bound, graceful shutdown | working — 28 tests, and 38 guards each observed failing |
-| Streams and flow control (§5) | working — 151 tests, and 223 guards each observed failing; both halves of flow control are wired to the stream table, and none of it is reachable from `cmd/zdh` |
+| Streams and flow control (§5) | working — 151 tests, and 223 guards each observed failing; both halves of flow control are wired to the stream table, and reachable from `cmd/zdh` |
 | HPACK (RFC 7541) | in progress, separate author |
 | Request semantics (RFC 9113 §8) | working — 70 tests, and 132 guards each observed failing |
 | Response header encoding and the per-stream body writer (§8.3, §6.10, §6.5.2) | working — 61 tests, and 116 guards each observed failing |
 | Request-to-handler plumbing (`internal/exchange`) | working — 51 tests, and 64 guards each observed failing |
-| Static file serving (`internal/static`) | working — 48 tests, and 87 guards each observed failing; not yet reachable from `cmd/zdh` |
+| Static file serving (`internal/static`) | working — 48 tests, and 87 guards each observed failing; served by `cmd/zdh` |
 | Self-signed certificate generation (`internal/certgen`) | working — 46 tests, and 39 guards each observed failing |
 | TLS 1.2/1.3, ALPN, RFC 9113 §9.2 cipher policy | working — 24 tests, and 31 guards each observed failing |
-| Browser demo | not started |
+| The server itself (`cmd/zdh`) | working — 20 tests, and 29 guards each observed failing; the only end-to-end coverage in the module |
+| Browser demo | working — `public/`, and the browser's own `window.performance` numbers in [docs/demo.png](docs/demo.png): 64 requests, all `h2`, zero connections opened |
 | h2spec conformance score | not yet run |
 
 Every count above is a top-level test function, which is what `go test -list '.*' ./...` prints: a table-driven test counts once rather than once per case, so the number is one command away from being checked rather than one convention away from being argued about.
@@ -106,9 +107,10 @@ python scripts/break-fields.py   # 62 breaks, all 62 caught
 python scripts/break-response.py # 116 breaks, all 116 caught
 python scripts/break-exchange.py # 64 breaks, all 64 caught
 python scripts/break-static.py   # 87 breaks, all 87 caught
+python scripts/break-cmd.py      # 29 breaks, all 29 caught
 ```
 
-Each campaign covers one Go package — usually one file, two for `internal/response` and `internal/exchange`, and three for `internal/static` — removes one guard at a time in place, runs each expected test in a process of its own, and restores every file on the way out, including on error, so a campaign that left the tree modified could not be mistaken for one that found a bug. A break that fires nothing is reported as a hole, and a hole is either a missing test or a guard whose justification was wrong. Both are worth knowing before a judge finds them.
+Each campaign covers one Go package — usually one file, two for `internal/response`, `internal/exchange` and `cmd/zdh`, and three for `internal/static` — removes one guard at a time in place, runs each expected test in a process of its own, and restores every file on the way out, including on error, so a campaign that left the tree modified could not be mistaken for one that found a bug. A break that fires nothing is reported as a hole, and a hole is either a missing test or a guard whose justification was wrong. Both are worth knowing before a judge finds them.
 
 The harness checks each campaign before it runs any of it, and refuses with a distinct exit status — 2 for a malformed campaign, 1 for holes — because the two need different readers. An anchor that matches no line removes nothing, so every test it named comes back green, and a typo in the campaign then reads as a suite full of holes. The preflight's four checks have all been observed refusing a deliberately malformed campaign, and observed leaving the target file byte-identical while doing it. `break-table.py`'s own first run was refused the same way, on an anchor that matched twice: a one-tab line is a substring of the two-tab version of itself, and the check counts substrings rather than lines because that is what the replacement will do.
 
@@ -116,9 +118,9 @@ The second refusal was the more valuable one, because nobody was looking for it.
 
 The same thing happened again on the commit after it, which is the argument for keeping the check rather than a story about one lucky catch. Two more of the peer's SETTINGS grew routes — `HEADER_TABLE_SIZE` and `MAX_HEADER_LIST_SIZE`, to the HPACK context this server's *responses* are compressed against — and giving each its own `case` invalidated the break anchored on the combined one they used to share. Refused with exit 2 again, in the same file, for the same reason. It is now two breaks instead of one.
 
-Three of the seven hundred are the reason the campaigns are run rather than read. Recomputing the SETTINGS-acknowledgement deadline on each read passes the silent-peer test and still lets a peer hold a connection open for ever. Taking the connection slot after `Accept` instead of before it leaves a server that honours its bound and still spends a descriptor and a handshake per refused peer. Dropping the backoff reset after a successful accept leaves a server that recovers from a rough patch on paper and carries a one-second pause before every connection for the rest of the week. None of the three is visible in a green suite.
+Three of the eight hundred and fifty-two are the reason the campaigns are run rather than read. Recomputing the SETTINGS-acknowledgement deadline on each read passes the silent-peer test and still lets a peer hold a connection open for ever. Taking the connection slot after `Accept` instead of before it leaves a server that honours its bound and still spends a descriptor and a handshake per refused peer. Dropping the backoff reset after a successful accept leaves a server that recovers from a rough patch on paper and carries a one-second pause before every connection for the rest of the week. None of the three is visible in a green suite.
 
-`break-table.py` is the largest of the fourteen at 133 breaks, and two of them are why the stream table is worth that many. Returning a refused stream's verdict *before* its header block is decoded leaves a server that is correct for every request a client sends until one of them is refused — and from that moment the HPACK dynamic table is one insertion behind the peer's, so every later request on the connection decodes into header fields nobody sent. §5.1 requires the compression state to be updated for a stream that is closed or refused, and that break is the demonstration of why. Moving the connection-window debit in `data` below the stream lookup is the same shape: flow control that is exactly right for every frame it accepts and silently wrong for every frame it refuses, after which the two ends disagree about the connection's credit by the size of whatever was dropped, permanently. Neither break produces a symptom anywhere near its cause.
+`break-table.py` is the largest of the fifteen at 133 breaks, and two of them are why the stream table is worth that many. Returning a refused stream's verdict *before* its header block is decoded leaves a server that is correct for every request a client sends until one of them is refused — and from that moment the HPACK dynamic table is one insertion behind the peer's, so every later request on the connection decodes into header fields nobody sent. §5.1 requires the compression state to be updated for a stream that is closed or refused, and that break is the demonstration of why. Moving the connection-window debit in `data` below the stream lookup is the same shape: flow control that is exactly right for every frame it accepts and silently wrong for every frame it refuses, after which the two ends disagree about the connection's credit by the size of whatever was dropped, permanently. Neither break produces a symptom anywhere near its cause.
 
 Four of `internal/stream`'s tests exist because a break was worked out that nothing would have noticed — worked out while the campaign was being written, which is early enough that the run itself came back clean. Nothing observed that a *refused* stream still spends its identifier, though the code claims it in as many words. Nothing pinned which of §5.1 and §8.1 answers a trailer section that breaks both. Every trailer test sent END_HEADERS on the first frame, so the trailer path's own call into the reassembler could complete a block early and no test would see it. And §6.9.1's accounting rule was pinned for a DATA frame on a closed stream but not for one after END_STREAM, which left the whole state check free to move above the debit. A fifth test was weak rather than missing: the CONTINUATION-on-the-wrong-stream test only ever sent a *higher* identifier than the open block's, so `!=` could become `>` and fire nothing. It now runs both directions.
 
@@ -143,6 +145,14 @@ The seam carries traffic in the other direction too, and its five breaks are the
 One guard on that route has no break, and it is named in the campaign rather than left out. The test that drives `ReportSendEnd` from sixteen goroutines while the reader dispatches frames is a `-race` test, and the breakage harness runs the suite without `-race`, so the break that would prove it — appending without the mutex — fires nothing and is not written down as one. Its subject is covered from the other side: the break that applies the close on the reporting goroutine reaches the map from two goroutines at once, and that is the test where the race detector says so.
 
 `break-request.py` and `break-fields.py` cover `internal/request` between them, and four of that package's tests were written or strengthened by designing them, before either script was run. §8.3.1's required-set check turned out to be untestable as written: removing it left the value checks below refusing the zero value, so `:path` still appeared in the reason and the assertion passed — it now asserts the words *no `:path`*, which only the required-set check produces. A tchar set narrowed to letters would have fired nothing, because every method in the suite was letters-only, so the unrecognised-method test now sends `M-SEARCH` and `BREW2`. The `+`, `-` and `.` half of §3.1's scheme grammar had no test at all, because the only non-HTTP scheme anywhere was `ftp`; it now sends `coap+tcp`, `view-source` and `z39.50r`. And the test that holds a stand-in `Host` to the authority rules found a bug in the code rather than a hole in itself: a `Host` carrying a userinfo was refused with a message blaming `:authority`, for a request that had no `:authority` at all. The checks are shared because the rules are shared, so the field name is now passed in and the message names whichever field actually carried the fault. A fifth test came out of the run: the same TE folding is enforced in a trailer section and in a header section by the same function, and only the header-section test sent `TrAiLeRs`.
+
+`break-cmd.py` is the only campaign against a command rather than a package, and the reason it is worth having is that four of its breaks are the wiring itself. Every package under `internal/` declares the interfaces it needs instead of importing what satisfies them, which is what keeps the dependency arrows pointing one way — and it means no unit test anywhere can observe two of them connected wrongly. `newConn` is where the connecting happens, so the campaign takes it apart in the ways it can plausibly be got wrong: one HPACK codec where there must be two, the cycle between the stream table and the request layer left unclosed, a teardown that reaches half of what it must reach, and a response encoder with no handler behind it.
+
+The codec break is the one that found something. Collapsing the two codecs into one passed the whole suite. The test that was supposed to catch it was sending three requests back to back and then reading all three responses — which is what a multiplexing test should do, and is exactly why it could not see this: the server's reader decodes all three header blocks before any handler has opened a file, so the two dynamic tables never get the chance to diverge. Sent one at a time, each response read before the next request goes out — which is what a browser does, one navigation and then its subresources — the second response is encoded against a table the second request has already been added to, and the same break resets the stream with `PROTOCOL_ERROR`. The comment above that test already claimed this coverage. The sequencing did not deliver it, and nothing but a break would have said so.
+
+Two more breaks were caught by tests that had to be written or repaired for them. `TestBindOpensBothListeners` was calling `bind` with a nil TLS configuration, so it could not tell a cleartext listener that wrongly carried one from a correct one — a server that expects a handshake on the port whose startup line says `http://`. It now passes a real configuration and asserts which of the two listeners holds it, which also makes the mirror-image mistake breakable. And the teardown break needed a test that does not exist anywhere below `cmd/zdh`: a handler parked reading an upload whose peer hangs up. The stream table ends the send side, the request layer ends the receive side, the two do not know about each other, and a command is the only thing holding both. Without the second half of that teardown the handler holds a request, a response and a stack for the life of the process, on the ordinary event of a browser tab closing mid-upload.
+
+Three of the campaign's breaks were rewritten before it was first run, because a break that hangs or does not compile is a break nobody has diagnosed. Deleting `run`'s no-listener check leaves a process selecting forever on two channels that never fire; deleting the `-version` short-circuit makes it bind `:8443` instead of printing; and dropping the port in `browserHost` leaves a `port` variable Go refuses to compile. Each was replaced with the nearest slip that fails fast — the complaint sent to the wrong stream, the report sent to stderr, the port discarded with `_` — which is the same lesson `break-fields.py` had already produced from the other direction.
 
 Two of `break-fields.py`'s breaks came back as holes on their first run and neither was one. Go treats a variable that is only assigned as unused, so `return int64(n), nil` cannot be broken to `return 0, nil` and `if regular {` cannot be broken to `if false {`: the package stops compiling, and a break that does not compile fails every test it names for a reason that has nothing to do with the guard. The harness reports that as `build` rather than folding it into `pass`, which is what made both diagnosable in one reading — and the fix belongs in the campaign, which now discards the value explicitly. Any break that removes the last read of something has this shape.
 
@@ -199,6 +209,41 @@ CGO_ENABLED=0 go build -trimpath -buildvcs=false -ldflags="-s -w -buildid=" -o b
 `-buildvcs=false` is the flag that is usually missing: without it Go stamps the git commit and working-tree state into the binary, and two builds of identical source at different commits differ. Toolchain is pinned to **go1.26.7** on both authors' machines with `GOTOOLCHAIN=local`, because the compiler version is baked into the binary. `go.mod` declares `go 1.24` so that any Go 1.24 or newer toolchain can build the project.
 
 The `Makefile` only delegates to `scripts/*.sh`. Git Bash on Windows ships no `make`, so the authors run the scripts directly while a judge on Linux can run `make gate`; both execute the same code, so there is no second implementation to drift.
+
+## Running it
+
+```bash
+bin/zdh -dir public
+```
+
+```
+certificate  generated a certificate for localhost, 127.0.0.1, ::1 and saved it to zdh-cert.pem
+serving      public
+listening    https://localhost:8443/  (h2 over TLS, ALPN "h2")
+listening    http://localhost:8081/  (h2c by prior knowledge — curl needs --http2-prior-knowledge)
+```
+
+Two ports, one server: a browser reaches the TLS one, and the cleartext one is for clients that speak h2c by prior knowledge (§3.3), which is how `h2spec` and `curl` connect. The connection bound and the graceful shutdown cover both together. Ctrl-C sends GOAWAY and waits for the streams in flight; a second Ctrl-C exits at once, so a client holding a stream open cannot make the first one look broken.
+
+```bash
+curl --http2-prior-knowledge -sSI http://localhost:8081/
+```
+
+```
+HTTP/2 200
+content-length: 3057
+content-type: text/html; charset=utf-8
+date: Sat, 29 Aug 2026 23:54:31 GMT
+server: zdh
+```
+
+The certificate is generated on first run and self-signed, so a browser warns. That warning is the correct behaviour for a certificate nobody has vouched for, and clicking through it is enough to see the demo. To silence it instead, trust the generated certificate for your own user — on Windows:
+
+```bash
+certutil -user -addstore Root zdh-cert.pem
+```
+
+`https://localhost:8443/?run=64` opens the demo and fires 64 concurrent requests on load. Every number it reports comes from the browser's own `window.performance`, not from anything this server claims: the protocol each response arrived over, its transfer size, and how many TCP connections the browser opened to fetch all of them. [docs/demo.png](docs/demo.png) is one such run — 64 requests, all `h2`, **zero** connections opened, 59 ms wall clock — which is the entry's one-line argument for why multiplexing is the feature and not the checkbox.
 
 ## Why not `net/http`
 
