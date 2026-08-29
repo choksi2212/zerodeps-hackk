@@ -14,7 +14,8 @@ This section is kept honest as the build proceeds; nothing is claimed here befor
 | Shared `internal/h2` contract | frozen |
 | Frame layer (RFC 9113 §4, §6) | working — all 10 frame types, 478 tests, 4 fuzz targets |
 | Connection timeouts and peer bounds (`internal/limits`) | working — six timeouts, 48 tests; the reset bucket is not yet wired to a connection |
-| Connection lifecycle, SETTINGS, PING, GOAWAY | working — 67 tests, and 37 guards each observed failing |
+| Connection lifecycle, SETTINGS, PING, GOAWAY | working — 67 tests, and 56 guards each observed failing |
+| Accept loop, connection bound, graceful shutdown | working — 25 tests, and 34 guards each observed failing |
 | Streams and flow control (§5) | not started |
 | HPACK (RFC 7541) | in progress, separate author |
 | Request semantics (§8), static file handler | not started |
@@ -55,6 +56,24 @@ go version -m bin/zdh | grep -c dep    # 0
 Each guard was deliberately tripped at bootstrap and observed to fail at the expected step: a used `net/http` import failed check 6, an empty `go.sum` failed check 8, a `require` line failed check 8, and a `vendor/` directory failed check 8. A guard nobody has seen fire is not a guard.
 
 One honest note about check 7, because a casual `grep golang.org` over the dependency graph is misleading here. Importing `crypto/tls` reaches nine paths that contain dots — eight under `vendor/golang.org/x/crypto` and `vendor/golang.org/x/net`, plus `crypto/internal/entropy`. Those are the standard library's own internal copies, shipped inside `GOROOT` as part of the Go distribution. They appear in no manifest, cannot be removed or substituted, and `go list` reports `.Standard = true` for every one of them. So the gate asks the Go tool whether a package is standard rather than pattern-matching its path, and the authoritative listing of non-standard packages contains only this module's own packages.
+
+### And proof that the tests fire
+
+The same argument applies one level up: a test that has never been seen failing is a test nobody has checked. A green suite proves the code passes the tests; it says nothing about whether the tests would notice if the code stopped being correct.
+
+So every security bound, deadline and protocol rule in this server has a *break* recorded against it — a one-line edit that removes exactly that guard, together with the tests that must fail as a result:
+
+```bash
+python scripts/break-conn.py     # 43 breaks, all 43 caught
+python scripts/break-server.py   # 34 breaks, all 34 caught
+python scripts/break-writer.py   # 13 breaks, all 13 caught
+```
+
+Each campaign edits one file in place, runs each expected test in a process of its own, and restores the file on the way out — including on error, so a campaign that left the tree modified could not be mistaken for one that found a bug. A break that fires nothing is reported as a hole, and a hole is either a missing test or a guard whose justification was wrong. Both are worth knowing before a judge finds them.
+
+Three of the ninety are the reason the campaigns are run rather than read. Recomputing the SETTINGS-acknowledgement deadline on each read passes the silent-peer test and still lets a peer hold a connection open for ever. Taking the connection slot after `Accept` instead of before it leaves a server that honours its bound and still spends a descriptor and a handshake per refused peer. Dropping the backoff reset after a successful accept leaves a server that recovers from a rough patch on paper and carries a one-second pause before every connection for the rest of the week. None of the three is visible in a green suite.
+
+Four breaks are detected as a panic rather than as a named failure, and the harness reports those separately rather than rounding them up: a missing `sync.Once` announces itself as `close of closed channel`, and there is nothing better to expect. Two guards in `internal/server/server.go` have no break at all, because both cover interleavings a test cannot schedule; `scripts/break-server.py` names them and says why.
 
 ## Build
 
