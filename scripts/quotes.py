@@ -1,4 +1,4 @@
-"""Check every RFC 9113 quotation in this tree against RFC 9113.
+"""Check every RFC quotation in this tree against the RFC it names.
 
 This file exists because seven of them were wrong.
 
@@ -53,16 +53,29 @@ definition and the §8.2.2 TE exception. Rule A is kept because a normative sent
 quoted without a nearby § — inside a table row, say — is still a normative sentence,
 and one span in this tree is selected by nothing else.
 
-A candidate is then checked unless the reference introducing it names a document other
-than RFC 9113. These comments quote RFC 9110, RFC 7541 and RFC 3986 as well, none of
-which is here to compare against, and a checker that reported those would be reporting
-correct quotations — the "MUST understand the class of any status code" in
-internal/response/fields.go is RFC 9110's sentence, quoted accurately. Three spellings
-attribute a reference elsewhere: "§4.3 of RFC 7541", "Section 7.6.1 of [HTTP]", and a
-bare "§15", which is somebody else's section because RFC 9113 stops at §12. The last of
-those is why the section numbers are read out of the RFC's own headings rather than
-assumed. Skipped candidates are counted in the summary line: a check that quietly
-declines to look at something reads exactly like a check that looked and was satisfied.
+A candidate is checked against the document its reference names. Three spellings name one
+other than RFC 9113 — "§4.3 of RFC 7541", "Section 7.6.1 of [HTTP]", and a bare "§15",
+which is somebody else's section because RFC 9113 stops at §12 — and the last of those is
+why the section numbers are read out of the RFC's own headings rather than assumed. RFC
+9110, RFC 7541 and RFC 3986 are all quoted here, and each is checked when a copy is beside
+the repository; a checkout with only rfc9113.txt names the spans it could not read and
+stays green, which is the same bargain the RFC 9113 check itself makes.
+
+Those three were unchecked at first, on the argument that reporting them would be
+reporting correct quotations. Two of them were not correct. A comment in internal/hpack
+quoted a sentence of §4.2 of RFC 7541 that does not appear in it and that asserts the
+opposite of the rule that does — the section requires a dynamic table size update at the
+beginning of a header block, and the invented sentence had it permitted anywhere between
+two field representations, which is also the opposite of what the decoder three files away
+enforces. A comment in internal/limits dropped a word from a real sentence of the same
+section. The first was found by accident: it spelled its attribution "RFC 7541 section
+4.2", which is a fourth spelling this script does not recognise, so the span fell through
+to the RFC 9113 default and was refused for naming the wrong document. Loud, and about the
+wrong document, and right. The lesson taken was not to widen the spellings — a quotation of
+a document nobody compared against is unchecked whichever way it is spelled, so all three
+documents are now compared against, and the ones that still cannot be are listed by file
+and line. A check that quietly declines to look at something reads exactly like a check
+that looked and was satisfied.
 
 Everything else is left alone, and deliberately. These comments quote ordinary English
 constantly, and a rule that flagged that would produce a hundred findings a run, which
@@ -94,18 +107,23 @@ that says B before A, which is a quotation that has reversed the rule it cites.
 
     python scripts/quotes.py [path-to-rfc9113.txt]
 
-The RFC is not in this repository. It is not ours, it is not code, and 180 KB of
-somebody else's text in a tree whose whole claim is that it depends on nothing would be
-a strange thing to explain. The path comes from the argument, then $RFC9113, then
-../rfc9113.txt beside the repository — and when none of those exists the check reports
-that it was skipped and exits 0, so that a checkout without the file still passes the
-gate. A path given explicitly and not found is an error rather than a skip. Fetch it
-with:
+None of these documents is in this repository. They are not ours, they are not code, and
+a megabyte of somebody else's text in a tree whose whole claim is that it depends on
+nothing would be a strange thing to explain. RFC 9113's path comes from the argument,
+then $RFC9113, then ../rfc9113.txt beside the repository — and when none of those exists
+the check reports that it was skipped and exits 0, so that a checkout without the file
+still passes the gate. A path given explicitly and not found is an error rather than a
+skip. The other three are looked for by name only, beside the repository and then inside
+it, and a quotation whose document is missing is named rather than checked. Fetch what
+you have room for:
 
     curl -o ../rfc9113.txt https://www.rfc-editor.org/rfc/rfc9113.txt
+    curl -o ../rfc9110.txt https://www.rfc-editor.org/rfc/rfc9110.txt
+    curl -o ../rfc7541.txt https://www.rfc-editor.org/rfc/rfc7541.txt
 
-Exit: 0 = every quotation checks out, or the RFC was not found; 1 = a quotation does
-not appear in RFC 9113 in the form it is quoted; 2 = a path was named and is not there.
+Exit: 0 = every quotation whose document is here checks out, or RFC 9113 was not found;
+1 = a quotation does not appear in the document it names, in the form it is quoted;
+2 = a path was named and is not there.
 """
 
 import os
@@ -164,6 +182,11 @@ ELISION = "[...]"
 def find_rfc(argv):
 	"""Locate rfc9113.txt, or return None. See the module docstring for the order.
 
+	Only RFC 9113, which is the one document this script requires and the only one whose
+	path can be given: it is what this server implements, so its section numbers are what
+	an unattributed "§6.9.1" means and its headings are what make a bare "§15" somebody
+	else's. The three optional documents are find_others' business.
+
 	A path given explicitly — as the argument or as $RFC9113 — and not found raises
 	rather than falling through to the next candidate. Falling back to a file the caller
 	did not name is how a typo in a path turns into a check that silently examined
@@ -186,6 +209,37 @@ def find_rfc(argv):
 		if p.is_file():
 			return p
 	return None
+
+
+# The other documents these comments quote, and the file each is looked for in. Beside
+# the repository first and then inside it, the same order and for the same reason as
+# rfc9113.txt: a checkout that fetched them gets them checked, and one that did not stays
+# green and says which quotations it could not read.
+#
+# Optional, unlike RFC 9113, because RFC 9113 is what this server implements and these
+# three are what it refers to. But optional is not the same as unchecked, and the
+# difference is why they are here at all: two of the spans they cover were wrong. One in
+# internal/hpack quoted a sentence of §4.2 of RFC 7541 that does not exist and asserted
+# the opposite of the rule that does, and one in internal/limits dropped a word from a
+# sentence of the same section. Neither was reachable by this script until the file was
+# beside it. Both were found by hand, which is the argument for not needing to.
+OTHERS = {
+	"7541": "rfc7541.txt",
+	"9110": "rfc9110.txt",
+	"3986": "rfc3986.txt",
+}
+
+
+def find_others():
+	"""The optional documents that are present, as {number: path}."""
+	root = pathlib.Path(__file__).resolve().parent.parent
+	found = {}
+	for num, name in OTHERS.items():
+		for p in (root.parent / name, root / name):
+			if p.is_file():
+				found[num] = p
+				break
+	return found
 
 
 def sections(raw):
@@ -299,20 +353,44 @@ def introducing(before):
 	return found[-1] if found else None
 
 
-def elsewhere(ref, secs):
-	"""Whether a reference names a document other than RFC 9113."""
-	if ref.group("post") is not None:
-		return ref.group("post").replace(" ", "") != "RFC9113"
+# What each of RFC 9113's own reference tags names, for the comments that quote a
+# sentence which cites one. "Section 7.6.1 of [HTTP]" is how RFC 9113 spells a reference
+# to RFC 9110, and a comment quoting that sentence keeps the tag rather than translating
+# it, because the quotation has to be the RFC's words and the tag is one of them.
+TAGS = {
+	"HTTP": "9110",
+	"HTTP2": "9113",
+	"COMPRESSION": "7541",
+	"RFC3986": "3986",
+	"URI": "3986",
+	"TLS": "8446",
+}
+
+
+def document(ref, secs):
+	"""Which RFC a reference names, as the four digits of its number.
+
+	A bare section number is RFC 9113's when RFC 9113 has a section by that number, and
+	somebody else's when it does not — see sections. Everything else says so outright,
+	either as digits or as one of RFC 9113's reference tags.
+	"""
+	post = ref.group("post")
+	if post is not None:
+		if post.startswith("["):
+			return TAGS.get(post.strip("[]"), post.strip("[]"))
+		return post.replace(" ", "").removeprefix("RFC")
 	if ref.group("pre") is not None:
-		return ref.group("pre") != "9113"
-	return ref.group("num") not in secs
+		return ref.group("pre")
+	return "9113" if ref.group("num") in secs else None
 
 
 def quotations(path, secs):
-	"""Yield (line number, span, ours) for every candidate quotation in path.
+	"""Yield (line number, span, document) for every candidate quotation in path.
 
-	ours is false when the reference introducing the span attributes it to another
-	document, which is a span this script is not in a position to check.
+	document is the four digits of the RFC the reference introducing the span attributes
+	it to, "9113" when nothing attributes it elsewhere, and None for a bare section
+	number RFC 9113 does not have — which names a document without saying which, and is
+	the one case this script cannot resolve.
 	"""
 	for start, text in comment_blocks(path):
 		for at, span in spans(text):
@@ -323,7 +401,7 @@ def quotations(path, secs):
 			cited = ref is not None and len(span.split()) >= MIN_WORDS
 			if not (normative or cited):
 				continue
-			yield start, span, ref is None or not elsewhere(ref, secs)
+			yield start, span, "9113" if ref is None else document(ref, secs)
 
 
 def variants(fragment, first, last):
@@ -361,38 +439,73 @@ def verbatim(span, rfc):
 def main(argv):
 	rfc_path = find_rfc(argv)
 	if rfc_path is None:
-		print("skipped: rfc9113.txt was not found. Fetch it with")
+		# Nothing is checked without RFC 9113, not even the spans that name another
+		# document: its headings are what tell a bare section number apart from one of
+		# somebody else's. So this is the whole check skipping, and it says so.
+		print("skipped: rfc9113.txt was not found. Fetch it, and the rest while you are here:")
 		print("    curl -o ../rfc9113.txt https://www.rfc-editor.org/rfc/rfc9113.txt")
+		print("    curl -o ../rfc9110.txt https://www.rfc-editor.org/rfc/rfc9110.txt")
+		print("    curl -o ../rfc7541.txt https://www.rfc-editor.org/rfc/rfc7541.txt")
 		return 0
 
 	raw = rfc_path.read_text(encoding="utf-8", errors="replace")
 	secs = sections(raw)
-	rfc = normalise(unwrap(raw))
+	texts = {"9113": normalise(unwrap(raw))}
+	paths = {"9113": rfc_path}
+	for num, p in find_others().items():
+		texts[num] = normalise(unwrap(p.read_text(encoding="utf-8", errors="replace")))
+		paths[num] = p
 
 	root = pathlib.Path(__file__).resolve().parent.parent
-	checked, skipped = 0, 0
-	bad = []
+	checked = 0
+	bad, unread = [], []
 	for path in sorted(root.rglob("*.go")):
-		for line, span, ours in quotations(path, secs):
-			if not ours:
-				skipped += 1
+		for line, span, doc in quotations(path, secs):
+			where = (path.relative_to(root), line, span)
+			if doc not in texts:
+				unread.append(where + (doc,))
 				continue
 			checked += 1
-			if not verbatim(span, rfc):
-				bad.append((path.relative_to(root), line, span))
+			if not verbatim(span, texts[doc]):
+				bad.append(where + (doc,))
 
-	for path, line, span in bad:
-		print("%s:%d does not quote RFC 9113:" % (path, line))
+	for path, line, span, doc in bad:
+		print("%s:%d does not quote RFC %s:" % (path, line, doc))
 		print("    %s" % span)
 		print()
 
-	print("%d quotations checked against %s" % (checked, rfc_path))
-	if skipped:
-		print("%d more name another document and were not checked." % skipped)
+	print("%d quotations checked against %s"
+		% (checked, ", ".join(str(paths[n]) for n in sorted(paths))))
+
+	# The ones this script has no copy of are named rather than counted, because a
+	# quotation nobody can audit is the only kind that can be wrong indefinitely. A count
+	# says two exist; a list says which two, and reading that list is the whole of their
+	# review. RFC 7541's absence made this concrete twice over: a comment in
+	# internal/hpack quoted a sentence of §4.2 that does not exist and inverted the rule
+	# that does, and a comment in internal/limits dropped a word from a real sentence of
+	# the same section. The first was found only because it spelled its attribution in a
+	# way this script does not recognise — "RFC 7541 section 4.2" rather than "§4.2 of RFC
+	# 7541" — so the span fell through to the RFC 9113 default and was refused for naming
+	# the wrong document. That was luck. Fetching the document is the part that is not.
+	if unread:
+		print()
+		print("%d name a document this checkout does not have, and were not checked:"
+			% len(unread))
+		for path, line, span, doc in unread:
+			short = span if len(span) <= 66 else span[:63] + "..."
+			print("    %s:%d  RFC %s: %s" % (path, line, doc or "?", short))
+		missing = sorted({d for _, _, _, d in unread if d in OTHERS})
+		if missing:
+			print("Read them by hand, or fetch what they name:")
+			for num in missing:
+				print("    curl -o ../%s https://www.rfc-editor.org/rfc/%s"
+					% (OTHERS[num], OTHERS[num]))
+
 	if bad:
-		print("%d of them are not in RFC 9113 in the form they are quoted." % len(bad))
+		print("%d of them are not in the document they name, in the form they are quoted."
+			% len(bad))
 		return 1
-	print("all of them appear in RFC 9113.")
+	print("all of them appear in the document they name.")
 	return 0
 
 

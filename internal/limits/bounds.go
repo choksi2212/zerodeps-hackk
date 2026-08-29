@@ -74,11 +74,12 @@ const MaxConcurrentStreams = 100
 // worth naming.
 //
 // Sitting below what the peer offered is legal and costs nothing. §4.2 of RFC 7541
-// makes the value "the maximum size the encoder is permitted to use" rather than the
-// size it must use, and lets an encoder choose any size below it provided it says
-// which — with a dynamic table size update at the front of the next block, which is
-// the encoder's own business. So a peer that offers a larger table than this gets the
-// responses it would have got anyway, encoded against a smaller one.
+// makes the value "the maximum size that the encoder is permitted to use for the
+// dynamic table" rather than the size it must use, and lets an encoder choose any size
+// below it provided it says which — with a dynamic table size update at the front of
+// the next block, which is the encoder's own business. So a peer that offers a larger
+// table than this gets the responses it would have got anyway, encoded against a
+// smaller one.
 //
 // Which way the bound applies is the part worth being careful about: it lowers the
 // value the peer sent and never raises it. A peer that advertises a table smaller

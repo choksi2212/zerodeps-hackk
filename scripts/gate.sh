@@ -116,16 +116,21 @@ if grep -Eq '^[[:space:]]*(require|replace|exclude|toolchain)' go.mod; then
 fi
 ok "go.mod is $(grep -c . go.mod) non-blank lines; no go.sum, no vendor/"
 
-step "9/10 every RFC 9113 quotation must be the RFC's own words"
-# The comments here argue from the specification and quote it, and seven of those
+step "9/10 every RFC quotation must be the RFC's own words"
+# The comments here argue from the specification and quote it, and nine of those
 # quotations turned out to be RFC 7540's text under RFC 9113's numbers, or
-# sentences that appear in neither. See scripts/quotes.py, which explains what it
-# tolerates, what it declines to grade, and why.
+# sentences that appear in neither. Four documents are quoted — 9113, 9110, 7541
+# and 3986 — and each is checked against when a copy is beside the checkout. See
+# scripts/quotes.py, which explains what it tolerates, what it declines to grade,
+# and why.
 #
-# Skipped, loudly, when Python or the RFC is missing. This check grades prose, it
+# Skipped, loudly, when Python or RFC 9113 is missing. This check grades prose, it
 # is the only step that needs anything outside the Go toolchain, and a
 # contributor without the RFC beside their checkout should not be stopped from
-# committing code — so it says it was skipped rather than passing quietly.
+# committing code — so it says it was skipped rather than passing quietly. The
+# three other documents are optional in a smaller way: their absence skips the
+# spans that name them, which the output lists by file and line, and the step
+# still passes.
 #
 # Each candidate is run, not merely found on PATH. On Windows, `python3` is an
 # App Execution Alias that exists whether or not Python is installed: it is on
@@ -143,8 +148,9 @@ if [ -z "$py" ]; then
 	printf '   skipped: no python on PATH, so the quotations were not checked\n'
 else
 	quotes="$("$py" scripts/quotes.py)" || die "$quotes
-          Fix the comment so it matches the RFC, or drop the quotation marks and
-          paraphrase instead. See scripts/quotes.py for what counts as verbatim."
+          Fix the comment so it matches the document it names, or drop the
+          quotation marks and paraphrase instead. See scripts/quotes.py for what
+          counts as verbatim."
 	printf '%s\n' "$quotes" | sed 's/^/   /'
 fi
 
