@@ -1,6 +1,7 @@
 package stream
 
 import (
+	"sync"
 	"time"
 
 	"zerodeps/zdh/internal/flow"
@@ -151,6 +152,20 @@ type Table struct {
 	// reaches here. A table that kept a partial block per stream would be
 	// modelling a state the protocol does not have.
 	assembling *block
+
+	// mu guards sent, and nothing else on this struct.
+	//
+	// The only lock in a package arranged around not having one, and what it covers
+	// is a slice of numbers rather than any part of the state machine: an append on
+	// one side, a swap on the other, never held across anything that can block. The
+	// promise in the package comment is unchanged in the way that matters — no
+	// goroutine but the reader's touches a stream, a window or the map.
+	mu sync.Mutex
+
+	// sent is the identifiers whose responses have been fully sent, as reported by
+	// the goroutines that sent them and not yet applied to the state machine. See
+	// ReportSendEnd and drainSent.
+	sent []uint32
 }
 
 // block is a header block under reassembly.
@@ -287,14 +302,13 @@ func (t *Table) Stream(id uint32) *Stream { return t.streams[id] }
 // and because an identifier would have to be looked up and found absent — which is
 // not an error worth a return value on a method whose whole job is bookkeeping.
 //
-// Like every other method here it must be called from the connection's reader
-// goroutine, and that is worth saying explicitly because this is the one whose
-// cause is elsewhere: the news it records is made by the goroutine writing the
-// response, which is not the goroutine allowed to call this. The table has no lock
-// and is not going to get one — see the package comment on why the state machine
-// stays out from behind one — so the response side reports that it has finished and
-// the reader goroutine is what calls this. Wiring that up is internal/server's, and
-// until it exists nothing but the tests calls this at all.
+// Like every other method here except ReportSendEnd it must be called from the
+// connection's reader goroutine, and that is worth saying explicitly because this is
+// the one whose cause is elsewhere: the news it records is made by the goroutine
+// writing the response, which is not the goroutine allowed to call this. The table has
+// no lock over its state machine and is not going to get one — see the package comment
+// on why that state stays out from behind one — so the response side calls
+// ReportSendEnd and the reader goroutine is what calls this, on the next frame.
 func (t *Table) SendEnd(s *Stream) {
 	if s.state == StateHalfClosedRemote {
 		// The peer had already finished, so this closes the stream outright.
@@ -305,12 +319,76 @@ func (t *Table) SendEnd(s *Stream) {
 	s.state = StateHalfClosedLocal
 }
 
+// ReportSendEnd says that the goroutine writing stream id's response has sent
+// END_STREAM on it. It is the one method here that may be called from another
+// goroutine.
+//
+// It does not apply the close. It records the identifier, and the next frame the
+// reader goroutine handles is what turns it into the state change — see drainSent.
+// Applying it here instead would be the goroutine writing a response reaching into
+// the stream map and the state machine of a table that has no lock over either, which
+// is not a race on one number but a race on every field this file touches.
+//
+// An identifier rather than the *Stream the caller is already holding, and that is not
+// a convenience withheld for tidiness. The stream can be gone before the reader gets
+// to it — the peer may reset it, and does exactly that when it abandons a download —
+// and an identifier can be looked up and found absent where a pointer would be
+// dereferenced regardless. §5.1.1 forbids an identifier from ever being reused on a
+// connection, so a stale one cannot resolve to some later stream. That it may not take
+// the pointer is the same fact that makes this method exist: everything on a Stream
+// except its identifier belongs to the reader goroutine.
+//
+// Reporting the same stream twice, or one that never existed, does nothing. Both are
+// the caller having lost track rather than the connection being in a bad state, and
+// neither is worth an error return to a goroutine that has nowhere to return it to.
+func (t *Table) ReportSendEnd(id uint32) {
+	t.mu.Lock()
+	t.sent = append(t.sent, id)
+	t.mu.Unlock()
+}
+
+// drainSent applies every send-end reported since the last frame.
+//
+// Called at the top of HandleFrame, before the frame is dispatched, because
+// HandleFrame is the only place the table is consulted and this is what makes it
+// current when it is. §5.1.2's concurrency limit is checked where a HEADERS frame
+// opens a stream, so a slot freed by a response that finished a moment ago has to be
+// free by then; draining after the dispatch instead would refuse a request the peer
+// was entitled to send, on a connection at its limit, for as long as the peer kept
+// requesting. The state a DATA frame is judged against is the other one: a stream this
+// server has finished sending on is half-closed (local), and it has to be that before
+// the frame is judged rather than after.
+//
+// An idle connection drains nothing, and does not need to. Nothing reads the table
+// while no frame is arriving, so a stream that is finished but still counted costs one
+// map entry until the peer's next frame — which is the frame that would have noticed.
+func (t *Table) drainSent() {
+	t.mu.Lock()
+	sent := t.sent
+	t.sent = nil
+	t.mu.Unlock()
+
+	for _, id := range sent {
+		// Absent is an ordinary outcome here rather than an anomaly. A peer that
+		// resets a stream mid-response has already retired it, and the goroutine
+		// writing that response reports its END_STREAM anyway, because it has no way
+		// to know and nothing to do about it if it did.
+		if s := t.streams[id]; s != nil {
+			t.SendEnd(s)
+		}
+	}
+}
+
 // HandleFrame dispatches one frame that names a stream.
 //
 // Every error returned carries its own scope, as h2.StreamError or h2.ConnError,
 // which is what lets internal/server answer one with RST_STREAM and the other
 // with GOAWAY without knowing a single protocol rule.
 func (t *Table) HandleFrame(f frame.Frame) error {
+	// Before the dispatch rather than after it, and the reason is §5.1.2's
+	// concurrency limit: see drainSent.
+	t.drainSent()
+
 	switch v := f.(type) {
 	case frame.HeadersFrame:
 		return t.headers(v)

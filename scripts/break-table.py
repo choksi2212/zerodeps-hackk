@@ -71,16 +71,43 @@ the streams on the way out looks like housekeeping and is a race: retire takes a
 stream's send window with it, so whether a woken writer sees the connection's reason or
 flow.ErrStreamGone comes down to which reached it first.
 
+ReportSendEnd and the drain are the other place a fact arrives from outside the reader
+goroutine, and their five breaks are worth reading together because three of them are
+about *when* rather than what. Applying the close where it is reported is the break the
+whole arrangement exists to prevent, and the only reason it is caught at all is that one
+test asserts the stream is still open between the report and the next frame -- every
+assertion about the end state passes, because the end state is right. What it costs is
+not a wrong answer but a data race on the stream map, the states and the concurrency
+count, which under -race is a caught test and in production is a wedged connection.
+Draining after the dispatch instead of before it produces a server that is correct until
+it is busy: §5.1.2's limit is checked where a HEADERS frame opens a stream, so a
+connection at its limit refuses a request the peer was entitled to send, and refuses the
+next one too, each paying for the response that finished just before it arrived. Never
+draining at all is the same fault without the recovery. The remaining two are the two
+lines inside the drain that look like they could be shorter: taking the list without
+emptying it grows one identifier per response for the life of the connection and is
+visible in no state assertion anywhere, and dropping the nil check is a nil dereference
+in the reader goroutine of a healthy connection on the ordinary event of a peer
+abandoning a download.
+
+There is one guard on that route with no break here, named rather than left out:
+TestReportSendEndIsSafeWhileTheReaderIsHandlingFrames is a -race test, and this harness
+runs the suite without it. The break that would prove it -- ReportSendEnd appending
+without the mutex -- fires nothing under a plain go test, so it is not written down as
+one. Its subject is covered from the other direction: the break that applies the close
+on the reporting goroutine reaches the map from two goroutines at once, and that test is
+where the race detector says so.
+
 Every guard in the file has a break here, both scopes of every error that has a
 choice of scope, and every message has one that strips its section reference.
-All 128 are caught, and three of them are worth knowing about for how they are caught
+All 133 are caught, and four of them are worth knowing about for how they are caught
 rather than that they are: removing the CONTINUATION-with-no-block guard, dropping
-the streams map from the constructor, and letting New skip making a Sender all
-produce a nil dereference rather than a failed assertion. All three still report as an
-ordinary failure of the named test, because the panic happens on the goroutine running
-that test and go test attributes it there -- so none of them needs the harness's crash
-outcome, which is for a break that takes the package down somewhere no test's name is
-attached to.
+the streams map from the constructor, letting New skip making a Sender, and taking the
+nil check out of the drain all produce a nil dereference rather than a failed assertion.
+All four still report as an ordinary failure of the named test, because the panic
+happens on the goroutine running that test and go test attributes it there -- so none of
+them needs the harness's crash outcome, which is for a break that takes the package down
+somewhere no test's name is attached to.
 
 Thirteen of the breaks were refused outright by preflight the first time this campaign
 was run after the send half of flow control moved out of this file and behind
@@ -324,6 +351,65 @@ BREAKS = [
         [
             "TestStateOfTracksTheOtherOrderOfClosing",
             "TestTheTableOnlyHoldsStreamsThatCountAsConcurrent",
+        ],
+    ),
+
+    # --- ReportSendEnd and the drain: the response side crossing back ---------
+    (
+        "ReportSendEnd applies the close where it stands, on the goroutine that reported it",
+        """	t.mu.Lock()
+	t.sent = append(t.sent, id)
+	t.mu.Unlock()""",
+        """	if s := t.streams[id]; s != nil {
+		t.SendEnd(s)
+	}""",
+        ["TestReportSendEndIsNotAppliedUntilTheNextFrame"],
+    ),
+    (
+        "the drain reads the reported list and leaves it there",
+        """	t.mu.Lock()
+	sent := t.sent
+	t.sent = nil
+	t.mu.Unlock()""",
+        """	t.mu.Lock()
+	sent := t.sent
+	t.mu.Unlock()""",
+        ["TestTheDrainEmptiesTheListItApplies"],
+    ),
+    (
+        "the drain dereferences an identifier the peer has already reset away",
+        """		if s := t.streams[id]; s != nil {
+			t.SendEnd(s)
+		}""",
+        """		t.SendEnd(t.streams[id])""",
+        ["TestReportSendEndForAStreamThePeerHasResetIsIgnored"],
+    ),
+    (
+        "HandleFrame never drains, so a finished response never closes its stream",
+        """	// Before the dispatch rather than after it, and the reason is §5.1.2's
+	// concurrency limit: see drainSent.
+	t.drainSent()
+
+""",
+        "",
+        [
+            "TestReportSendEndIsNotAppliedUntilTheNextFrame",
+            "TestReportSendEndFreesTheConcurrencySlotBeforeTheNextRequestIsJudged",
+            "TestReportSendEndOnAStreamThePeerHasNotFinishedLeavesItHalfClosedLocal",
+            "TestReportSendEndIsSafeWhileTheReaderIsHandlingFrames",
+        ],
+    ),
+    (
+        "HandleFrame drains after the dispatch, so every frame is judged against a stale table",
+        """	t.drainSent()
+
+	switch v := f.(type) {""",
+        """	defer t.drainSent()
+
+	switch v := f.(type) {""",
+        [
+            "TestReportSendEndFreesTheConcurrencySlotBeforeTheNextRequestIsJudged",
+            "TestReportSendEndOnAStreamThePeerHasNotFinishedLeavesItHalfClosedLocal",
         ],
     ),
 

@@ -1891,6 +1891,151 @@ func TestResettingAStreamWakesTheGoroutineWritingItsResponse(t *testing.T) {
 	}
 }
 
+// --- the response's END_STREAM coming back ---------------------------------
+
+func TestReportSendEndIsNotAppliedUntilTheNextFrame(t *testing.T) {
+	// Why this is a report and not the state change itself. The fact is made on the
+	// goroutine writing the response; the state machine it changes belongs to the
+	// reader's. So the assertions *between* the two calls are the ones that matter — a
+	// ReportSendEnd that closed the stream where it stands would satisfy every other
+	// test in this file and be a data race on the map, the states and the concurrency
+	// count at once, of the kind that shows up as a wedged connection under load and
+	// never in a unit test.
+	h := newHarness(t, Config{})
+	h.open(1, true)
+	h.assertState(1, StateHalfClosedRemote)
+
+	h.tab.ReportSendEnd(1)
+
+	h.assertState(1, StateHalfClosedRemote)
+	if got := h.tab.Len(); got != 1 {
+		t.Fatalf("the table holds %d streams immediately after ReportSendEnd, want the 1 that was still open: the close was applied off the reader goroutine", got)
+	}
+
+	// Any frame the reader handles would do; a second request is the one the next test
+	// is about.
+	h.mustSend(request(3, false))
+
+	h.assertState(1, StateClosed)
+	if h.tab.Stream(1) != nil {
+		t.Error("stream 1 is still in the table after the frame that should have applied its send-end")
+	}
+}
+
+func TestReportSendEndFreesTheConcurrencySlotBeforeTheNextRequestIsJudged(t *testing.T) {
+	// Why the drain is at the top of HandleFrame rather than the bottom. §5.1.2's limit
+	// is checked where a HEADERS frame opens a stream, so a slot freed by a response
+	// that finished a moment ago has to be free by the time that check runs. Draining
+	// afterwards instead refuses a request the peer was entitled to send — and on a
+	// connection sitting at its limit it refuses the one after that too, each request
+	// paying for the response that finished just before it arrived.
+	h := newHarness(t, Config{MaxConcurrent: 1})
+	h.open(1, true)
+	assertStreamError(t, h.send(request(3, false)), 3, h2.RefusedStream, "a stream behind an unfinished response")
+
+	h.tab.ReportSendEnd(1)
+
+	if err := h.send(request(5, false)); err != nil {
+		t.Fatalf("a request arriving behind a response that had finished was refused: %v", err)
+	}
+	h.assertState(1, StateClosed)
+}
+
+func TestReportSendEndOnAStreamThePeerHasNotFinishedLeavesItHalfClosedLocal(t *testing.T) {
+	// The other half of §5.1's two-sided close, and the second reason the drain runs
+	// before the dispatch: the state a DATA frame is judged and delivered against has
+	// to be current when it is. A response that finishes before the request body has
+	// all arrived is ordinary — a handler answering 405 or 413 without reading the body
+	// does exactly this — and §5.1 keeps the stream receiving afterwards.
+	h := newHarness(t, Config{})
+	h.open(1, false)
+
+	h.tab.ReportSendEnd(1)
+
+	h.mustSend(data(1, "still coming", false))
+	h.assertState(1, StateHalfClosedLocal)
+	h.assertEvents("[headers(1, [{:method GET false} {:path /1 false}], end=false, state=open) " +
+		"data(1, \"still coming\", end=false, state=half-closed (local))]")
+}
+
+func TestReportSendEndForAStreamThePeerHasResetIsIgnored(t *testing.T) {
+	// A download the peer abandons. The RST_STREAM is read here and retires the stream,
+	// and the goroutine writing that response reports its END_STREAM regardless: it
+	// learns the stream is gone by being woken with an error, has nothing to do about
+	// it, and reporting is not conditional on anything it can see. So the identifier
+	// that arrives names nothing the table answers to any more, and §5.1.1's ban on
+	// reuse means it cannot come to name something else either. Finding nothing has to
+	// be an outcome rather than a nil dereference in the reader goroutine of a
+	// connection that was otherwise healthy.
+	h := newHarness(t, Config{})
+	h.open(1, false)
+	h.mustSend(frame.RSTStreamFrame{StreamID: 1, ErrCode: h2.Cancel})
+
+	h.tab.ReportSendEnd(1)
+
+	h.mustSend(request(3, false))
+
+	h.assertState(1, StateClosed)
+	if got := h.tab.Len(); got != 1 {
+		t.Errorf("the table holds %d streams, want only the 1 that is open: a stream the peer reset came back", got)
+	}
+}
+
+func TestTheDrainEmptiesTheListItApplies(t *testing.T) {
+	// The list is taken and emptied in one step, not read and left behind. An
+	// implementation that read it and left it would be correct in every state it
+	// produced — applying a send-end twice finds a stream that has already gone and
+	// does nothing — and would grow by one identifier per response for the life of the
+	// connection, which is an allocation the peer controls and which no assertion about
+	// states or table sizes anywhere in this file would ever notice. Reaching into the
+	// field is the only way to see it, which is what this test is for.
+	h := newHarness(t, Config{})
+	h.open(1, true)
+	h.tab.ReportSendEnd(1)
+	h.mustSend(request(3, false))
+
+	h.tab.mu.Lock()
+	defer h.tab.mu.Unlock()
+	if len(h.tab.sent) != 0 {
+		t.Errorf("the reported list still holds %v after the drain applied it, so it grows by one identifier per response for the life of the connection", h.tab.sent)
+	}
+}
+
+func TestReportSendEndIsSafeWhileTheReaderIsHandlingFrames(t *testing.T) {
+	// The one goroutine boundary this package has, driven across. Under -race — which
+	// is how the gate runs the suite — this is the test that says the list behind the
+	// mutex is the whole of what is shared: a ReportSendEnd that reached into the
+	// stream map, or a drain that read the list without holding the lock, is reported
+	// here and by nothing else in this file.
+	//
+	// The frames the reader handles meanwhile are PRIORITY on stream 2, which is even
+	// and so idle for ever (§5.1.1) and which PRIORITY changes nothing about anyway. So
+	// the reader is doing real work inside HandleFrame without any of that work
+	// touching the streams being reported — which is what leaves the drain as the only
+	// place the two goroutines meet.
+	h := newHarness(t, Config{})
+	var ids []uint32
+	for id := uint32(1); id <= 31; id += 2 {
+		ids = append(ids, id)
+		h.open(id, true)
+	}
+	for _, id := range ids {
+		go h.tab.ReportSendEnd(id)
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for h.tab.Len() > 0 {
+		if time.Now().After(deadline) {
+			t.Fatalf("%d of the %d reported streams were still in the table after 5s", h.tab.Len(), len(ids))
+		}
+		h.mustSend(frame.PriorityFrame{StreamID: 2, StreamDependency: 0, Weight: 1})
+		runtime.Gosched()
+	}
+	for _, id := range ids {
+		h.assertState(id, StateClosed)
+	}
+}
+
 // --- the connection's ending -----------------------------------------------
 
 func TestCloseWakesEveryGoroutineParkedForSendCredit(t *testing.T) {

@@ -40,13 +40,19 @@
 //
 // # Concurrency
 //
-// A Table is not safe for concurrent use and has no lock. Every method is called
-// from the connection's single reader goroutine, in frame arrival order, which is
-// the only order the HPACK codec can be driven in at all (see h2.HeaderCodec).
-// The per-stream goroutines that will write responses do not touch the table;
-// they are handed their own stream, and they spend send-side flow control through
-// the *flow.Sender the table exposes, which is the one part of this package's
+// A Table's streams are not safe for concurrent use and are not behind a lock. Every
+// method but one is called from the connection's single reader goroutine, in frame
+// arrival order, which is the only order the HPACK codec can be driven in at all (see
+// h2.HeaderCodec). The per-stream goroutines that write responses do not touch the
+// table; they are handed their own stream, and they spend send-side flow control
+// through the *flow.Sender the table exposes, which is the one part of this package's
 // state that is shared and locked.
+//
+// The exception is Table.ReportSendEnd, and it is arranged so as not to be one. A
+// response finishes on its own goroutine, and the state change that fact causes has to
+// happen on the reader's, so the identifier is put on a list behind a mutex that guards
+// nothing else and the next frame the reader handles applies it. No stream, window or
+// map entry is reachable from another goroutine even there.
 package stream
 
 import (
