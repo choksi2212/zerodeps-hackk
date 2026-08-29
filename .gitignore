@@ -6,5 +6,9 @@ bin/
 *.prof
 *.out
 
+# Bytecode from the break-campaign scripts importing scripts/breakage.py. The
+# scripts are committed; what Python caches of them is not.
+__pycache__/
+
 # testdata/fuzz/ is deliberately NOT ignored: a fuzz crasher is a committed
 # regression test, and the corpus growing over the window is evidence.
