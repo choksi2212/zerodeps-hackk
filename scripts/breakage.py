@@ -12,9 +12,11 @@ a test that hangs until the timeout has detected the break and told nobody, and 
 test whose binary panics has detected it legibly but has not reported it through
 the suite. See outcome() for the full taxonomy.
 
-Every campaign is checked before any of it is run — see preflight — because a
-malformed break is silent in the worst way: it reports the tests it named as passing,
-which reads as a hole in the suite rather than a typo in the campaign.
+A campaign covers one Go package, which is usually one file and sometimes several —
+see campaign() for how a break finds the file it belongs to. Every campaign is checked
+before any of it is run — see preflight — because a malformed break is silent in the
+worst way: it reports the tests it named as passing, which reads as a hole in the suite
+rather than a typo in the campaign.
 
 This module holds no campaign of its own. It exists because the second campaign
 would otherwise have been a copy of the first, and two copies of a harness drift:
@@ -130,14 +132,14 @@ def first_matching(lines, pred):
     return ""
 
 
-def preflight(original, breaks):
+def preflight(originals, breaks):
     """Check every break before any of them is run, and report what cannot work.
 
     Up front rather than as each break comes round, which is where this check used to
     live. A campaign is thirty to forty breaks and each one is several `go test`
     processes, so a bad anchor on the last break was twenty minutes of waiting to be
     told about a typo. Everything checked here is a property of the campaign and of
-    the file it edits, both of which are known before the first test runs.
+    the files it edits, both of which are known before the first test runs.
 
     An anchor that matches twice removes a different guard than the one named. One
     that matches none tests nothing while every expected test reports a pass, which
@@ -145,13 +147,21 @@ def preflight(original, breaks):
     no-op with the same symptom. A break with no expected tests can never fail. Two
     breaks sharing a name make the hole list ambiguous, which matters because that
     list is what gets acted on.
+
+    The match is counted across every file in the campaign rather than within one,
+    which is what a multi-file campaign needs and is also strictly stricter than the
+    single-file count it replaces: an anchor occurring once in each of two files was
+    unambiguous per file and is ambiguous in fact.
     """
     problems = []
     seen = set()
     for name, old, new, expect in breaks:
-        n = original.count(old)
+        hits = {path: text.count(old) for path, text in originals.items()}
+        n = sum(hits.values())
         if n != 1:
-            problems.append("%s: the anchor matched %d times, not once" % (name, n))
+            where = ", ".join("%s x%d" % (p, c) for p, c in hits.items() if c)
+            problems.append("%s: the anchor matched %d times, not once%s"
+                            % (name, n, " (%s)" % where if where else ""))
         if old == new:
             problems.append("%s: the replacement is identical to the anchor" % name)
         if not expect:
@@ -162,12 +172,27 @@ def preflight(original, breaks):
     return problems
 
 
-def campaign(source, package, breaks):
+def anchor_file(originals, old):
+    """The one file holding this break's anchor. preflight has already established
+    that exactly one does."""
+    for path, text in originals.items():
+        if old in text:
+            return path
+    raise AssertionError("no file holds the anchor, which preflight should have caught")
+
+
+def campaign(sources, package, breaks):
     """Run every break in turn and report. Returns a process exit status.
 
-    source is the file to edit, package the Go package whose tests are run, and
-    breaks a list of (name, old, new, tests) tuples. The file is restored on the
-    way out, including on error: a campaign that left the tree modified would be
+    sources is the file to edit or a list of them, package the Go package whose tests
+    are run, and breaks a list of (name, old, new, tests) tuples. Each break names its
+    own file implicitly, by where its anchor is found: a campaign covers a package, a
+    package is sometimes more than one file, and asking each break to repeat which file
+    it belongs to would be a field that is always derivable and occasionally wrong.
+
+    Every file is restored before each break, so a campaign over several files never
+    runs one break on top of another's edit. All of them are restored on the way out,
+    including on error: a campaign that left the tree modified would be
     indistinguishable from a campaign that found a bug.
 
     Exit status 0 if every break was caught, 1 if any went unnoticed, and 2 if the
@@ -175,10 +200,15 @@ def campaign(source, package, breaks):
     cannot run has found nothing, and reporting it as holes would say the suite is
     weak when what is wrong is the file describing it.
     """
-    src = pathlib.Path(source)
-    original = read(src)
+    if isinstance(sources, str):
+        sources = [sources]
+    originals = {pathlib.Path(s): read(pathlib.Path(s)) for s in sources}
 
-    problems = preflight(original, breaks)
+    def restore():
+        for path, text in originals.items():
+            write(path, text)
+
+    problems = preflight(originals, breaks)
     if problems:
         say("%d of %d breaks cannot be run as written, and nothing was tested:"
             % (len(problems), len(breaks)))
@@ -189,7 +219,9 @@ def campaign(source, package, breaks):
     holes = []
     try:
         for name, old, new, expect in breaks:
-            write(src, original.replace(old, new, 1))
+            restore()
+            path = anchor_file(originals, old)
+            write(path, originals[path].replace(old, new, 1))
 
             results = [(test,) + outcome(test, package) for test in expect]
             crashed = [t for t, s, _ in results if s == "crash"]
@@ -207,7 +239,7 @@ def campaign(source, package, breaks):
                 # an em-dash here comes out as mojibake in every report line.
                 say("      %-5s %s%s" % (status, test, "  -- " + detail if detail else ""))
     finally:
-        write(src, original)
+        restore()
 
     say("")
     if holes:
@@ -219,6 +251,6 @@ def campaign(source, package, breaks):
     return 0
 
 
-def main(source, package, breaks):
+def main(sources, package, breaks):
     """The entry point a campaign script ends with."""
-    sys.exit(campaign(source, package, breaks))
+    sys.exit(campaign(sources, package, breaks))
