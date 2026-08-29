@@ -1,0 +1,16 @@
+# RFC 7541 Appendix C.5 — response sequence without Huffman coding.
+# SETTINGS_HEADER_TABLE_SIZE = 256 for this sequence, which forces
+# evictions. This is the vector that matters most: it is the only one that
+# exercises eviction, so it tests the +32 accounting and the FIFO order
+# together. Extracted programmatically from the RFC text (hex dump lines
+# concatenated, ASCII sidebar and whitespace stripped) — never transcribed
+# by eye.
+
+# C.5.1 First response: :status 302, cache-control private, date, location
+4803333032580770726976617465611d4d6f6e2c203231204f637420323031332032303a31333a323120474d546e1768747470733a2f2f7777772e6578616d706c652e636f6d
+
+# C.5.2 Second response: :status 307 evicts :status 302
+4803333037c1c0bf
+
+# C.5.3 Third response: several evictions
+88c1611d4d6f6e2c203231204f637420323031332032303a31333a323220474d54c05a04677a69707738666f6f3d4153444a4b48514b425a584f5157454f50495541585157454f49553b206d61782d6167653d333630303b2076657273696f6e3d31

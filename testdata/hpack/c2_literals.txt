@@ -1,0 +1,15 @@
+# RFC 7541 Appendix C.2 — header field representation examples.
+# format: <hex> | <name> | <value> | sensitive=<0/1>
+# Hex extracted programmatically from the RFC text; never transcribed by eye.
+
+# C.2.1 Literal Header Field with Indexing
+400a637573746f6d2d6b65790d637573746f6d2d686561646572 | custom-key | custom-header | sensitive=0
+
+# C.2.2 Literal Header Field without Indexing
+040c2f73616d706c652f70617468 | :path | /sample/path | sensitive=0
+
+# C.2.3 Literal Header Field Never Indexed
+100870617373776f726406736563726574 | password | secret | sensitive=1
+
+# C.2.4 Indexed Header Field
+82 | :method | GET | sensitive=0
