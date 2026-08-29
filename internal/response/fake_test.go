@@ -189,6 +189,100 @@ func newEncoder() (*Encoder, *fakeCodec, *fakeTransport) {
 	return NewEncoder(c, t), c, t
 }
 
+// ask is one Reserve call: the stream, what it was asked for, and what it answered.
+type ask struct {
+	id   uint32
+	want int
+	got  int
+}
+
+// fakeCredit is one connection's send-side flow control under the test's control.
+//
+// The real thing is *flow.Sender, and driving it here would mean building windows and
+// WINDOW_UPDATE arithmetic to produce a partial reservation — which is flow's own tests
+// over again, and which would make what a body looks like on the wire depend on two
+// packages' arithmetic instead of one. What this package does with credit is ask for a
+// chunk, send what it was given and ask again; what the tests need is therefore a Reserve
+// whose answers they choose, including answers no real window would produce.
+type fakeCredit struct {
+	mu   sync.Mutex
+	asks []ask
+
+	// grant, when set, answers each reservation. n is the ordinal of the call, counted
+	// from zero, so a test can refuse the third and assert on the two before it. Set
+	// before the credit is used and never written again.
+	grant func(n int, id uint32, want int) (int, error)
+
+	// entered and release, when non-nil, make every Reserve a handshake, the way
+	// fakeTransport.gate does for Enqueue. Set before use and never written again.
+	//
+	// This is what locates the Encoder's lock from outside. Reserve is the call that
+	// blocks for as long as a peer wants it to, so while one goroutine is parked here
+	// another stream's whole header burst has to be able to reach the transport — and if
+	// it cannot, a slow reader on one stream has stalled every other stream on the
+	// connection.
+	entered chan struct{}
+	release chan error
+}
+
+// park makes every Reserve on c wait until the test lets it through.
+func (c *fakeCredit) park() *fakeCredit {
+	c.entered, c.release = make(chan struct{}), make(chan error)
+	return c
+}
+
+func (c *fakeCredit) Reserve(id uint32, want int) (int, error) {
+	if want <= 0 {
+		// flow.Sender panics on this and so does this, rather than answering with a zero.
+		// A reservation of nothing is a caller that has not worked out how much it wants
+		// to send, and a zero would turn that into a loop enqueuing empty DATA frames
+		// until the frame budget stopped it.
+		panic(fmt.Sprintf("fakeCredit: Reserve(%d, %d): want must be positive", id, want))
+	}
+
+	if c.entered != nil {
+		c.entered <- struct{}{}
+		if err := <-c.release; err != nil {
+			return 0, err
+		}
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	got, err := want, error(nil)
+	if c.grant != nil {
+		got, err = c.grant(len(c.asks), id, want)
+	}
+	c.asks = append(c.asks, ask{id: id, want: want, got: got})
+	if err != nil {
+		return 0, err
+	}
+	if got < 1 || got > want {
+		// A test whose grant hook is wrong would otherwise look like a bug in Writer:
+		// a grant above the want overruns the caller's buffer, and one of zero makes
+		// the loop spin. Neither is something flow.Sender can do, so neither is
+		// something the code under test has to survive.
+		panic(fmt.Sprintf("fakeCredit: a grant of %d for a want of %d; flow.Sender's "+
+			"contract is a reservation in [1, want]", got, want))
+	}
+	return got, nil
+}
+
+// asked is a snapshot of the reservations made so far.
+func (c *fakeCredit) asked() []ask {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return slices.Clone(c.asks)
+}
+
+// newWriter returns a Writer on stream 1, and everything behind it.
+func newWriter() (*Writer, *fakeCodec, *fakeTransport, *fakeCredit) {
+	enc, c, tr := newEncoder()
+	cr := &fakeCredit{}
+	return NewWriter(enc, cr, 1), c, tr, cr
+}
+
 // status is the one pseudo-header field a response must carry.
 func status(code string) h2.Field { return h2.Field{Name: pseudoStatus, Value: code} }
 

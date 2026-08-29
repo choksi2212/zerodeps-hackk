@@ -3,11 +3,18 @@ package response
 import (
 	"bytes"
 	"errors"
+	"io"
 	"strings"
 
 	"zerodeps/zdh/internal/frame"
 	"zerodeps/zdh/internal/h2"
 )
+
+// A Writer is an io.WriteCloser, which is what the two signatures below are for: serving
+// a file is io.Copy into one of these and then closing it, and any other shape would mean
+// a handler reimplementing the copy loop. Asserted here rather than left for a caller to
+// discover, because it is a claim Write's documentation makes.
+var _ io.WriteCloser = (*Writer)(nil)
 
 // Credit is one connection's send-side flow control as this package needs it: a way to
 // be granted octets for a stream, or told that the stream will never get any.
