@@ -51,6 +51,28 @@ func TestDecodeSizeUpdateBeforeHeaderFieldIsValid(t *testing.T) {
 	}
 }
 
+// RFC 7541 section 4.2: "This dynamic table size update MAY occur anywhere
+// between two header field representations." Multiple updates before the
+// first field are legal, and only the last one is in effect.
+func TestDecodeMultipleSizeUpdatesBeforeHeaderField(t *testing.T) {
+	codec := New()
+	block := appendInt(nil, 0x20, 5, 200)
+	block = appendInt(block, 0x20, 5, 50)
+	block = appendInt(block, 0x20, 5, 4096)
+	block = append(block, 0x82) // then Indexed :method: GET
+
+	got, err := codec.Decode(block)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(got) != 1 || got[0].Name != ":method" {
+		t.Fatalf("got %+v", got)
+	}
+	if codec.dyn.max != 4096 {
+		t.Fatalf("dyn.max = %d, want 4096 (the last update wins)", codec.dyn.max)
+	}
+}
+
 func TestDecodeTruncatedBlockMidInstruction(t *testing.T) {
 	cases := [][]byte{
 		{0x40},             // literal-with-indexing: name index byte present, nothing else
