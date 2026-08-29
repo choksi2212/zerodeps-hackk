@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sync"
 	"time"
 
 	"zerodeps/zdh/internal/frame"
@@ -44,18 +45,20 @@ type streamHandler interface {
 	HandleFrame(f frame.Frame) error
 }
 
-// The three ways a connection ends with nobody at fault.
+// The four ways a connection ends with nobody at fault.
 //
 // Each is a distinct sentinel rather than a plain nil return, because the endings
 // are not interchangeable in what they permit us to do next: a peer that closed
 // its socket cannot be sent a GOAWAY, a peer that sent one has already said
-// goodbye and is owed the courtesy of a reply, and an idle connection is being
-// closed by us and has to be told so it can retry elsewhere. Collapsing them to
-// nil would make Serve guess.
+// goodbye and is owed the courtesy of a reply, an idle connection is being closed
+// by us and has to be told so it can retry elsewhere, and a connection we are
+// shutting down owes the peer the same courtesy for a different reason.
+// Collapsing them to nil would make Serve guess.
 var (
-	errPeerClosed = errors.New("peer closed the connection")
-	errPeerGoAway = errors.New("peer sent GOAWAY")
-	errIdle       = errors.New("connection idle")
+	errPeerClosed   = errors.New("peer closed the connection")
+	errPeerGoAway   = errors.New("peer sent GOAWAY")
+	errIdle         = errors.New("connection idle")
+	errShuttingDown = errors.New("server shutting down")
 )
 
 // readDeadlineKind says which of the connection's read deadlines the current read
@@ -107,6 +110,18 @@ type conn struct {
 	// connection. Recorded at dispatch rather than on completion, because the
 	// promise is about what we may have acted on, not what we finished.
 	lastStreamID uint32
+
+	// quit is closed by Shutdown to ask the read loop to stop. Every field above
+	// belongs to the reader goroutine alone; these two are the only shared state
+	// on the connection, because Shutdown is the only thing another goroutine
+	// calls. See Shutdown for what deadlineMu orders and why nothing else here
+	// needs a lock.
+	quit     chan struct{}
+	quitOnce sync.Once
+
+	// deadlineMu orders the read deadline's two writers — the reader goroutine
+	// arming the next one, and Shutdown bringing it forward — against each other.
+	deadlineMu sync.Mutex
 }
 
 // newConn returns a connection over sock, with h receiving the stream-bearing
@@ -127,6 +142,7 @@ func newConn(sock connSocket, h streamHandler, t limits.Timeouts) *conn {
 		w:        startFrameWriter(sock, t.Write),
 		handler:  h,
 		timeouts: t,
+		quit:     make(chan struct{}),
 	}
 }
 
@@ -212,6 +228,18 @@ func (c *conn) Serve() error {
 		sendErr = c.farewell(h2.NoError, "idle timeout")
 		err = nil
 
+	case errors.Is(err, errShuttingDown):
+		// §6.8's graceful shutdown, minus the two-stage GOAWAY it recommends. A
+		// server with streams in flight should send a first GOAWAY naming stream
+		// 2^31-1, wait for the requests already on the wire to arrive, and only then
+		// send the real last stream identifier; sending only the second one races
+		// the client and loses whatever it had in flight. There are no streams on
+		// this branch, so the last identifier is final the moment the read loop
+		// stops and there is nothing for a first GOAWAY to hold open.
+		// internal/stream owns the first one.
+		sendErr = c.farewell(h2.NoError, "server shutting down")
+		err = nil
+
 	case errors.As(err, &ce):
 		sendErr = c.farewell(ce.Code, ce.Reason)
 
@@ -258,8 +286,47 @@ func (c *conn) farewell(code h2.ErrCode, reason string) error {
 	return err
 }
 
+// Shutdown asks the connection to stop serving. Serve then returns nil, having
+// sent a GOAWAY with NO_ERROR: the difference between this and closing the socket
+// is the difference between a server that says goodbye and one that looks crashed.
+//
+// It is safe to call from any goroutine, more than once, and after Serve has
+// already returned — the accept layer calls it on every live connection at once,
+// and cannot know which of them ended a microsecond earlier by itself.
+//
+// The reader goroutine is almost always parked in a socket read when this is
+// called, and a channel it is not selecting on will not wake it. Bringing the read
+// deadline forward will: the read fails with os.ErrDeadlineExceeded, and readError
+// turns that into errShuttingDown rather than a timeout because the flag is set.
+// That is what deadlineMu orders. Without it, this call could land between the
+// loop's check of the flag and the loop arming its own deadline, and the reader
+// would overwrite our interrupt with a deadline a full idle timeout away —
+// a shutdown that returns in a minute instead of at once.
+func (c *conn) Shutdown() {
+	c.quitOnce.Do(func() { close(c.quit) })
+
+	c.deadlineMu.Lock()
+	defer c.deadlineMu.Unlock()
+	if err := c.sock.SetReadDeadline(time.Now()); err != nil {
+		// Nothing to do and nothing to report: a socket rejects a deadline once it
+		// is closed, which is the state this call is asking for. The read it would
+		// have interrupted has already finished.
+		return
+	}
+}
+
+// stopping reports whether Shutdown has been called.
+func (c *conn) stopping() bool {
+	select {
+	case <-c.quit:
+		return true
+	default:
+		return false
+	}
+}
+
 // run is the connection's read loop. It returns the reason it stopped, which is
-// one of the three sentinels above, an h2.ConnError, or a transport error.
+// one of the four sentinels above, an h2.ConnError, or a transport error.
 func (c *conn) run() error {
 	// Our SETTINGS goes out before the client's preface is read, not after.
 	// §3.4 requires only that it be the first frame we send, and sending it
@@ -286,6 +353,14 @@ func (c *conn) run() error {
 	c.settingsAckDue = time.Now().Add(c.timeouts.SettingsAck)
 
 	for {
+		// Checked before the read, not only after it. Shutdown's interrupt works on
+		// a read that blocks, and a read does not block when the peer's octets are
+		// already in the socket's receive buffer — which on a busy connection is the
+		// usual case. Without this, a shutdown would serve however many frames the
+		// kernel had already buffered before noticing.
+		if c.stopping() {
+			return errShuttingDown
+		}
 		if err := c.setReadDeadline(deadlineIdle); err != nil {
 			return err
 		}
@@ -328,6 +403,16 @@ func (c *conn) setReadDeadline(want readDeadlineKind) error {
 		}
 	}
 	c.deadlineKind = kind
+
+	c.deadlineMu.Lock()
+	defer c.deadlineMu.Unlock()
+	if c.stopping() {
+		// Shutdown has already brought the deadline forward and this call would push
+		// it back out. Deciding inside the lock is what makes the two orderings
+		// equivalent: either Shutdown's deadline lands after ours and wins, or it
+		// landed before and this branch repeats it.
+		deadline = time.Now()
+	}
 	return c.sock.SetReadDeadline(deadline)
 }
 
@@ -358,6 +443,14 @@ func (c *conn) readError(err error) error {
 		return errPeerClosed
 
 	case errors.Is(err, os.ErrDeadlineExceeded):
+		// An expired deadline on a connection that has been asked to stop is this
+		// server's own interrupt arriving, not the peer being slow. Checked before
+		// the kind, because the kind still names whichever deadline the loop last
+		// armed — a shutdown would otherwise be reported as a preface timeout or an
+		// idle one, and the peer would be told PROTOCOL_ERROR for our decision.
+		if c.stopping() {
+			return errShuttingDown
+		}
 		switch c.deadlineKind {
 		case deadlineSettingsAck:
 			// §6.5.3 names this specific failure and gives it its own code, which

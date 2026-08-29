@@ -179,6 +179,13 @@ func (ts *testSocket) allReadDeadlines() []time.Time {
 	return append([]time.Time(nil), ts.readDeadlines...)
 }
 
+// pendingLen is how much of the script the connection has not read yet.
+func (ts *testSocket) pendingLen() int {
+	ts.readMu.Lock()
+	defer ts.readMu.Unlock()
+	return len(ts.pending)
+}
+
 // handlerFunc adapts a function to streamHandler.
 type handlerFunc func(frame.Frame) error
 
@@ -381,6 +388,49 @@ func stopWriter(t *testing.T, c *conn) {
 	c.w.Close()
 	if err := c.w.Wait(); err != nil {
 		t.Errorf("stopping the writer: %v", err)
+	}
+}
+
+// awaitParked waits until the connection has consumed its whole script and armed
+// the deadline for the read that follows, which is the moment its reader goroutine
+// is blocked in Read with nothing to return.
+//
+// It is what separates "Shutdown interrupts a blocked read" from "the loop noticed
+// between two frames". Both end the connection, only one of them is what the
+// interrupt exists for, and a sleep would let the machine's load pick which one a
+// given run tested.
+func awaitParked(t *testing.T, ts *testSocket) {
+	t.Helper()
+	limit := time.Now().Add(gateWait)
+	for {
+		// Two deadlines: the preface read's, and the read after it. The second is
+		// only armed once the script's SETTINGS has been read and dispatched.
+		if ts.pendingLen() == 0 && len(ts.allReadDeadlines()) >= 2 {
+			return
+		}
+		if time.Now().After(limit) {
+			t.Fatalf("the connection did not park in a read within %v: it armed %d read deadlines and "+
+				"left %d octets of the script unread", gateWait, len(ts.allReadDeadlines()), ts.pendingLen())
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// assertGracefulGoAway is the frame a shutdown owes the peer.
+//
+// NO_ERROR and nothing else: a fault code here would tell a client that its own
+// traffic was the problem, and a client that believes that stops retrying against
+// a server which is merely restarting.
+func assertGracefulGoAway(t *testing.T, frames []frame.Frame) {
+	t.Helper()
+	ga := goAwayIn(t, frames)
+	if ga.ErrCode != h2.NoError {
+		t.Errorf("the shutdown GOAWAY carries %s, want NO_ERROR: this server is stopping and the peer "+
+			"has done nothing wrong", ga.ErrCode)
+	}
+	if !strings.Contains(string(ga.Debug), "shut") {
+		t.Errorf("the shutdown GOAWAY says %q, want it to name the shutdown: the peer's log is the only "+
+			"place a client operator can see why the connection went", ga.Debug)
 	}
 }
 
@@ -1527,6 +1577,137 @@ func TestServeReportsATruncatedFrame(t *testing.T) {
 	}
 }
 
+// --- graceful shutdown -------------------------------------------------------
+
+// TestConnShutdownInterruptsAParkedRead is the case Shutdown exists for, and the
+// one a channel alone cannot serve.
+//
+// A connection spends nearly all of its life blocked in a socket read, and a
+// goroutine blocked in a read is not selecting on anything. Closing a channel it
+// will look at eventually means "eventually" is the idle timeout — a minute by
+// default — so the deadline has to be brought forward under it.
+func TestConnShutdownInterruptsAParkedRead(t *testing.T) {
+	to := testTimeouts()
+	// Out of reach on purpose. With the default short idle timeout, a Shutdown that
+	// did nothing at all would still see the connection end 40ms later, and this
+	// test would pass on the timeout it was written to rule out.
+	to.Idle = longTimeout
+
+	ts := newTestSocket(&testTarget{}).script(clientHello(t))
+	c := newConn(ts, rejectingHandler(t), to)
+	done := serveInBackground(c)
+	awaitParked(t, ts)
+
+	c.Shutdown()
+
+	if err := awaitServe(t, done); err != nil {
+		t.Fatalf("Serve returned %v after Shutdown, want nil: a shutdown is this server's own decision "+
+			"and not a failure of the connection", err)
+	}
+	assertGracefulGoAway(t, peerSaw(t, ts))
+}
+
+// TestConnShutdownBeforeTheFirstReadEndsAtOnce is the window between the read
+// loop's check of the flag and the loop arming its own deadline.
+//
+// Shutdown's interrupt has already been applied when the loop gets there, so the
+// deadline the loop is about to set would overwrite it — and the loop's check has
+// already passed, so nothing would look at the flag again until the deadline it
+// just set expires. That is why setReadDeadline decides under the same lock.
+// A shutdown that returns in an hour is not a shutdown.
+func TestConnShutdownBeforeTheFirstReadEndsAtOnce(t *testing.T) {
+	to := testTimeouts()
+	// Both out of reach: nothing here may be ended by a deadline expiring on its
+	// own merits.
+	to.Preface, to.Idle = longTimeout, longTimeout
+
+	// No script at all — the peer connects and says nothing, which is also the
+	// cheapest attack there is and the state most of a server's connections are in
+	// when it is asked to stop.
+	ts := newTestSocket(&testTarget{})
+	c := newConn(ts, rejectingHandler(t), to)
+	c.Shutdown()
+
+	err := awaitServe(t, serveInBackground(c))
+	if err != nil {
+		t.Fatalf("Serve returned %v for a connection shut down before its first read, want nil: the "+
+			"peer's silence is not a protocol violation when we are the ones leaving", err)
+	}
+	assertGracefulGoAway(t, peerSaw(t, ts))
+}
+
+// TestConnShutdownDoesNotServeAnotherFrame is the case the deadline interrupt
+// cannot cover, which is why the read loop checks the flag as well.
+//
+// A read with octets already in the receive buffer does not block, so it never
+// consults a deadline: on a busy connection the interrupt would arrive and be
+// ignored for as many frames as the kernel had buffered. Answering a request after
+// announcing GOAWAY is worse than rude — §6.8 makes the last stream identifier a
+// promise about what was and was not acted on.
+func TestConnShutdownDoesNotServeAnotherFrame(t *testing.T) {
+	to := testTimeouts()
+	to.Preface, to.Idle = longTimeout, longTimeout
+
+	ts := newTestSocket(&testTarget{}).
+		script(append(clientHello(t), encodeFrames(t, ping(9))...))
+	c := newConn(ts, rejectingHandler(t), to)
+	c.Shutdown()
+
+	if err := awaitServe(t, serveInBackground(c)); err != nil {
+		t.Fatalf("Serve returned %v, want nil", err)
+	}
+
+	got := peerSaw(t, ts)
+	for _, f := range got {
+		if _, ok := f.(frame.PingFrame); ok {
+			t.Errorf("the peer's PING was answered after the connection had been asked to stop; the peer "+
+				"received %s", describe(got))
+			break
+		}
+	}
+	assertGracefulGoAway(t, got)
+}
+
+// TestConnShutdownIsIdempotent is the accept layer's actual usage: it shuts every
+// live connection down at once, and cannot know which of them finished by itself a
+// microsecond earlier.
+//
+// Three ways to get it wrong, all of them here: a second close of the quit channel
+// panics, a deadline set on a socket that Serve has already closed fails, and eight
+// callers racing on the deadline is a data race under -race even though each write
+// on its own is fine. Exactly one GOAWAY, asserted by goAwayIn, is the other half —
+// a GOAWAY per caller would be frames sent after announcing there would be none.
+func TestConnShutdownIsIdempotent(t *testing.T) {
+	to := testTimeouts()
+	to.Idle = longTimeout
+
+	ts := newTestSocket(&testTarget{}).script(clientHello(t))
+	c := newConn(ts, rejectingHandler(t), to)
+	done := serveInBackground(c)
+	awaitParked(t, ts)
+
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			c.Shutdown()
+		}()
+	}
+	wg.Wait()
+
+	if err := awaitServe(t, done); err != nil {
+		t.Fatalf("Serve returned %v after eight concurrent Shutdowns, want nil", err)
+	}
+
+	// And twice more with the socket already closed, which is the call the accept
+	// layer makes for a connection that ended on its own while it was looking.
+	c.Shutdown()
+	c.Shutdown()
+
+	assertGracefulGoAway(t, peerSaw(t, ts))
+}
+
 // TestNewConnRequiresAStreamHandler fails at construction rather than on the first
 // HEADERS frame of the first request. The alternative is the same bug reported
 // later, from a goroutine further away, with a peer's traffic mixed into the stack
@@ -1591,5 +1772,15 @@ func TestServeLeaksNoGoroutines(t *testing.T) {
 	for _, build := range endings {
 		_ = serve(t, build(), rejectingHandler(t), testTimeouts())
 	}
+
+	// The shutdown ending, which is the one no script can produce: it takes a call
+	// from another goroutine while the connection is running. It is also the ending
+	// most likely to leak, because it is the only one where the reader goroutine
+	// stops for a reason the socket never reported.
+	c := newConn(newTestSocket(&testTarget{}).script(clientHello(t)), rejectingHandler(t), testTimeouts())
+	done := serveInBackground(c)
+	c.Shutdown()
+	_ = awaitServe(t, done)
+
 	assertNoGoroutineLeak(t, baseline)
 }

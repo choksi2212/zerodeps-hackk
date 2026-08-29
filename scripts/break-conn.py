@@ -10,6 +10,12 @@ silent-peer test and still lets a peer hold the connection open for ever, and
 dropping the writer's queue on a clean close loses a mandatory acknowledgement
 only when the timing goes one way. Neither is visible in a green suite.
 
+A third joined them with graceful shutdown: setReadDeadline's check of the quit
+flag covers a window a few instructions wide, between the read loop checking that
+flag and the loop arming the deadline for its next read. Removing it leaves a
+server that answers a shutdown when the connection next hears from its peer, which
+on an idle connection is a minute later and on an abandoned one is never.
+
 Run from the repository root. Restores the file on the way out, including on error.
 """
 
@@ -177,10 +183,8 @@ BREAKS = [
     # --- deadlines -----------------------------------------------------------
     (
         "setReadDeadline: the socket is never told, so a silent peer is never timed out",
-        """	c.deadlineKind = kind
-	return c.sock.SetReadDeadline(deadline)""",
-        """	c.deadlineKind = kind
-	_ = deadline
+        """	return c.sock.SetReadDeadline(deadline)""",
+        """	_ = deadline
 	return nil""",
         ["TestServeSetsAReadDeadlineBeforeEveryRead"],
     ),
@@ -336,6 +340,72 @@ BREAKS = [
         """	return c.handler.HandleFrame(f)""",
         """	return nil""",
         ["TestServeHandsStreamFramesToTheHandler", "TestServeResetsOneStreamAndKeepsTheConnection"],
+    ),
+
+    # --- graceful shutdown ---------------------------------------------------
+    (
+        "Serve: a shutdown is reported as a failure and the peer is never told why",
+        """		sendErr = c.farewell(h2.NoError, "server shutting down")
+		err = nil""",
+        "",
+        [
+            "TestConnShutdownInterruptsAParkedRead",
+            "TestConnShutdownBeforeTheFirstReadEndsAtOnce",
+            "TestConnShutdownDoesNotServeAnotherFrame",
+            "TestConnShutdownIsIdempotent",
+        ],
+    ),
+    (
+        "Serve: the shutdown GOAWAY blames the peer for a connection this server ended",
+        """		sendErr = c.farewell(h2.NoError, "server shutting down")""",
+        """		sendErr = c.farewell(h2.InternalError, "server shutting down")""",
+        ["TestConnShutdownInterruptsAParkedRead", "TestConnShutdownDoesNotServeAnotherFrame"],
+    ),
+    (
+        "Shutdown: the parked read is never interrupted, so a shutdown waits out the idle timeout",
+        """	if err := c.sock.SetReadDeadline(time.Now()); err != nil {
+		// Nothing to do and nothing to report: a socket rejects a deadline once it
+		// is closed, which is the state this call is asking for. The read it would
+		// have interrupted has already finished.
+		return
+	}
+""",
+        "",
+        ["TestConnShutdownInterruptsAParkedRead", "TestConnShutdownIsIdempotent"],
+    ),
+    (
+        "setReadDeadline: the loop pushes the deadline back out over Shutdown's interrupt",
+        """	if c.stopping() {
+		// Shutdown has already brought the deadline forward and this call would push
+		// it back out. Deciding inside the lock is what makes the two orderings
+		// equivalent: either Shutdown's deadline lands after ours and wins, or it
+		// landed before and this branch repeats it.
+		deadline = time.Now()
+	}
+""",
+        "",
+        ["TestConnShutdownBeforeTheFirstReadEndsAtOnce"],
+    ),
+    (
+        "readError: our own interrupt is reported to the peer as its fault",
+        """		if c.stopping() {
+			return errShuttingDown
+		}
+		switch c.deadlineKind {""",
+        """		switch c.deadlineKind {""",
+        [
+            "TestConnShutdownInterruptsAParkedRead",
+            "TestConnShutdownBeforeTheFirstReadEndsAtOnce",
+        ],
+    ),
+    (
+        "run: a shutdown still serves whatever the peer had already buffered",
+        """		if c.stopping() {
+			return errShuttingDown
+		}
+		if err := c.setReadDeadline(deadlineIdle); err != nil {""",
+        """		if err := c.setReadDeadline(deadlineIdle); err != nil {""",
+        ["TestConnShutdownDoesNotServeAnotherFrame"],
     ),
 ]
 
