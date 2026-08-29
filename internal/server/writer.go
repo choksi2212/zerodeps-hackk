@@ -60,8 +60,11 @@ const coalesceHighWater = frame.DefaultMaxFrameSize
 // frame after that point is read at the wrong offset. Everything else that wants
 // to send a frame calls Enqueue.
 //
-// Enqueue is safe for concurrent use. Nothing else here is: Shutdown, Close and
-// Wait are for the connection that owns the writer.
+// Every method here is safe for concurrent use, which is not incidental: Enqueue
+// is called from every stream goroutine at once, SetMaxFrameSize from the reader
+// goroutine, and Shutdown and Close from whichever goroutine noticed the problem
+// first — a read error and a shutdown request can arrive together. The stop
+// signals are idempotent for the same reason.
 type frameWriter struct {
 	fw      *frame.Writer
 	target  writeTarget
@@ -109,12 +112,12 @@ func startFrameWriter(target writeTarget, timeout time.Duration) *frameWriter {
 
 // SetMaxFrameSize applies the peer's SETTINGS_MAX_FRAME_SIZE.
 //
-// It must be called from the connection's reader goroutine before the SETTINGS
-// frame is acknowledged and while nothing is queued, which is the only moment at
-// which it is not a data race: the value is read by the writer goroutine on every
-// frame. That is a narrow contract, and it is the right one — the alternative is a
-// mutex on the write path to serialise against a value that changes once or twice
-// in a connection's life.
+// Safe to call while the writer goroutine is writing, and it has to be: a peer
+// may send SETTINGS at any point in a connection's life, that frame is read by
+// the connection's reader goroutine, and the writer is as likely as not to be
+// mid-burst when it arrives. frame.Writer holds the value atomically for exactly
+// this call — see its SetMaxFrameSize for why the protocol makes ordering with
+// the surrounding frames unnecessary.
 func (w *frameWriter) SetMaxFrameSize(size uint32) {
 	w.fw.SetMaxFrameSize(size)
 }

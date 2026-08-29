@@ -2,6 +2,7 @@ package frame
 
 import (
 	"io"
+	"sync/atomic"
 
 	"zerodeps/zdh/internal/h2"
 )
@@ -38,11 +39,17 @@ type WriterConfig struct {
 // one per frame. Coalescing into a single buffer costs a copy of each payload;
 // that copy is cheaper than the syscall it saves, and much cheaper than the
 // several syscalls a scatter/gather write would need to arrange.
+//
+// One field is the exception to the single-goroutine rule, and it is atomic
+// rather than locked because of what the protocol says about it rather than to
+// save a mutex. See SetMaxFrameSize.
 type Writer struct {
 	w   io.Writer
 	buf []byte
 
-	maxFrameSize uint32
+	// maxFrameSize is set by the connection's reader goroutine when the peer's
+	// SETTINGS arrive, and read by the writer goroutine on every frame.
+	maxFrameSize atomic.Uint32
 
 	// err latches the first write failure. See Flush.
 	err error
@@ -63,6 +70,20 @@ func NewWriter(w io.Writer, cfg WriterConfig) *Writer {
 
 // SetMaxFrameSize records the peer's SETTINGS_MAX_FRAME_SIZE.
 //
+// Safe to call from another goroutine while frames are being written, which is
+// what the connection layer needs: a peer may send SETTINGS at any point in a
+// connection's life, that frame arrives on the reader goroutine, and the writer
+// goroutine is very likely mid-burst when it does.
+//
+// The value is atomic and nothing more — no lock, no ordering with the frames
+// around it — and that is a claim about the protocol, not a shortcut. §6.5.3
+// requires a peer to keep honouring the value it previously advertised until it
+// receives our acknowledgement, so a frame sent under either the old bound or
+// the new one is one the peer has undertaken to accept. What must not happen is a
+// torn or invented read of the field, which is exactly what atomic prevents. A
+// mutex would buy an ordering guarantee the protocol does not ask for, on the
+// hottest path in the server.
+//
 // The value is clamped into the range §6.5.2 permits rather than trusted. A
 // setting below 2^14 or above 2^24-1 is invalid and parseSettings rejects it, so
 // a value outside that range here means the setting reached us by some route that
@@ -77,11 +98,11 @@ func (w *Writer) SetMaxFrameSize(n uint32) {
 	if n > MaxLength {
 		n = MaxLength
 	}
-	w.maxFrameSize = n
+	w.maxFrameSize.Store(n)
 }
 
 // MaxFrameSize reports the largest payload this Writer will send.
-func (w *Writer) MaxFrameSize() uint32 { return w.maxFrameSize }
+func (w *Writer) MaxFrameSize() uint32 { return w.maxFrameSize.Load() }
 
 // Buffered reports how many octets are queued and not yet written. The
 // connection layer uses it to decide when a burst is worth a syscall.
@@ -100,12 +121,18 @@ func (w *Writer) Queue(f Frame) error {
 		return w.err
 	}
 
-	if n := f.PayloadLen(); n > w.maxFrameSize {
+	// Loaded once, into a local, so that the comparison and the message it
+	// produces cannot quote different numbers. The field is set concurrently by
+	// the reader goroutine; two loads could straddle a change and report a limit
+	// the frame was never measured against, which is the kind of diagnostic that
+	// costs an hour.
+	max := w.maxFrameSize.Load()
+	if n := f.PayloadLen(); n > max {
 		return connErrf(h2.InternalError,
 			"refusing to send a %s frame with %d payload octets, above the peer's "+
 				"SETTINGS_MAX_FRAME_SIZE of %d (RFC 9113 §4.2): the layer that built it "+
 				"should have split it",
-			f.Type(), n, w.maxFrameSize)
+			f.Type(), n, max)
 	}
 	// The header's stream identifier is 31 bits. AppendTo truncates rather than
 	// reporting, because a nine-octet serialiser has no useful way to fail — so

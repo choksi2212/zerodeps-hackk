@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"reflect"
+	"sync"
 	"testing"
 
 	"zerodeps/zdh/internal/h2"
@@ -199,6 +200,68 @@ func TestWriterHonoursThePeersMaxFrameSize(t *testing.T) {
 	}
 	tooBig := DataFrame{StreamID: 1, Data: bytes.Repeat([]byte{0xaa}, raised+1)}
 	wantConnErr(t, w.Queue(tooBig), h2.InternalError)
+}
+
+// TestWriterMaxFrameSizeIsSettableWhileWriting is the concurrency claim
+// SetMaxFrameSize makes, and it exists because the alternative reading of that
+// claim is a data race the race detector would find in production rather than
+// here.
+//
+// A peer may send SETTINGS at any point in a connection's life. That frame is
+// read by the connection's reader goroutine, and the writer goroutine is as
+// likely as not to be mid-burst when it arrives, so the bound is written by one
+// goroutine while another reads it on every frame. What the protocol does not
+// require is any ordering between the change and the frames around it: §6.5.3
+// obliges the peer to keep honouring its previous value until it sees our
+// acknowledgement, so a frame sent under either bound is one it has undertaken to
+// accept. Atomicity is therefore the whole requirement, and this test is only
+// meaningful under -race, which the gate runs.
+//
+// The assertion at the end is deliberately weak — one of the two values, not a
+// particular one. Asserting which would be asserting an ordering the protocol
+// does not give and the test cannot control.
+func TestWriterMaxFrameSizeIsSettableWhileWriting(t *testing.T) {
+	const raised = 1 << 15
+	w := NewWriter(&recordingWriter{}, WriterConfig{})
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 500; i++ {
+			// Alternating rather than raising once, so that a read straddling a
+			// change is likely rather than a one-in-five-hundred chance.
+			if i%2 == 0 {
+				w.SetMaxFrameSize(raised)
+			} else {
+				w.SetMaxFrameSize(DefaultMaxFrameSize)
+			}
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		f := DataFrame{StreamID: 1, Data: bytes.Repeat([]byte{0xaa}, 64)}
+		for i := 0; i < 500; i++ {
+			// A frame well under both bounds, so it is never refused however the
+			// two goroutines interleave: what is under test is the read of the
+			// field, not the decision it feeds.
+			if err := w.Queue(f); err != nil {
+				t.Errorf("Queue while the bound was changing: %v", err)
+				return
+			}
+			if err := w.Flush(); err != nil {
+				t.Errorf("Flush while the bound was changing: %v", err)
+				return
+			}
+			_ = w.MaxFrameSize()
+		}
+	}()
+	wg.Wait()
+
+	if got := w.MaxFrameSize(); got != raised && got != DefaultMaxFrameSize {
+		t.Errorf("MaxFrameSize = %d, want one of the two values that were set (%d or %d)",
+			got, raised, uint32(DefaultMaxFrameSize))
+	}
 }
 
 // TestWriterMaxFrameSizeIsClamped covers the values §6.5.2 makes impossible. They
