@@ -70,9 +70,10 @@ is the same as producing none.
 
 # What counts as verbatim
 
-The RFC is a hard-wrapped 72-column text file and a Go comment is not, so a literal
-comparison is not available. Four differences are tolerated, each because it is forced
-rather than because it is convenient:
+The RFC is a hard-wrapped 72-column text file that sets its notes off with a leading
+"|", and a Go comment is neither, so a literal comparison is not available. The layout
+is undone on the RFC side first — see unwrap — and then four differences are tolerated,
+each because it is forced rather than because it is convenient:
 
   * Whitespace, collapsed on both sides. This is the wrap.
   * Quotation marks, removed on both sides. The RFC writes the stream states as "idle"
@@ -203,13 +204,23 @@ def sections(raw):
 
 
 def unwrap(text):
-	"""Undo the RFC's hard wrap where it split a hyphenated word.
+	"""Undo the RFC's own typography, where it is layout rather than words.
 
-	"half-closed" is spelled across two lines as "half-" and "closed" in §5.1.2, and a
-	comparison that collapsed the newline to a space would look for "half- closed" and
-	not find it. Applied to the RFC only: a Go comment is wrapped by gofmt, which never
-	breaks a word.
+	Two things, both applied to the RFC only: a Go comment is wrapped by gofmt, which
+	never breaks a word and has no asides.
+
+	The hard wrap, where it split a hyphenated word. "half-closed" is spelled across two
+	lines as "half-" and "closed" in §5.1.2, and a comparison that collapsed the newline
+	to a space would look for "half- closed" and not find it.
+
+	The aside marker. RFC 9113 sets its notes off with a leading "|", one per line, and
+	§6.1's note is where this server's empty END_STREAM frame comes from. Left in place
+	those bars land in the middle of the sentence — "by sending a STREAM frame with a |
+	zero-length Data field" — so every quotation from a note was unmatchable, and the one
+	in internal/response/writer.go is what discovered it. Stripped before the hyphen rule,
+	because a word can be split across two lines of a note as easily as anywhere else.
 	"""
+	text = re.sub(r"(?m)^\s*\|\s?", " ", text)
 	return re.sub(r"-\n\s+", "-", text)
 
 
