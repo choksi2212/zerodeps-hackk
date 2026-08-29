@@ -360,6 +360,34 @@ func awaitPeers(t *testing.T, l *testListener, n int) {
 	})
 }
 
+// connCount is how many connections the server has registered. Test-only, and it
+// counts the set Shutdown walks rather than a tally of its own, which is the only
+// version of this that cannot disagree with the thing under test.
+func (s *Server) connCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.conns)
+}
+
+// awaitTrackedConns waits until the server has registered n connections.
+//
+// A third event, and the distance between it and awaitPeers is where a test went
+// flaky. The listener records a connection inside Accept; the server registers it a
+// moment later, in track, and serveConn's own comment says what happens in between —
+// a connection accepted after the server stopped "is in nobody's set" and "nothing
+// waits for it". A Shutdown landing in that window therefore finds an empty set,
+// waits for nothing and reports a clean stop, which is correct behaviour and the
+// wrong precondition for a test about a connection that cannot stop cleanly.
+//
+// Every other test here crosses the window by exchanging a frame with its peer, which
+// takes a peer that reads. A stalled connection has none, so it waits for the set.
+func awaitTrackedConns(t *testing.T, s *Server, n int) {
+	t.Helper()
+	poll(t, gateWait, func() bool { return s.connCount() >= n }, func() string {
+		return fmt.Sprintf("the server has registered %d connections, want at least %d", s.connCount(), n)
+	})
+}
+
 // awaitPeerFrames waits until the peer has received n whole frames and returns them.
 func awaitPeerFrames(t *testing.T, p *peerConn, n int) []frame.Frame {
 	t.Helper()
@@ -973,7 +1001,14 @@ func TestServerShutdownForcesAStalledConnectionPastTheGrace(t *testing.T) {
 	l := newTestListener(nil).stalled()
 	s, _ := testServer(t, Config{Timeouts: to}, nil)
 	done := serverInBackground(s, l)
-	awaitPeers(t, l, 1)
+
+	// The registration and not the accept. Once the server is tracking this
+	// connection it cannot finish inside the grace period: its writer goroutine is
+	// started by newConn, the read loop's first act is to enqueue the server preface,
+	// and the teardown waits for a writer that is stuck on an unbuffered pipe until
+	// its hour-long write deadline expires. Before the registration none of that is
+	// true, and the shutdown has nothing to wait for.
+	awaitTrackedConns(t, s, 1)
 
 	err := s.Shutdown()
 	if !errors.Is(err, ErrShutdownGraceExpired) {
