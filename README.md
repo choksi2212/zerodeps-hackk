@@ -19,6 +19,7 @@ This section is kept honest as the build proceeds; nothing is claimed here befor
 | Streams and flow control (§5) | not started |
 | HPACK (RFC 7541) | in progress, separate author |
 | Request semantics (§8), static file handler | not started |
+| Self-signed certificate generation (`internal/certgen`) | working — 46 tests, and 39 guards each observed failing |
 | TLS + ALPN, browser demo | not started |
 | h2spec conformance score | not yet run |
 
@@ -67,13 +68,18 @@ So every security bound, deadline and protocol rule in this server has a *break*
 python scripts/break-conn.py     # 43 breaks, all 43 caught
 python scripts/break-server.py   # 34 breaks, all 34 caught
 python scripts/break-writer.py   # 13 breaks, all 13 caught
+python scripts/break-certgen.py  # 39 breaks, all 39 caught
 ```
 
 Each campaign edits one file in place, runs each expected test in a process of its own, and restores the file on the way out — including on error, so a campaign that left the tree modified could not be mistaken for one that found a bug. A break that fires nothing is reported as a hole, and a hole is either a missing test or a guard whose justification was wrong. Both are worth knowing before a judge finds them.
 
-Three of the ninety are the reason the campaigns are run rather than read. Recomputing the SETTINGS-acknowledgement deadline on each read passes the silent-peer test and still lets a peer hold a connection open for ever. Taking the connection slot after `Accept` instead of before it leaves a server that honours its bound and still spends a descriptor and a handshake per refused peer. Dropping the backoff reset after a successful accept leaves a server that recovers from a rough patch on paper and carries a one-second pause before every connection for the rest of the week. None of the three is visible in a green suite.
+Three of the hundred and twenty-nine are the reason the campaigns are run rather than read. Recomputing the SETTINGS-acknowledgement deadline on each read passes the silent-peer test and still lets a peer hold a connection open for ever. Taking the connection slot after `Accept` instead of before it leaves a server that honours its bound and still spends a descriptor and a handshake per refused peer. Dropping the backoff reset after a successful accept leaves a server that recovers from a rough patch on paper and carries a one-second pause before every connection for the rest of the week. None of the three is visible in a green suite.
 
-Four breaks are detected as a panic rather than as a named failure, and the harness reports those separately rather than rounding them up: a missing `sync.Once` announces itself as `close of closed channel`, and there is nothing better to expect. Two guards in `internal/server/server.go` have no break at all, because both cover interleavings a test cannot schedule; `scripts/break-server.py` names them and says why.
+Two of `break-certgen.py`'s findings were holes on the first run, and both were in the tests rather than in the code — which is the outcome the campaigns exist to produce. Dropping `serialNumber`'s error return changed nothing observable through the public API, because a dead entropy source fails the key generation too and both failures wrap the same underlying error; the guard is now tested by calling the unexported function directly. Dropping `cert.Leaf = leaf` also changed nothing, because `crypto/tls` has set `Leaf` itself in `X509KeyPair` since Go 1.23 — the comment in the code claiming otherwise was simply wrong. It sets it only while the `x509keypairleaf` GODEBUG is on, and that is off for any module declaring `go 1.22` or older, so the test now switches it off and asserts against this package instead of against the standard library.
+
+Four of `break-certgen.py`'s breaks make a related point about what a passing handshake proves. Removing `ExtKeyUsage`, `IsCA`, `KeyUsageCertSign` or `BasicConstraintsValid` leaves every TLS handshake test in that package passing, because `crypto/x509` short-circuits verification when the leaf is itself in the client's root pool — `if opts.Roots.contains(c) { candidateChains = [][]*Certificate{{c}} }` — and a chain of one is never handed to `CheckSignatureFrom`. Those fields matter to a trust store verifying the certificate as the root it was imported as, so they are held by explicit field assertions and by a self-signature check, and by nothing else.
+
+Four breaks are detected as a panic rather than as a named failure, and the harness reports those separately rather than rounding them up: a missing `sync.Once` announces itself as `close of closed channel`, and there is nothing better to expect. Two guards in `internal/server/server.go` have no break at all, because both cover interleavings a test cannot schedule; `scripts/break-server.py` names them and says why. Two in `internal/certgen/certgen.go` have none either — the private key's `0o600` mode, whose test skips on Windows where the ACL rather than the mode governs, and a `Close` that fails after a successful write, which needs a fault injector this project has no business growing. `scripts/break-certgen.py` names both.
 
 ## Build
 
