@@ -1,0 +1,135 @@
+/* zdh demo styling. No framework, no reset, no font from a CDN — a
+   zero-dependency entry whose demo page pulls in three megabytes of somebody
+   else's CSS would be a poor joke. */
+
+:root {
+  --bg: #10131a;
+  --card: #171b24;
+  --line: #262c39;
+  --ink: #e6e9ef;
+  --dim: #98a2b8;
+  --accent: #7cc7ff;
+  --good: #6ee7a8;
+  --bad: #ff9f9f;
+  --mono: ui-monospace, "Cascadia Mono", "SF Mono", Consolas, monospace;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0 auto;
+  padding: 2.5rem 1.25rem 4rem;
+  max-width: 52rem;
+  background: var(--bg);
+  color: var(--ink);
+  font: 16px/1.6 system-ui, -apple-system, Segoe UI, sans-serif;
+}
+
+header {
+  display: flex;
+  gap: 1rem;
+  align-items: center;
+  margin-bottom: 2rem;
+}
+
+h1 {
+  margin: 0;
+  font-size: 2.25rem;
+  letter-spacing: -0.02em;
+  font-family: var(--mono);
+}
+
+h2 {
+  margin: 0 0 0.5rem;
+  font-size: 1.05rem;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+  color: var(--accent);
+}
+
+p { margin: 0 0 0.75rem; }
+p:last-child { margin-bottom: 0; }
+
+.sub { color: var(--dim); font-size: 0.9rem; }
+
+.card {
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 1.25rem 1.5rem;
+  margin-bottom: 1.25rem;
+}
+
+code {
+  font-family: var(--mono);
+  font-size: 0.9em;
+  background: #0c0f15;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 0.05em 0.35em;
+}
+
+a { color: var(--accent); }
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-family: var(--mono);
+  font-size: 0.85rem;
+  margin-top: 0.75rem;
+}
+
+th, td {
+  text-align: left;
+  padding: 0.35rem 0.5rem;
+  border-bottom: 1px solid var(--line);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+th { color: var(--dim); font-weight: 500; }
+td.n, th.n { text-align: right; }
+
+.tag {
+  display: inline-block;
+  padding: 0 0.4em;
+  border-radius: 4px;
+  font-weight: 600;
+}
+.tag.h2 { color: var(--good); background: #12291f; }
+.tag.other { color: var(--bad); background: #2a1618; }
+
+button {
+  font: inherit;
+  font-family: var(--mono);
+  color: #0b0e13;
+  background: var(--accent);
+  border: 0;
+  border-radius: 6px;
+  padding: 0.5rem 1rem;
+  cursor: pointer;
+}
+button:hover { filter: brightness(1.1); }
+button:disabled { opacity: 0.5; cursor: progress; }
+
+button.ghost {
+  color: var(--accent);
+  background: transparent;
+  border: 1px solid var(--line);
+}
+
+.result { margin-top: 1rem; border-top: 1px solid var(--line); padding-top: 1rem; }
+
+dl {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 0.25rem 1.25rem;
+  margin: 0 0 0.75rem;
+  font-family: var(--mono);
+  font-size: 0.9rem;
+}
+dt { color: var(--dim); }
+dd { margin: 0; }
+
+footer { color: var(--dim); font-size: 0.85rem; margin-top: 2rem; }

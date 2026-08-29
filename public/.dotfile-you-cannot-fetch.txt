@@ -1,0 +1,9 @@
+This file is in the served directory and cannot be fetched from it.
+
+A name whose first octet is "." is refused by internal/static/path.go, before the
+name reaches a syscall, on every platform. The rule is there because the files a
+static server discloses by accident are almost always dotfiles: .env, .git/config,
+.htaccess, .ssh/id_rsa. A build that copies a directory into a web root copies
+those too, and a server that serves whatever is in front of it publishes them.
+
+The demo page fetches this file and shows you the 404.
