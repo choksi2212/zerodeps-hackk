@@ -138,7 +138,7 @@ func (c *fakeTLSConn) handshakes() int {
 // testHandshaker is a server with nothing but the fields handshake reads, which is
 // how these tests avoid standing up an accept loop to negotiate one connection.
 func testHandshaker(to limits.Timeouts) *Server {
-	return New(func() streamHandler { return handlerFunc(func(frame.Frame) error { return nil }) },
+	return New(func(FrameEnqueuer) StreamHandler { return handlerFunc(func(frame.Frame) error { return nil }) },
 		Config{Timeouts: to})
 }
 
@@ -629,7 +629,7 @@ func TestDiscardClosesTheSocketWithoutWritingToIt(t *testing.T) {
 
 	tt := &testTarget{}
 	ts := newTestSocket(tt)
-	c := newConn(ts, rejectingHandler(t), testTimeouts())
+	c := newConn(ts, always(rejectingHandler(t)), testTimeouts())
 
 	if err := c.discard(); err != nil {
 		t.Errorf("discard returned %v, want nil for a socket and writer that both stopped cleanly", err)
@@ -658,7 +658,7 @@ func TestDiscardReportsBothHalvesOfTheTeardown(t *testing.T) {
 
 	tt := newGatedTarget()
 	ts := &closeFailsSocket{testSocket: newTestSocket(tt), err: closeErr}
-	c := newConn(ts, rejectingHandler(t), testTimeouts())
+	c := newConn(ts, always(rejectingHandler(t)), testTimeouts())
 
 	// The writer has to have failed before discard runs, and it has to have failed
 	// deterministically. Parking it inside a Write and then releasing it with an error

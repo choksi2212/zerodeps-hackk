@@ -28,7 +28,22 @@ type connSocket interface {
 	Close() error
 }
 
-// streamHandler receives the frames that belong to a stream rather than to the
+// FrameEnqueuer is the connection's write half as a stream sees it: one method,
+// which hands a frame to the writer goroutine and returns.
+//
+// It is deliberately narrower than *frameWriter, which also flushes, shuts down and
+// waits. Those belong to the connection's own lifecycle — a stream goroutine
+// calling Shutdown mid-request would take every other stream's reply down with it —
+// and Enqueue is in any case the only method on the writer that is safe to call
+// from every stream goroutine at once.
+type FrameEnqueuer interface {
+	// Enqueue hands f to the writer goroutine. It returns when the frame is queued,
+	// not when it reaches the wire, and it fails only once the write half is
+	// finished: see frameWriter.Enqueue.
+	Enqueue(f frame.Frame) error
+}
+
+// StreamHandler receives the frames that belong to a stream rather than to the
 // connection.
 //
 // The split is the whole design of this file. SETTINGS, PING, GOAWAY and a
@@ -41,7 +56,13 @@ type connSocket interface {
 // Implementations are called from the connection's reader goroutine, in frame
 // arrival order, and must not block indefinitely: this goroutine is also the one
 // answering the peer's PINGs and noticing its GOAWAY.
-type streamHandler interface {
+//
+// Exported, unlike most of this package, because the implementation is somebody
+// else's: it lives in internal/stream and is supplied by whoever builds the server.
+// A factory returning an unexported interface is a factory its caller cannot write
+// down, so the interface has to be nameable from outside this package for the
+// server to be constructible from outside it.
+type StreamHandler interface {
 	HandleFrame(f frame.Frame) error
 
 	// ConnWindowUpdate applies a stream-0 WINDOW_UPDATE (§6.9).
@@ -111,7 +132,7 @@ type conn struct {
 	sock    connSocket
 	r       *frame.Reader
 	w       *frameWriter
-	handler streamHandler
+	handler StreamHandler
 
 	timeouts limits.Timeouts
 
@@ -147,22 +168,39 @@ type conn struct {
 	deadlineMu sync.Mutex
 }
 
-// newConn returns a connection over sock, with h receiving the stream-bearing
-// frames. Unset timeouts take their defaults.
+// newConn returns a connection over sock, with the stream-bearing frames going to a
+// handler from newHandler. Unset timeouts take their defaults.
 //
-// A nil handler panics, deliberately and at construction. The alternative is a
-// nil method call on the first HEADERS frame of the first request, which is the
-// same bug reported later, from a goroutine further away, with a peer's traffic
-// mixed into the stack trace.
-func newConn(sock connSocket, h streamHandler, t limits.Timeouts) *conn {
-	if h == nil {
-		panic("server: newConn requires a stream handler")
+// The handler is built here rather than handed in because it needs somewhere to
+// write, and that somewhere does not exist until this function makes it. Hence a
+// factory: a handler cannot be constructed before the writer it answers through, the
+// writer cannot outlive the socket it owns, and neither can be shared with a second
+// connection.
+//
+// A nil factory panics, and so does one that returns no handler — deliberately, and
+// at construction. The alternative is a nil method call on the first HEADERS frame of
+// the first request, which is the same bug reported later, from a goroutine further
+// away, with a peer's traffic mixed into the stack trace.
+func newConn(sock connSocket, newHandler func(FrameEnqueuer) StreamHandler, t limits.Timeouts) *conn {
+	if newHandler == nil {
+		panic("server: newConn requires a stream handler factory")
 	}
 	t = t.WithDefaults()
+	w := startFrameWriter(sock, t.Write)
+	h := newHandler(w)
+	if h == nil {
+		// The writer's goroutine is already running by now, and this panic is a
+		// programming error that a test is entitled to recover from. Stopping it
+		// first is what keeps the leak check answering a question about the
+		// connections that were built rather than about the one that was refused.
+		w.Close()
+		_ = w.Wait()
+		panic("server: the stream handler factory returned no handler")
+	}
 	return &conn{
 		sock:     sock,
 		r:        frame.NewReader(sock, readerConfig()),
-		w:        startFrameWriter(sock, t.Write),
+		w:        w,
 		handler:  h,
 		timeouts: t,
 		quit:     make(chan struct{}),
@@ -648,7 +686,7 @@ func (c *conn) applySetting(s frame.Setting) error {
 		// obeyed or disobeyed until this connection sends a response.
 
 	case frame.SettingInitialWindowSize:
-		// The awkward one, and the reason streamHandler has a method for it.
+		// The awkward one, and the reason StreamHandler has a method for it.
 		// §6.9.2 requires the change to be applied to every open stream's window
 		// as a delta rather than only to streams opened afterwards, and a change
 		// that pushes a window negative is legal and has to be carried. Neither is
@@ -698,7 +736,7 @@ func (c *conn) handlePing(f frame.PingFrame) error {
 //
 // Absorbed at this level rather than routed through HandleFrame because a
 // stream-0 frame has no stream to hand it to, and the alternative is the stream
-// table growing a special case for stream zero. See streamHandler.
+// table growing a special case for stream zero. See StreamHandler.
 func (c *conn) handleConnectionWindowUpdate(f frame.WindowUpdateFrame) error {
 	return c.handler.ConnWindowUpdate(f.Increment)
 }

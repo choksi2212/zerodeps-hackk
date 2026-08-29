@@ -187,7 +187,7 @@ func (ts *testSocket) pendingLen() int {
 	return len(ts.pending)
 }
 
-// handlerFunc adapts a function to streamHandler.
+// handlerFunc adapts a function to StreamHandler.
 //
 // The two connection-level hooks answer nil. A double built to observe frame
 // dispatch has nothing to say about flow control, and answering them with a
@@ -274,12 +274,23 @@ func (h *recordingHandler) seen() []frame.Frame {
 // Errorf and not Fatalf, because this runs on the connection's reader goroutine
 // and Fatalf from a goroutine other than the test's own stops that goroutine
 // instead of the test.
-func rejectingHandler(t *testing.T) streamHandler {
+func rejectingHandler(t *testing.T) StreamHandler {
 	return handlerFunc(func(f frame.Frame) error {
 		t.Errorf("a %s frame on stream %d reached the stream handler, but it belongs to the connection",
 			f.Type(), f.Stream())
 		return nil
 	})
+}
+
+// always is the factory for a test that has one connection and already holds the
+// handler it wants to watch.
+//
+// It ignores the write half and hands the same handler out every time, which is
+// exactly what a server must not do — see Server.newHandler — and is harmless here
+// because each of these tests builds one connection. A test about the factory being
+// a factory writes its own: TestServerBuildsAHandlerPerConnection.
+func always(h StreamHandler) func(FrameEnqueuer) StreamHandler {
+	return func(FrameEnqueuer) StreamHandler { return h }
 }
 
 // testTimeouts is the timeouts for a test that is not testing a timeout.
@@ -354,9 +365,16 @@ func awaitServe(t *testing.T, done chan error) error {
 // serve runs a connection to completion over ts and returns what Serve returned.
 // It is the shape of almost every test here: load a script, run it out, read back
 // what the peer received.
-func serve(t *testing.T, ts *testSocket, h streamHandler, to limits.Timeouts) error {
+func serve(t *testing.T, ts *testSocket, h StreamHandler, to limits.Timeouts) error {
 	t.Helper()
-	return awaitServe(t, serveInBackground(newConn(ts, h, to)))
+	return serveWith(t, ts, always(h), to)
+}
+
+// serveWith is serve for a test that cares which write half its handler was handed,
+// and so has to build the handler inside the factory rather than before it.
+func serveWith(t *testing.T, ts *testSocket, newHandler func(FrameEnqueuer) StreamHandler, to limits.Timeouts) error {
+	t.Helper()
+	return awaitServe(t, serveInBackground(newConn(ts, newHandler, to)))
 }
 
 // peerSaw decodes everything the connection wrote.
@@ -748,7 +766,7 @@ func TestServeAppliesAndAcknowledgesThePeersSettings(t *testing.T) {
 	ts := newTestSocket(&testTarget{}).
 		script(clientHello(t, frame.Setting{ID: frame.SettingMaxFrameSize, Value: raised})).
 		atEOF()
-	c := newConn(ts, rejectingHandler(t), testTimeouts())
+	c := newConn(ts, always(rejectingHandler(t)), testTimeouts())
 
 	if err := awaitServe(t, serveInBackground(c)); err != nil {
 		t.Fatalf("Serve: %v", err)
@@ -791,7 +809,7 @@ func TestServeAppliesSettingsBeforeAcknowledging(t *testing.T) {
 	to.Idle, to.Write = longTimeout, longTimeout
 
 	ts := newTestSocket(newGatedTarget()).script([]byte(frame.ClientPreface))
-	c := newConn(ts, rejectingHandler(t), to)
+	c := newConn(ts, always(rejectingHandler(t)), to)
 	done := serveInBackground(c)
 
 	// Awaited before the queue is filled, not after: the writer drains the queue
@@ -846,7 +864,7 @@ func TestServeAppliesSettingsBeforeAcknowledging(t *testing.T) {
 // stalls the connection. Ignoring a parameter and refusing it are different things.
 //
 // INITIAL_WINDOW_SIZE used to belong here and no longer does: it reaches the stream
-// layer through streamHandler.SetInitialWindowSize, which
+// layer through StreamHandler.SetInitialWindowSize, which
 // TestServeAppliesInitialWindowSizeToTheStreamLayer covers. A parameter left in this
 // list after it grew an implementation would make this test claim it is ignored.
 func TestServeAcknowledgesTheSettingsItDoesNotActOnYet(t *testing.T) {
@@ -1083,7 +1101,7 @@ func TestRunReportsWhatThePeersGoAwaySaid(t *testing.T) {
 		})...)).
 		atEOF()
 
-	c := newConn(ts, rejectingHandler(t), testTimeouts())
+	c := newConn(ts, always(rejectingHandler(t)), testTimeouts())
 	defer stopWriter(t, c)
 
 	err := c.run()
@@ -1234,7 +1252,7 @@ func TestServeAppliesInitialWindowSizeToTheStreamLayer(t *testing.T) {
 		atEOF()
 
 	h := &recordingHandler{}
-	c := newConn(ts, h, testTimeouts())
+	c := newConn(ts, always(h), testTimeouts())
 	if err := awaitServe(t, serveInBackground(c)); err != nil {
 		t.Fatalf("Serve: %v", err)
 	}
@@ -1264,7 +1282,7 @@ func TestServeStopsOnASettingItCannotApply(t *testing.T) {
 		atEOF()
 
 	h := &recordingHandler{hookErr: h2.ConnErrorf(h2.FlowControlError, "a stream window would overflow")}
-	c := newConn(ts, h, testTimeouts())
+	c := newConn(ts, always(h), testTimeouts())
 	err := awaitServe(t, serveInBackground(c))
 	if ce := connErrorOf(t, err); ce.Code != h2.FlowControlError {
 		t.Errorf("Serve returned %s, want the FLOW_CONTROL_ERROR the stream layer reported", ce.Code)
@@ -1485,7 +1503,7 @@ func TestServeReportsASettingsTimeoutToAChattyPeer(t *testing.T) {
 	to.Idle, to.Write = longTimeout, longTimeout
 
 	ts := newTestSocket(&testTarget{}).script(clientHello(t))
-	done := serveInBackground(newConn(ts, rejectingHandler(t), to))
+	done := serveInBackground(newConn(ts, always(rejectingHandler(t)), to))
 
 	// Encoded here rather than in the goroutine below, because encodeFrames reports
 	// through t.Fatalf and that may only be called from the goroutine running the
@@ -1768,7 +1786,7 @@ func TestConnShutdownInterruptsAParkedRead(t *testing.T) {
 	to.Idle = longTimeout
 
 	ts := newTestSocket(&testTarget{}).script(clientHello(t))
-	c := newConn(ts, rejectingHandler(t), to)
+	c := newConn(ts, always(rejectingHandler(t)), to)
 	done := serveInBackground(c)
 	awaitParked(t, ts)
 
@@ -1799,7 +1817,7 @@ func TestConnShutdownBeforeTheFirstReadEndsAtOnce(t *testing.T) {
 	// cheapest attack there is and the state most of a server's connections are in
 	// when it is asked to stop.
 	ts := newTestSocket(&testTarget{})
-	c := newConn(ts, rejectingHandler(t), to)
+	c := newConn(ts, always(rejectingHandler(t)), to)
 	c.Shutdown()
 
 	err := awaitServe(t, serveInBackground(c))
@@ -1824,7 +1842,7 @@ func TestConnShutdownDoesNotServeAnotherFrame(t *testing.T) {
 
 	ts := newTestSocket(&testTarget{}).
 		script(append(clientHello(t), encodeFrames(t, ping(9))...))
-	c := newConn(ts, rejectingHandler(t), to)
+	c := newConn(ts, always(rejectingHandler(t)), to)
 	c.Shutdown()
 
 	if err := awaitServe(t, serveInBackground(c)); err != nil {
@@ -1856,7 +1874,7 @@ func TestConnShutdownIsIdempotent(t *testing.T) {
 	to.Idle = longTimeout
 
 	ts := newTestSocket(&testTarget{}).script(clientHello(t))
-	c := newConn(ts, rejectingHandler(t), to)
+	c := newConn(ts, always(rejectingHandler(t)), to)
 	done := serveInBackground(c)
 	awaitParked(t, ts)
 
@@ -1882,22 +1900,87 @@ func TestConnShutdownIsIdempotent(t *testing.T) {
 	assertGracefulGoAway(t, peerSaw(t, ts))
 }
 
-// TestNewConnRequiresAStreamHandler fails at construction rather than on the first
-// HEADERS frame of the first request. The alternative is the same bug reported
+// TestNewConnRequiresAStreamHandlerFactory fails at construction rather than on the
+// first HEADERS frame of the first request. The alternative is the same bug reported
 // later, from a goroutine further away, with a peer's traffic mixed into the stack
 // trace.
-func TestNewConnRequiresAStreamHandler(t *testing.T) {
+func TestNewConnRequiresAStreamHandlerFactory(t *testing.T) {
 	defer func() {
 		r := recover()
 		if r == nil {
-			t.Fatal("newConn accepted a nil stream handler; the connection would instead panic on " +
+			t.Fatal("newConn accepted a nil handler factory; the connection would instead panic on " +
 				"the first stream frame it received")
 		}
-		if msg, ok := r.(string); !ok || !strings.Contains(msg, "stream handler") {
-			t.Errorf("the panic says %v, want it to name the missing handler", r)
+		if msg, ok := r.(string); !ok || !strings.Contains(msg, "stream handler factory") {
+			t.Errorf("the panic says %v, want it to name the missing factory", r)
 		}
 	}()
 	newConn(newTestSocket(&testTarget{}), nil, testTimeouts())
+}
+
+// TestNewConnRejectsAFactoryThatReturnsNoHandler is the same guard one call further
+// along, and it is not the same check: a factory is a function this package invokes,
+// so "there is a factory" and "there is a handler" are two facts, and the second is
+// the one every frame dispatch depends on.
+//
+// It also holds the ordering. The writer's goroutine is running by the time the
+// factory has been called, so a construction that refuses the handler has to stop the
+// writer before it panics — otherwise every recovered panic leaves a goroutine
+// behind, and the leak check stops being able to tell that from a real leak.
+func TestNewConnRejectsAFactoryThatReturnsNoHandler(t *testing.T) {
+	baseline := goroutineBaseline()
+
+	func() {
+		defer func() {
+			r := recover()
+			if r == nil {
+				t.Fatal("newConn accepted a factory that returned no handler; the connection would " +
+					"instead panic on the first stream frame it received")
+			}
+			if msg, ok := r.(string); !ok || !strings.Contains(msg, "returned no handler") {
+				t.Errorf("the panic says %v, want it to name what the factory did", r)
+			}
+		}()
+		newConn(newTestSocket(&testTarget{}), func(FrameEnqueuer) StreamHandler { return nil }, testTimeouts())
+	}()
+
+	assertNoGoroutineLeak(t, baseline)
+}
+
+// TestNewConnGivesTheStreamHandlerAWritePath is the reason newConn takes a factory at
+// all. A handler that receives HEADERS and cannot answer them is not a handler, and
+// the write half it must answer through does not exist until newConn makes it — so
+// the handler is built here, against this connection's writer, and nowhere else.
+//
+// A DATA frame is the assertion, because it is the one frame type this connection
+// never sends on its own: a SETTINGS, a PING acknowledgement or a GOAWAY reaching the
+// peer would prove only that the connection still works.
+func TestNewConnGivesTheStreamHandlerAWritePath(t *testing.T) {
+	body := []byte("answered by the stream layer")
+	ts := newTestSocket(&testTarget{}).
+		script(append(clientHello(t), encodeFrames(t, frame.RSTStreamFrame{StreamID: 1, ErrCode: h2.Cancel})...)).
+		atEOF()
+
+	newHandler := func(w FrameEnqueuer) StreamHandler {
+		return handlerFunc(func(frame.Frame) error {
+			return w.Enqueue(frame.DataFrame{StreamID: 1, Data: body, EndStream: true})
+		})
+	}
+	if err := serveWith(t, ts, newHandler, testTimeouts()); err != nil && !errors.Is(err, errPeerClosed) {
+		t.Fatalf("Serve: %v", err)
+	}
+
+	got := peerSaw(t, ts)
+	for _, f := range got {
+		if d, ok := f.(frame.DataFrame); ok {
+			if string(d.Data) != string(body) {
+				t.Errorf("the peer received DATA carrying %q, want %q", d.Data, body)
+			}
+			return
+		}
+	}
+	t.Errorf("the peer received %s, with no DATA frame among it: the handler was given a write "+
+		"path it could not write to", describe(got))
 }
 
 // TestNewConnFillsUnsetTimeouts is the check that a caller cannot get a connection
@@ -1905,7 +1988,7 @@ func TestNewConnRequiresAStreamHandler(t *testing.T) {
 // deadline being time.Now, which fails every read at once — a failure mode that
 // looks exactly like a broken peer.
 func TestNewConnFillsUnsetTimeouts(t *testing.T) {
-	c := newConn(newTestSocket(&testTarget{}).atEOF(), &recordingHandler{}, limits.Timeouts{})
+	c := newConn(newTestSocket(&testTarget{}).atEOF(), always(&recordingHandler{}), limits.Timeouts{})
 	defer stopWriter(t, c)
 
 	if c.timeouts != limits.DefaultTimeouts() {
@@ -1951,7 +2034,7 @@ func TestServeLeaksNoGoroutines(t *testing.T) {
 	// from another goroutine while the connection is running. It is also the ending
 	// most likely to leak, because it is the only one where the reader goroutine
 	// stops for a reason the socket never reported.
-	c := newConn(newTestSocket(&testTarget{}).script(clientHello(t)), rejectingHandler(t), testTimeouts())
+	c := newConn(newTestSocket(&testTarget{}).script(clientHello(t)), always(rejectingHandler(t)), testTimeouts())
 	done := serveInBackground(c)
 	c.Shutdown()
 	_ = awaitServe(t, done)
