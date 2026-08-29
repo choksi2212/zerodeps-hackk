@@ -212,13 +212,14 @@ func checkRegular(f h2.Field) error {
 	return nil
 }
 
-// checkStatus holds a ":status" value to §8.3.2, which defines it as "the numeric HTTP
-// status code (see Section 15 of [HTTP])" — and §15 of RFC 9110 makes that "a
-// three-digit integer code".
+// checkStatus holds a ":status" value to §8.3.2, where it is the pseudo-header field
+// that "carries the HTTP status code field (see Section 15 of [HTTP])" — and Section 15
+// of RFC 9110 makes that "a three-digit integer code".
 //
 // So three digits exactly, and a first digit in 1-5. That pair is the whole of the
-// range: §15 assigns 1xx through 5xx and says a client "MUST understand the class of
-// any status code, as indicated by the first digit", which a 6xx code makes impossible.
+// range: RFC 9110 §15 assigns 1xx through 5xx and says that "a client MUST understand
+// the class of any status code, as indicated by the first digit", which a 6xx code
+// makes impossible.
 // Length is checked before the digits so that a value of "200 OK" — the HTTP/1.1 status
 // line, which is the mistake a handler makes — is refused as the wrong length rather
 // than as an unexpected space.

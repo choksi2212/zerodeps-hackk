@@ -1,12 +1,12 @@
 """Check every RFC 9113 quotation in this tree against RFC 9113.
 
-This file exists because six of them were wrong.
+This file exists because seven of them were wrong.
 
 The comments in this repository argue from the specification, and they quote it: a
 guard is justified by the sentence that requires it, and the sentence is reproduced so
 that a reader can weigh the guard against the rule rather than against a paraphrase of
 the rule. That habit has a failure mode, and it is not a subtle one — a quotation
-written from memory reads exactly like a quotation written from the file. Six of them
+written from memory reads exactly like a quotation written from the file. Seven of them
 were, and the errors were not typographical:
 
   * §6.9.1 was quoted as "a sender MUST NOT send a flow-controlled frame with length 0,
@@ -18,6 +18,9 @@ were, and the errors were not typographical:
     that peer".
   * §6.5.2 was quoted as charging "an overhead of 32 octets for each header field".
     9113 charges it for each *field line*, having renamed the thing in between.
+  * §8.3.2 was quoted as defining ":status" as "the numeric HTTP status code". 9113
+    says it "carries the HTTP status code field", and the renaming is the same one:
+    "numeric" is RFC 7540's word for it.
   * §6.2 was quoted as saying a HEADERS frame without END_HEADERS "MUST be followed by
     either a CONTINUATION or another frame type", which is the opposite of what §6.2
     requires. That one was a paraphrase of RFC 7540's §4.3 gone wrong in transit.
@@ -35,24 +38,34 @@ That is the whole cost, and it is enough.
 
 # What is checked
 
-A quoted span inside a Go comment is checked when either:
+A quoted span inside a Go comment is a candidate when either:
 
   A. it contains a normative keyword — MUST, MUST NOT, MAY, SHOULD, SHALL, REQUIRED,
      RECOMMENDED — because those are the words that carry the obligation, and a
      misstated obligation is the most expensive kind of error to make here; or
 
-  B. it is six words or longer and the comment text immediately before it contains a §
-     reference with no intervening quotation mark, which is what "§6.5.2: '...'" looks
-     like and what an ordinary bit of quoted English does not.
+  B. it is six words or longer and a section reference introduces it, which is what
+     "§6.5.2: '...'" looks like and what an ordinary bit of quoted English does not.
 
-Rule B is the one that earns its keep. Two of the six defects above contain no
-normative keyword at all and would have passed rule A: the §6.5.2 overhead and the
-§8.2.2 TE exception. Rule A is kept because a normative sentence quoted without a
-nearby § — inside a table row, say — is still a normative sentence.
+Rule B is the one that earns its keep. Three of the seven defects above contain no
+normative keyword at all and would have passed rule A: the §6.5.2 overhead, the §8.3.2
+definition and the §8.2.2 TE exception. Rule A is kept because a normative sentence
+quoted without a nearby § — inside a table row, say — is still a normative sentence,
+and one span in this tree is selected by nothing else.
+
+A candidate is then checked unless the reference introducing it names a document other
+than RFC 9113. These comments quote RFC 9110, RFC 7541 and RFC 3986 as well, none of
+which is here to compare against, and a checker that reported those would be reporting
+correct quotations — the "MUST understand the class of any status code" in
+internal/response/fields.go is RFC 9110's sentence, quoted accurately. Three spellings
+attribute a reference elsewhere: "§4.3 of RFC 7541", "Section 7.6.1 of [HTTP]", and a
+bare "§15", which is somebody else's section because RFC 9113 stops at §12. The last of
+those is why the section numbers are read out of the RFC's own headings rather than
+assumed. Skipped candidates are counted in the summary line: a check that quietly
+declines to look at something reads exactly like a check that looked and was satisfied.
 
 Everything else is left alone, and deliberately. These comments quote ordinary English
-constantly, and they quote RFC 9110, RFC 7541 and RFC 3986, none of which is here to
-check against. A rule that flagged those would produce a hundred findings a run, which
+constantly, and a rule that flagged that would produce a hundred findings a run, which
 is the same as producing none.
 
 # What counts as verbatim
@@ -103,10 +116,38 @@ import sys
 # their meaning in that case, and "the peer may not have sent it" is prose.
 NORMATIVE = re.compile(r"\b(MUST|MAY|SHOULD|SHALL|REQUIRED|RECOMMENDED)\b")
 
-# A § reference close enough before an opening quote to be introducing it, with no
-# quotation mark in between — anchored at the end, because what matters is the text
-# immediately before the quote and not the whole comment block.
-CITED = re.compile("§\\s?\\d+(\\.\\d+)*[^\"]{0,60}$")
+# A section reference, together with whatever attributes it to a document. Four shapes
+# occur in these comments: a bare "§8.3.2", which means RFC 9113 because that is what
+# this repository is about; "§4.3 of RFC 7541" and "Section 7.6.1 of [HTTP]", which name
+# another one; and "RFC 9113 §8.2.1", which the error messages use because a log line
+# arrives without the context that supplies the default.
+#
+# The trailing "'s" is optional and matched rather than merely tolerated, because the
+# possessive is how half of these comments introduce a quotation — "§8.2.2's list" — and
+# a pattern that stopped at the digits would leave the "s" to be read as prose.
+REFERENCE = re.compile(
+	r"(?:RFC\s*(?P<pre>\d{4})\s+)?"
+	r"(?:§\s?|Section\s+)"
+	r"(?P<num>\d+(?:\.\d+)*)"
+	r"(?:'s)?"
+	r"(?:\s+of\s+(?P<post>RFC\s*\d{4}|\[[^]\s]+\]))?"
+)
+
+# A numbered section heading in the RFC, at column zero. The RFC's numbered lists are
+# indented, so the anchor is what keeps "1.  one HEADERS frame" out of the set.
+HEADING = re.compile(r"^(\d+(?:\.\d+)*)\.\s\s\S")
+
+# How far back a reference may be and still count as introducing a quotation. What a
+# quotation claims to be is whatever was named just before it, not whatever was named
+# anywhere in the doc comment.
+#
+# Deliberately tight, because the two ways of being wrong here are not symmetrical. Too
+# tight and a correct quotation of RFC 9110 whose attribution is further off than this
+# gets reported as an RFC 9113 misquotation, which is loud, wrong and fixed in one
+# edit. Too loose and a stale mention of another document exempts a quotation of RFC
+# 9113 from being checked at all, which is silent and is the failure this whole script
+# exists to prevent.
+WINDOW = 60
 
 # The shortest span rule B will look at. Below this the false positives are ordinary
 # English and there are a great many of them.
@@ -144,6 +185,21 @@ def find_rfc(argv):
 		if p.is_file():
 			return p
 	return None
+
+
+def sections(raw):
+	"""The section numbers RFC 9113 actually has, read out of its own headings.
+
+	This is what makes a bare "§15" recognisable as somebody else's section rather than
+	ours. RFC 9113 stops at §12, so §15 is RFC 9110's, which is where the status code
+	classes are defined and where the comment that cites it says they are.
+
+	Read from the file rather than written down here. Ninety-five section numbers copied
+	into a script are ninety-five numbers that are wrong the first time anybody points
+	this at a different revision, and the failure would be silent: a section the script
+	had not heard of would make a quotation of it somebody else's words.
+	"""
+	return {m.group(1) for m in (HEADING.match(line) for line in raw.splitlines()) if m}
 
 
 def unwrap(text):
@@ -193,15 +249,70 @@ def comment_blocks(path):
 		yield start, " ".join(current)
 
 
-def quotations(path):
-	"""Yield (line number, span) for every quoted span in path that a rule selects."""
+def spans(text):
+	"""Yield (offset of the span, span) for every quoted span in text.
+
+	The pairing is positional — the marks alternate, so the first opens, the second
+	closes, the third opens again — and that is not what a regular expression for "a
+	quote, some non-quote characters, a quote" does once a length floor is put in it.
+	Such a pattern skips a span that is too short and then pairs that span's *closing*
+	mark with the next opening one, after which every span it reports for the rest of
+	the block is the prose between two quotations instead of a quotation.
+
+	One `":status"` in a doc comment is enough to do it, and one did: it hid a
+	misquotation of §8.3.2 on the next line of the same comment, and three other spans
+	elsewhere in the tree, from the first version of this script.
+
+	The final piece of a block with an odd number of marks is not a span. It has no
+	closing mark, which makes it prose that mentions a quotation mark.
+	"""
+	parts = text.split('"')
+	at = 0
+	for i, part in enumerate(parts):
+		if i % 2 == 1 and i + 1 < len(parts):
+			yield at, part
+		at += len(part) + 1
+
+
+def introducing(before):
+	"""The section reference that introduces a span, or None.
+
+	The last one within WINDOW characters of the span, with no quotation mark in
+	between. Both bounds matter: a doc comment cites several sections, and the one a
+	quotation is a claim about is the one just before it — while a reference on the far
+	side of an earlier quotation belongs to that quotation and not to this one.
+	"""
+	tail = before[-WINDOW:]
+	tail = tail[tail.rfind('"') + 1:]
+	found = list(REFERENCE.finditer(tail))
+	return found[-1] if found else None
+
+
+def elsewhere(ref, secs):
+	"""Whether a reference names a document other than RFC 9113."""
+	if ref.group("post") is not None:
+		return ref.group("post").replace(" ", "") != "RFC9113"
+	if ref.group("pre") is not None:
+		return ref.group("pre") != "9113"
+	return ref.group("num") not in secs
+
+
+def quotations(path, secs):
+	"""Yield (line number, span, ours) for every candidate quotation in path.
+
+	ours is false when the reference introducing the span attributes it to another
+	document, which is a span this script is not in a position to check.
+	"""
 	for start, text in comment_blocks(path):
-		for m in re.finditer(r'"([^"]{%d,})"' % MIN_CHARS, text):
-			span = m.group(1)
+		for at, span in spans(text):
+			if len(span) < MIN_CHARS:
+				continue
+			ref = introducing(text[: at - 1])
 			normative = NORMATIVE.search(span) is not None
-			cited = CITED.search(text[: m.start()]) is not None and len(span.split()) >= MIN_WORDS
-			if normative or cited:
-				yield start, span
+			cited = ref is not None and len(span.split()) >= MIN_WORDS
+			if not (normative or cited):
+				continue
+			yield start, span, ref is None or not elsewhere(ref, secs)
 
 
 def variants(fragment, first, last):
@@ -243,13 +354,18 @@ def main(argv):
 		print("    curl -o ../rfc9113.txt https://www.rfc-editor.org/rfc/rfc9113.txt")
 		return 0
 
-	rfc = normalise(unwrap(rfc_path.read_text(encoding="utf-8", errors="replace")))
+	raw = rfc_path.read_text(encoding="utf-8", errors="replace")
+	secs = sections(raw)
+	rfc = normalise(unwrap(raw))
 
 	root = pathlib.Path(__file__).resolve().parent.parent
-	checked = 0
+	checked, skipped = 0, 0
 	bad = []
 	for path in sorted(root.rglob("*.go")):
-		for line, span in quotations(path):
+		for line, span, ours in quotations(path, secs):
+			if not ours:
+				skipped += 1
+				continue
 			checked += 1
 			if not verbatim(span, rfc):
 				bad.append((path.relative_to(root), line, span))
@@ -260,6 +376,8 @@ def main(argv):
 		print()
 
 	print("%d quotations checked against %s" % (checked, rfc_path))
+	if skipped:
+		print("%d more name another document and were not checked." % skipped)
 	if bad:
 		print("%d of them are not in RFC 9113 in the form they are quoted." % len(bad))
 		return 1

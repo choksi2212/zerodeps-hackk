@@ -128,7 +128,8 @@ var ErrHeaderListTooLarge = errors.New("response: header list exceeds the peer's
 // connection whose peer is not reading has nothing useful for the other streams to be
 // doing in the meantime.
 type Encoder struct {
-	// mu orders the whole of an encode-and-enqueue, and guards every field below.
+	// mu orders the whole of an encode-and-enqueue, and guards every mutable field
+	// below. t is the exception and is documented as one.
 	mu sync.Mutex
 
 	// codec is this connection's encoding direction. It is not safe for concurrent
@@ -140,6 +141,11 @@ type Encoder struct {
 	// client happened to send us.
 	codec h2.HeaderCodec
 
+	// t is set by NewEncoder and never written again, which is why it is the one
+	// field mu does not guard: splitAt reads the peer's frame size through it from a
+	// stream goroutine that holds no lock, and frameWriter.MaxFrameSize is documented
+	// as safe from any goroutine. Enqueue is called under the lock, but for the order
+	// of the frames rather than for the safety of the call.
 	t Transport
 
 	// maxList is the peer's SETTINGS_MAX_HEADER_LIST_SIZE, or noHeaderListLimit.
@@ -296,6 +302,26 @@ func (e *Encoder) writeSection(id uint32, fields []h2.Field, endStream bool) err
 	return nil
 }
 
+// enqueue puts one frame on the connection under the same lock a header burst is
+// enqueued under.
+//
+// This exists for Writer, and the lock is the whole of the reason it does. A DATA
+// frame needs no HPACK context and no ordering against other streams' bodies, so a
+// Writer with a Transport of its own would send correct DATA — right up to the first
+// frame that landed between a HEADERS and its last CONTINUATION, which §4.3 forbids
+// and §6.10 makes a connection error of type PROTOCOL_ERROR. Every frame this package
+// sends therefore goes out under this mutex, and a stream's body waits behind another
+// stream's header section rather than interleaving it.
+//
+// The wait is short by construction. Reserving flow-control credit is the part of
+// writing a body that blocks for as long as a peer wants it to, and it happens before
+// this is called; what is inside the lock is one queue send.
+func (e *Encoder) enqueue(f frame.Frame) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.t.Enqueue(f)
+}
+
 // splitAt is the largest fragment a frame of this burst may carry.
 //
 // Read once for the whole block rather than once per frame. A peer's SETTINGS may
@@ -305,12 +331,21 @@ func (e *Encoder) writeSection(id uint32, fields []h2.Field, endStream bool) err
 // holder. What must not happen is a split computed against two different numbers,
 // which is how a fragment ends up one octet over a limit nobody applied to it.
 //
+// That argument is about one field block and does not reach a body, which is why
+// Writer calls this once per DATA frame and takes no lock to do it: consecutive DATA
+// frames are independent, so a peer that raises its frame size mid-body should have
+// the larger frames it asked for and one that lowers it should have the smaller ones.
+//
 // Floored at §6.5.2's initial value rather than trusted, exactly as
 // frame.Writer.SetMaxFrameSize floors it and for a sharper version of the same
 // reason: a Transport reporting zero would not merely make frames unsendable, it
 // would make the loop above split a block into fragments of nothing and never
 // finish. A transport that reports below the floor has broken its own documented
 // contract, and the useful response to that is a connection that keeps working.
+//
+// §6.5.2 also makes the floor safe against a peer that wants smaller frames than
+// 16384: the value an endpoint advertises "MUST be between this initial value and the
+// maximum allowed frame size", so there is no legitimate cap below it to respect.
 func (e *Encoder) splitAt() int {
 	max := int(e.t.MaxFrameSize())
 	if max < frame.DefaultMaxFrameSize {

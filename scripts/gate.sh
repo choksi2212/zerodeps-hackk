@@ -117,10 +117,10 @@ fi
 ok "go.mod is $(grep -c . go.mod) non-blank lines; no go.sum, no vendor/"
 
 step "9/10 every RFC 9113 quotation must be the RFC's own words"
-# The comments here argue from the specification and quote it, and six of those
+# The comments here argue from the specification and quote it, and seven of those
 # quotations turned out to be RFC 7540's text under RFC 9113's numbers, or
 # sentences that appear in neither. See scripts/quotes.py, which explains what it
-# tolerates and why.
+# tolerates, what it declines to grade, and why.
 #
 # Skipped, loudly, when Python or the RFC is missing. This check grades prose, it
 # is the only step that needs anything outside the Go toolchain, and a
