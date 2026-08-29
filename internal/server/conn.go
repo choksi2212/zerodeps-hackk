@@ -315,6 +315,24 @@ func (c *conn) Shutdown() {
 	}
 }
 
+// Close ends the connection now, without a GOAWAY and without waiting for the read
+// loop to agree.
+//
+// It is the answer to a connection that did not stop when Shutdown asked it to,
+// which is a real state and not a hypothetical one: a stream goroutine wedged in a
+// handler is not watching the quit channel, and a peer that has stopped reading can
+// hold the writer until the write deadline. Closing the socket reaches both, because
+// every goroutine on a connection is ultimately blocked on it.
+//
+// Serve closes the socket too, on every path, and both closes running is the normal
+// case rather than a bug — the accept layer calls this on a connection that may have
+// ended a microsecond earlier. The second one returns an error saying the socket was
+// already closed, which is why this returns it rather than swallowing it: the caller
+// is the one that knows whether it expected to be first.
+func (c *conn) Close() error {
+	return c.sock.Close()
+}
+
 // stopping reports whether Shutdown has been called.
 func (c *conn) stopping() bool {
 	select {
