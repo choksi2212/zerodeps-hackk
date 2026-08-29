@@ -60,12 +60,14 @@ type Config struct {
 // exist at once, what happens when accept fails, and how the whole set of them is
 // brought down. Everything about one connection is conn's.
 type Server struct {
-	// newHandler makes the stream handler for one connection. Called once per
-	// accepted connection and never shared between two, because a stream table
-	// belongs to exactly one connection: §5.1.1 numbers streams per connection, and
-	// a table shared between two would let one peer's identifiers collide with
-	// another's.
-	newHandler func() streamHandler
+	// newHandler makes the stream handler for one connection, given that
+	// connection's write half. Called once per accepted connection and never shared
+	// between two, because a stream table belongs to exactly one connection: §5.1.1
+	// numbers streams per connection, and a table shared between two would let one
+	// peer's identifiers collide with another's. The enqueuer settles it even where
+	// the table would not — it writes to one socket, so a handler kept from a
+	// previous connection would answer this peer's requests down someone else's.
+	newHandler func(FrameEnqueuer) StreamHandler
 
 	timeouts limits.Timeouts
 	log      *log.Logger
@@ -99,12 +101,12 @@ type Server struct {
 }
 
 // New returns a server that serves each accepted connection with a handler from
-// newHandler.
+// newHandler, built against that connection's write half.
 //
 // A nil factory panics, for the same reason newConn does: the alternative is a
 // server that starts, listens, accepts, and then panics on the first connection
 // with a peer's traffic in the stack trace.
-func New(newHandler func() streamHandler, cfg Config) *Server {
+func New(newHandler func(FrameEnqueuer) StreamHandler, cfg Config) *Server {
 	if newHandler == nil {
 		panic("server: New requires a handler factory")
 	}
@@ -195,7 +197,7 @@ func (s *Server) Serve(l net.Listener) error {
 // releases it. The pair is split across two functions because the acquire has to
 // happen before Accept and the release cannot happen until the connection is over.
 func (s *Server) serveConn(nc net.Conn) {
-	c := newConn(nc, s.newHandler(), s.timeouts)
+	c := newConn(nc, s.newHandler, s.timeouts)
 
 	tracked := s.track(c)
 	if !tracked {

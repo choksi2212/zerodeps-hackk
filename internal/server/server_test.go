@@ -315,12 +315,12 @@ func (r *logRecorder) text() string {
 
 // testServer returns a server logging into a recorder. A nil factory gets
 // rejectingHandler, which fails the test if any frame reaches the stream layer.
-func testServer(t *testing.T, cfg Config, newHandler func() streamHandler) (*Server, *logRecorder) {
+func testServer(t *testing.T, cfg Config, newHandler func(FrameEnqueuer) StreamHandler) (*Server, *logRecorder) {
 	t.Helper()
 	rec := &logRecorder{}
 	cfg.ErrorLog = log.New(rec, "", 0)
 	if newHandler == nil {
-		newHandler = func() streamHandler { return rejectingHandler(t) }
+		newHandler = func(FrameEnqueuer) StreamHandler { return rejectingHandler(t) }
 	}
 	return New(newHandler, cfg), rec
 }
@@ -530,7 +530,7 @@ func TestServerBoundsConcurrentConnections(t *testing.T) {
 // config empty, because both are security-relevant and both fail silently: an
 // unbounded connection count and a set of zero deadlines that expire immediately.
 func TestServerFillsUnsetConfig(t *testing.T) {
-	s := New(func() streamHandler { return rejectingHandler(t) }, Config{})
+	s := New(func(FrameEnqueuer) StreamHandler { return rejectingHandler(t) }, Config{})
 
 	if got := cap(s.slots); got != limits.MaxConns {
 		t.Errorf("an empty Config gives room for %d connections, want limits.MaxConns = %d",
@@ -562,6 +562,76 @@ func TestServerNewRequiresAHandlerFactory(t *testing.T) {
 		}
 	}()
 	New(nil, Config{})
+}
+
+// taggedHandler is a handler two of which can be told apart. handlerFunc cannot:
+// it is a func type, and comparing two interface values holding funcs panics instead
+// of answering.
+type taggedHandler struct {
+	StreamHandler
+	w FrameEnqueuer
+}
+
+// TestServerBuildsAHandlerPerConnection is the claim on Server.newHandler, and it is
+// the one thing about the factory a single-connection test cannot see.
+//
+// Calling it once and reusing the handler would work, right up to the second
+// concurrent connection: §5.1.1 numbers streams per connection, so two peers both
+// opening stream 1 would meet in one table and one of them would get the other's
+// request. The write half settles it even where the identifiers happen not to
+// collide — it is bound to one socket, so a handler carried over from a previous
+// connection answers this peer down somebody else's.
+//
+// Distinct handlers and distinct enqueuers are therefore both asserted. Either alone
+// passes for a server that got the other wrong.
+func TestServerBuildsAHandlerPerConnection(t *testing.T) {
+	baseline := goroutineBaseline()
+
+	var mu sync.Mutex
+	var handlers []*taggedHandler
+	newHandler := func(w FrameEnqueuer) StreamHandler {
+		h := &taggedHandler{StreamHandler: rejectingHandler(t), w: w}
+		mu.Lock()
+		handlers = append(handlers, h)
+		mu.Unlock()
+		return h
+	}
+	built := func() int {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(handlers)
+	}
+
+	l := newTestListener(nil, nil)
+	s, _ := testServer(t, Config{Timeouts: serverTimeouts()}, newHandler)
+	done := serverInBackground(s, l)
+	awaitPeers(t, l, 2)
+	poll(t, gateWait, func() bool { return built() >= 2 }, func() string {
+		return fmt.Sprintf("the server built %d handlers for 2 connections", built())
+	})
+
+	func() {
+		mu.Lock()
+		defer mu.Unlock()
+		if handlers[0] == handlers[1] {
+			t.Errorf("both connections were served by the same handler, so two peers share one stream table")
+		}
+		if handlers[0].w == handlers[1].w {
+			t.Errorf("both handlers were given the same write half, so one peer's response can be " +
+				"written to the other's socket")
+		}
+		for i, h := range handlers {
+			if h.w == nil {
+				t.Errorf("connection %d's handler was given no write half, so it cannot answer a request", i)
+			}
+		}
+	}()
+
+	if err := s.Shutdown(); err != nil {
+		t.Errorf("Shutdown: %v", err)
+	}
+	assertServerClosed(t, awaitServe(t, done))
+	assertNoGoroutineLeak(t, baseline)
 }
 
 // --- accept failures ----------------------------------------------------------
@@ -927,11 +997,11 @@ func TestServerShutdownForcesAStalledConnectionPastTheGrace(t *testing.T) {
 // that is not blocked on the socket. Both Shutdown and Close have to give up on it and
 // say so, which is what the two tests below check — and it is not a contrived state:
 // any handler that waits on a backend, a lock, or a disk can be in it.
-func wedgedHandler() (newHandler func() streamHandler, entered <-chan struct{}, release func()) {
+func wedgedHandler() (newHandler func(FrameEnqueuer) StreamHandler, entered <-chan struct{}, release func()) {
 	in := make(chan struct{})
 	out := make(chan struct{})
 	var once sync.Once
-	factory := func() streamHandler {
+	factory := func(FrameEnqueuer) StreamHandler {
 		return handlerFunc(func(frame.Frame) error {
 			once.Do(func() { close(in) })
 			<-out
@@ -1169,7 +1239,7 @@ func TestServerShutdownReachesAConnectionAcceptedInTheRace(t *testing.T) {
 func TestServerRecoversFromAPanickingHandler(t *testing.T) {
 	baseline := goroutineBaseline()
 
-	handler := func() streamHandler {
+	handler := func(FrameEnqueuer) StreamHandler {
 		return handlerFunc(func(frame.Frame) error {
 			panic("a bug reached through a peer's frame")
 		})
@@ -1251,7 +1321,7 @@ func TestServerWithNoLogDiscardsEveryLine(t *testing.T) {
 
 	boom := errors.New("accept: too many open files")
 	l := newTestListener(boom, nil)
-	s := New(func() streamHandler { return rejectingHandler(t) }, Config{Timeouts: serverTimeouts()})
+	s := New(func(FrameEnqueuer) StreamHandler { return rejectingHandler(t) }, Config{Timeouts: serverTimeouts()})
 	done := serverInBackground(s, l)
 
 	awaitPeers(t, l, 1)

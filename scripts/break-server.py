@@ -26,6 +26,16 @@ oversights:
   test. The close is also what keeps every other path out of Serve safe as more
   are added.
 
+A third is not a guard but a shape, and it is named here because
+TestServerBuildsAHandlerPerConnection holds it and nothing in this campaign can
+break it. serveConn calls s.newHandler once per accepted connection; the mistake it
+rules out is calling it once and sharing the result, which would put two peers'
+streams in one table. There is no one-line edit that makes that mistake, because
+"per connection" is expressed by calling the factory at the point of use rather than
+by a check — the wrong version needs a field to cache the handler in, and a break
+that adds a field is a different program, not a broken guard. The test is what
+covers it.
+
 One break is worth reading for what it measured rather than for what it caught.
 Deleting runConn's whole handshake step leaves a well-behaved client served
 correctly: TestServeTLSServesHTTP2ToAClientThatNegotiatesIt passes. That is not a

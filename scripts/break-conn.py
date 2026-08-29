@@ -36,6 +36,16 @@ indistinguishable on this path. Shutdown flushes what is queued, Close does not,
 with an empty queue those are the same thing. The distinction matters in Serve, where
 it is broken and caught.
 
+The campaign went stale once, and the preflight is what said so rather than a run
+full of holes. applySetting grew an error return when the connection started routing
+INITIAL_WINDOW_SIZE to the stream layer, which left this file's acknowledge-before-
+apply break anchored on a loop body that no longer existed: it matched 0 times, the
+harness refused the whole campaign with exit 2, and nothing was tested. That is the
+outcome the preflight is for. The alternative -- a break that removes nothing, so
+every test it names comes back green -- reports as a hole in the suite, and the three
+routing behaviours added in the same commit as the error return genuinely had no
+breaks at all. They have them now.
+
 Run from the repository root. Restores the file on the way out, including on error.
 """
 
@@ -48,19 +58,39 @@ PKG = "./internal/server/"
 BREAKS = [
     # --- construction --------------------------------------------------------
     (
-        "newConn: a nil handler is accepted and fails later, on a peer's first frame",
-        """	if h == nil {
-		panic("server: newConn requires a stream handler")
+        "newConn: a nil factory is accepted and fails later, on a peer's first frame",
+        """	if newHandler == nil {
+		panic("server: newConn requires a stream handler factory")
 	}
 """,
         "",
-        ["TestNewConnRequiresAStreamHandler"],
+        ["TestNewConnRequiresAStreamHandlerFactory"],
+    ),
+    (
+        "newConn: a factory that returns no handler is accepted, and the nil arrives on dispatch",
+        """	if h == nil {""",
+        """	if false {""",
+        ["TestNewConnRejectsAFactoryThatReturnsNoHandler"],
+    ),
+    (
+        "newConn: the writer is left running when the handler is refused, so a recovered panic leaks it",
+        """		w.Close()
+		_ = w.Wait()
+		panic("server: the stream handler factory returned no handler")""",
+        """		panic("server: the stream handler factory returned no handler")""",
+        ["TestNewConnRejectsAFactoryThatReturnsNoHandler"],
+    ),
+    (
+        "newConn: the handler gets a writer of its own, so two goroutines own one socket",
+        """	h := newHandler(w)""",
+        """	h := newHandler(startFrameWriter(sock, t.Write))""",
+        ["TestServeLeaksNoGoroutines"],
     ),
     (
         "newConn: unset timeouts keep their zero values, so every deadline is now",
         """	t = t.WithDefaults()
-	return &conn{""",
-        """	return &conn{""",
+""",
+        "",
         ["TestNewConnFillsUnsetTimeouts"],
     ),
     (
@@ -283,17 +313,24 @@ BREAKS = [
     (
         "handleSettings: acknowledged before applied, licensing a frame we might still refuse",
         """	for _, s := range f.Settings {
-		c.applySetting(s)
+		if err := c.applySetting(s); err != nil {
+			return err
+		}
 	}
 	return c.w.Enqueue(frame.SettingsFrame{Ack: true})""",
         """	if err := c.w.Enqueue(frame.SettingsFrame{Ack: true}); err != nil {
 		return err
 	}
 	for _, s := range f.Settings {
-		c.applySetting(s)
+		if err := c.applySetting(s); err != nil {
+			return err
+		}
 	}
 	return nil""",
-        ["TestServeAppliesSettingsBeforeAcknowledging"],
+        [
+            "TestServeAppliesSettingsBeforeAcknowledging",
+            "TestServeStopsOnASettingItCannotApply",
+        ],
     ),
     (
         "handleSettings: nothing is acknowledged, so a peer waiting for one stalls",
@@ -309,6 +346,33 @@ BREAKS = [
         """		c.w.SetMaxFrameSize(s.Value)""",
         """		_ = s.Value""",
         ["TestServeAppliesAndAcknowledgesThePeersSettings"],
+    ),
+    (
+        "handleSettings: a parameter that cannot be applied is skipped and the rest acknowledged",
+        """		if err := c.applySetting(s); err != nil {
+			return err
+		}""",
+        """		_ = c.applySetting(s)""",
+        ["TestServeStopsOnASettingItCannotApply"],
+    ),
+    (
+        "applySetting: INITIAL_WINDOW_SIZE never reaches the streams that hold the windows",
+        """		return c.handler.SetInitialWindowSize(s.Value)""",
+        """		_ = s.Value""",
+        [
+            "TestServeAppliesInitialWindowSizeToTheStreamLayer",
+            "TestServeStopsOnASettingItCannotApply",
+        ],
+    ),
+    (
+        "handleConnectionWindowUpdate: a stream-0 credit is swallowed at the connection level",
+        """	return c.handler.ConnWindowUpdate(f.Increment)""",
+        """	_ = f.Increment
+	return nil""",
+        [
+            "TestServeKeepsAStreamZeroWindowUpdateFromTheHandler",
+            "TestServeReportsARefusedConnectionWindowUpdate",
+        ],
     ),
 
     # --- dispatch ------------------------------------------------------------

@@ -12,17 +12,19 @@ This section is kept honest as the build proceeds; nothing is claimed here befor
 |---|---|
 | Build gate, zero-dependency guards, reproducible build | working |
 | Shared `internal/h2` contract | frozen |
-| Frame layer (RFC 9113 §4, §6) | working — all 10 frame types, 478 tests, 4 fuzz targets |
-| Connection timeouts and peer bounds (`internal/limits`) | working — six timeouts, 48 tests; the reset bucket is not yet wired to a connection |
-| Connection lifecycle, SETTINGS, PING, GOAWAY | working — 67 tests, and 58 guards each observed failing |
-| Accept loop, connection bound, graceful shutdown | working — 25 tests, and 38 guards each observed failing |
-| Streams and flow control (§5) | not started |
+| Frame layer (RFC 9113 §4, §6) | working — all 10 frame types, 198 tests, 5 fuzz targets |
+| Connection timeouts and peer bounds (`internal/limits`) | working — six timeouts, 36 tests; the reset bucket is not yet wired to a connection |
+| Connection lifecycle, SETTINGS, PING, GOAWAY | working — 73 tests, and 64 guards each observed failing |
+| Accept loop, connection bound, graceful shutdown | working — 28 tests, and 38 guards each observed failing |
+| Streams and flow control (§5) | working — 107 tests, and 170 guards each observed failing; not yet reachable from `cmd/zdh` |
 | HPACK (RFC 7541) | in progress, separate author |
 | Request semantics (§8), static file handler | not started |
 | Self-signed certificate generation (`internal/certgen`) | working — 46 tests, and 39 guards each observed failing |
 | TLS 1.2/1.3, ALPN, RFC 9113 §9.2 cipher policy | working — 24 tests, and 31 guards each observed failing |
 | Browser demo | not started |
 | h2spec conformance score | not yet run |
+
+Every count above is a top-level test function, which is what `go test -list '.*' ./...` prints: a table-driven test counts once rather than once per case, so the number is one command away from being checked rather than one convention away from being argued about.
 
 ## Zero dependencies — check it in thirty seconds
 
@@ -66,18 +68,31 @@ The same argument applies one level up: a test that has never been seen failing 
 So every security bound, deadline and protocol rule in this server has a *break* recorded against it — a one-line edit that removes exactly that guard, together with the tests that must fail as a result:
 
 ```bash
-python scripts/break-conn.py     # 45 breaks, all 45 caught
+python scripts/break-conn.py     # 51 breaks, all 51 caught
 python scripts/break-server.py   # 38 breaks, all 38 caught
 python scripts/break-tls.py      # 31 breaks, all 31 caught
 python scripts/break-writer.py   # 13 breaks, all 13 caught
 python scripts/break-certgen.py  # 39 breaks, all 39 caught
+python scripts/break-flow.py     # 39 breaks, all 39 caught
+python scripts/break-stream.py   # 17 breaks, all 17 caught
+python scripts/break-table.py    # 114 breaks, all 114 caught
 ```
 
 Each campaign edits one file in place, runs each expected test in a process of its own, and restores the file on the way out — including on error, so a campaign that left the tree modified could not be mistaken for one that found a bug. A break that fires nothing is reported as a hole, and a hole is either a missing test or a guard whose justification was wrong. Both are worth knowing before a judge finds them.
 
-The harness checks each campaign before it runs any of it, and refuses with a distinct exit status — 2 for a malformed campaign, 1 for holes — because the two need different readers. An anchor that matches no line removes nothing, so every test it named comes back green, and a typo in the campaign then reads as a suite full of holes. All five of those checks have been observed refusing a deliberately malformed campaign, and observed leaving the target file byte-identical while doing it.
+The harness checks each campaign before it runs any of it, and refuses with a distinct exit status — 2 for a malformed campaign, 1 for holes — because the two need different readers. An anchor that matches no line removes nothing, so every test it named comes back green, and a typo in the campaign then reads as a suite full of holes. The preflight's four checks have all been observed refusing a deliberately malformed campaign, and observed leaving the target file byte-identical while doing it. `break-table.py`'s own first run was refused the same way, on an anchor that matched twice: a one-tab line is a substring of the two-tab version of itself, and the check counts substrings rather than lines because that is what the replacement will do.
 
-Three of the hundred and sixty-six are the reason the campaigns are run rather than read. Recomputing the SETTINGS-acknowledgement deadline on each read passes the silent-peer test and still lets a peer hold a connection open for ever. Taking the connection slot after `Accept` instead of before it leaves a server that honours its bound and still spends a descriptor and a handshake per refused peer. Dropping the backoff reset after a successful accept leaves a server that recovers from a rough patch on paper and carries a one-second pause before every connection for the rest of the week. None of the three is visible in a green suite.
+The second refusal was the more valuable one, because nobody was looking for it. `break-conn.py` held a break anchored on `handleSettings`'s loop body, and that loop had since grown an error check — the connection began routing `SETTINGS_INITIAL_WINDOW_SIZE` to the stream layer, which gave `applySetting` an error to return. The anchor matched nothing, so the campaign was refused with exit 2 and nothing ran. Without the check it would have removed nothing, reported its test as green, and read as coverage of a rule it was no longer touching. Asking why then turned up the real gap behind it: the three routing behaviours added in that same commit had no breaks at all. This campaign is 51 rather than 45 because of what one stale anchor led to.
+
+Three of the three hundred and forty-two are the reason the campaigns are run rather than read. Recomputing the SETTINGS-acknowledgement deadline on each read passes the silent-peer test and still lets a peer hold a connection open for ever. Taking the connection slot after `Accept` instead of before it leaves a server that honours its bound and still spends a descriptor and a handshake per refused peer. Dropping the backoff reset after a successful accept leaves a server that recovers from a rough patch on paper and carries a one-second pause before every connection for the rest of the week. None of the three is visible in a green suite.
+
+`break-table.py` is the largest of the eight at 114 breaks, and two of them are why the stream table is worth that many. Returning a refused stream's verdict *before* its header block is decoded leaves a server that is correct for every request a client sends until one of them is refused — and from that moment the HPACK dynamic table is one insertion behind the peer's, so every later request on the connection decodes into header fields nobody sent. §5.1 requires the compression state to be updated for a stream that is closed or refused, and that break is the demonstration of why. Moving the connection-window debit in `data` below the stream lookup is the same shape: flow control that is exactly right for every frame it accepts and silently wrong for every frame it refuses, after which the two ends disagree about the connection's credit by the size of whatever was dropped, permanently. Neither break produces a symptom anywhere near its cause.
+
+Four of `internal/stream`'s tests exist because a break was worked out that nothing would have noticed — worked out while the campaign was being written, which is early enough that the run itself came back clean. Nothing observed that a *refused* stream still spends its identifier, though the code claims it in as many words. Nothing pinned which of §5.1 and §8.1 answers a trailer section that breaks both. Every trailer test sent END_HEADERS on the first frame, so the trailer path's own call into the reassembler could complete a block early and no test would see it. And §6.9.1's accounting rule was pinned for a DATA frame on a closed stream but not for one after END_STREAM, which left the whole state check free to move above the debit. A fifth test was weak rather than missing: the CONTINUATION-on-the-wrong-stream test only ever sent a *higher* identifier than the open block's, so `!=` could become `>` and fire nothing. It now runs both directions.
+
+`break-stream.py` produced the third kind of hole on its first run, and it was in the campaign rather than in the code or the tests. The break that stops `recvEnd` from closing a stream this server has already finished sending on was expected to fail `TestAnEmptyDataFrameWithEndStreamClosesAnExhaustedStream` — but that test never sends END_STREAM of its own, so its stream is never in half-closed (local), which is the only state that break changes. Three other tests caught it. A name in a campaign's list is a claim about a specific test, and the harness holds it to that claim rather than settling for the break being caught by something.
+
+Two more results are measurements rather than catches, and both stay in the scripts because the reasoning is what a reader would otherwise reconstruct wrongly. `beginTrailers` records END_STREAM on a trailer block and nothing can observe it, because the trailer path ends the stream unconditionally — which it may, since a trailer section without END_STREAM is already a stream error by the time it gets there. And `admit`'s self-dependency check reads the PRIORITY flag before the dependency it guards, which cannot matter: `internal/frame` leaves the dependency at zero when the flag is absent and rejects a dependency on stream 0 outright, so the two forms agree for every frame that can reach the check. Both are kept for what they say to a reader, not for what they guard.
 
 Two of `break-certgen.py`'s findings were holes on the first run, and both were in the tests rather than in the code — which is the outcome the campaigns exist to produce. Dropping `serialNumber`'s error return changed nothing observable through the public API, because a dead entropy source fails the key generation too and both failures wrap the same underlying error; the guard is now tested by calling the unexported function directly. Dropping `cert.Leaf = leaf` also changed nothing, because `crypto/tls` has set `Leaf` itself in `X509KeyPair` since Go 1.23 — the comment in the code claiming otherwise was simply wrong. It sets it only while the `x509keypairleaf` GODEBUG is on, and that is off for any module declaring `go 1.22` or older, so the test now switches it off and asserts against this package instead of against the standard library.
 
