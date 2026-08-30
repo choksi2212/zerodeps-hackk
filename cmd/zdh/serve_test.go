@@ -17,6 +17,7 @@ import (
 	"zerodeps/zdh/internal/frame"
 	"zerodeps/zdh/internal/h2"
 	"zerodeps/zdh/internal/hpack"
+	"zerodeps/zdh/internal/priority"
 	"zerodeps/zdh/internal/response"
 	"zerodeps/zdh/internal/server"
 	"zerodeps/zdh/internal/static"
@@ -741,5 +742,79 @@ func (c *client) awaitCredit(id uint32, want uint32) {
 		case frame.RSTStreamFrame:
 			c.t.Fatalf("the server reset stream %d instead of sending credit: %v", v.StreamID, v.ErrCode)
 		}
+	}
+}
+
+// --- the wiring no other test can see ---------------------------------------
+
+// recorder is a connection's write half that keeps what it was told about priority and
+// throws away the frames.
+//
+// It exists for one assertion, and the assertion needs a double rather than a socket
+// because what is being checked is a call and not an octet. Safe from every goroutine,
+// because the real writer is: a handler's goroutine reaches Enqueue and Forget while the
+// reader goroutine reaches Prioritize.
+type recorder struct {
+	mu    sync.Mutex
+	prios []uint32
+}
+
+func (r *recorder) Enqueue(frame.Frame) error { return nil }
+func (r *recorder) MaxFrameSize() uint32      { return frame.DefaultMaxFrameSize }
+func (r *recorder) Forget(uint32)             {}
+
+func (r *recorder) Prioritize(id uint32, p priority.Params) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.prios = append(r.prios, id)
+}
+
+func (r *recorder) prioritized() []uint32 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]uint32(nil), r.prios...)
+}
+
+// The Priority header field is read by internal/exchange and acted on by
+// internal/server, and the line that connects them is one field in one composite
+// literal in newConn.
+//
+// Nothing else in the module would notice it missing. exchange.Config.Priorities is
+// allowed to be nil — §10 of RFC 9218 makes acting on a priority signal a
+// recommendation, so a server that ignores one is conformant — which means a forgotten
+// field is not a build failure. It is not a wire-visible failure either: every request
+// is still answered, and every response is still scheduled, just all at the same
+// urgency. The tests above this one would all pass.
+//
+// So this one calls newConn with its own write half and watches for the call. No socket,
+// no preface and no timing: Headers runs on the goroutine that delivered the frame, so
+// by the time HandleFrame has returned the signal has either been made or lost.
+func TestNewConnGivesTheRequestLayerSomewhereToSendAPriorityField(t *testing.T) {
+	w := &recorder{}
+	h := drainer{got: make(chan int64, 1)}
+	sh := newConn(h, nil)(w)
+	t.Cleanup(func() { sh.Close(errors.New("the test is over")) })
+
+	enc := hpack.New()
+	err := sh.HandleFrame(frame.HeadersFrame{
+		StreamID:   1,
+		EndStream:  true,
+		EndHeaders: true,
+		Fragment: enc.Encode([]h2.Field{
+			{Name: ":method", Value: "GET"},
+			{Name: ":scheme", Value: "http"},
+			{Name: ":authority", Value: "127.0.0.1"},
+			{Name: ":path", Value: "/"},
+			{Name: "priority", Value: "u=0"},
+		}),
+	})
+	if err != nil {
+		t.Fatalf("delivering the request: %v", err)
+	}
+
+	if got := w.prioritized(); len(got) != 1 || got[0] != 1 {
+		t.Errorf("the write half was told to prioritize %v, want [1]: newConn has to pass "+
+			"itself to exchange.Config.Priorities or the Priority header field of every "+
+			"request is read and discarded", got)
 	}
 }

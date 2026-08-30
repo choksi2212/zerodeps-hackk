@@ -51,6 +51,7 @@ import (
 
 	"zerodeps/zdh/internal/flow"
 	"zerodeps/zdh/internal/h2"
+	"zerodeps/zdh/internal/priority"
 	"zerodeps/zdh/internal/request"
 	"zerodeps/zdh/internal/response"
 	"zerodeps/zdh/internal/stream"
@@ -113,6 +114,25 @@ type Streams interface {
 	ReportConsumed(id uint32, n int, more bool)
 }
 
+// Priorities is the write side's scheduler as this package needs it: the one call that
+// tells it what a request asked for.
+//
+// Declared here rather than imported for the same reason Streams is, and with one extra
+// reason of its own. The implementation is the connection's frame writer, which lives in
+// the package that constructs this one, so importing it to write a compile-time
+// assertion would be importing the layer above. The assignment in cmd/zdh is the check,
+// and it is a build failure in the four lines that wire a connection.
+type Priorities interface {
+	// Prioritize is what the client asked for on stream id, and it is a complete
+	// signal rather than a partial one: a parameter the client left out is a
+	// parameter at its default, not one to carry over from an earlier signal. §4 of
+	// RFC 9218: "When receiving an HTTP request that does not carry these priority
+	// parameters, a server SHOULD act as if their default values were specified."
+	//
+	// So the most recent call wins outright, and nothing here merges.
+	Prioritize(id uint32, p priority.Params)
+}
+
 // Config is what running a request needs.
 type Config struct {
 	// Handler answers the requests. Required.
@@ -126,6 +146,18 @@ type Config struct {
 	// Required.
 	Credit response.Credit
 
+	// Priorities receives the priority signal a request carried in its own header
+	// section (§5 of RFC 9218). Nil discards them, and every response is then
+	// scheduled at §4's defaults.
+	//
+	// Optional, unlike the three above it, and that is a claim about the protocol
+	// rather than a convenience. §10 of RFC 9218: "Endpoints cannot depend on
+	// particular treatment based on priority signals." A server that reads the field
+	// and does nothing with it is conformant, so a nil here is a configuration and not
+	// a wiring mistake — which is why New does not panic on it the way it does on a
+	// missing encoder, and why cmd/zdh has a test that it is nevertheless supplied.
+	Priorities Priorities
+
 	// Log receives one line for every handler that panicked, with its stack. Nil
 	// discards them, which is right for a test and wrong for a deployment: a
 	// contained panic that nobody logs is a bug that never gets fixed.
@@ -137,6 +169,7 @@ type Requests struct {
 	handler Handler
 	enc     *response.Encoder
 	credit  response.Credit
+	prios   Priorities
 	log     *log.Logger
 
 	// streams is where a finished response is reported. Not in Config, because the
@@ -187,6 +220,7 @@ func New(cfg Config) *Requests {
 		handler:  cfg.Handler,
 		enc:      cfg.Encoder,
 		credit:   cfg.Credit,
+		prios:    cfg.Priorities,
 		log:      cfg.Log,
 		arriving: make(map[uint32]*inbound),
 	}
@@ -226,6 +260,24 @@ func (r *Requests) Attach(s Streams) {
 // handler that has already answered it — §8.1.1 permits an endpoint to have "performed
 // some processing before identifying a request [...] as malformed", and not needing
 // that permission is better than using it.
+//
+// # Why the Priority field is applied from here
+//
+// Because here is the connection's reader goroutine, and being on it is the whole
+// arbitration between RFC 9218's two carriers. §7 of RFC 9218 settles which wins: "for
+// the purposes of scheduling, the most recently received PRIORITY_UPDATE frame can be
+// considered as the most up-to-date information that overrides any other signal."
+//
+// Nothing here compares timestamps or remembers where a signal came from, and it does
+// not have to, because both carriers reach the write side from this one goroutine in
+// arrival order. A frame that arrived first was buffered and is applied by conn.leftIdle
+// after this returns; a frame that arrives later is applied when it arrives. Either way
+// the frame's call to Prioritize is the last one, which is what §7 asks for.
+//
+// That is not luck. leftIdle runs after this because the connection defers it past the
+// stream layer's handling of the frame that opened the stream — written that way so a
+// stream the table refuses cannot leak a priority nothing will retire, and the override
+// falls out of the same line. See conn.handleStreamFrame.
 func (r *Requests) Headers(s *stream.Stream, fields []h2.Field, endStream bool) error {
 	req, err := request.Parse(s.ID(), fields, endStream)
 	if err != nil {
@@ -237,6 +289,18 @@ func (r *Requests) Headers(s *stream.Stream, fields []h2.Field, endStream bool) 
 		body.end(nil)
 	} else {
 		r.arriving[s.ID()] = &inbound{body: body, declared: req.ContentLength}
+	}
+
+	// Before the goroutine that answers exists, so the first frame of the response is
+	// already scheduled at the urgency the client asked for rather than at the default.
+	//
+	// The zero Params is skipped rather than applied. It means the field was absent —
+	// or present and empty, which §4 of RFC 9218 makes the same thing — and applying it
+	// would put an entry in the scheduler's table saying precisely what the absence of
+	// an entry already says, once per request, under the writer's lock, on the
+	// goroutine that also has to answer the peer's PING frames.
+	if r.prios != nil && req.Priority != (priority.Params{}) {
+		r.prios.Prioritize(s.ID(), req.Priority)
 	}
 
 	r.start(s.ID(), &Request{Request: req, Body: body})

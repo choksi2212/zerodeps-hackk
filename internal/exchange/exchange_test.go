@@ -14,6 +14,7 @@ import (
 	"zerodeps/zdh/internal/frame"
 	"zerodeps/zdh/internal/h2"
 	"zerodeps/zdh/internal/hpack"
+	"zerodeps/zdh/internal/priority"
 	"zerodeps/zdh/internal/request"
 	"zerodeps/zdh/internal/response"
 	"zerodeps/zdh/internal/stream"
@@ -41,8 +42,14 @@ import (
 type collector struct {
 	mu     sync.Mutex
 	frames []frame.Frame
+	prios  []prioritized
 	max    uint32
 	err    error
+
+	// atFirstFrame is how many priority signals had been made when the first frame was
+	// enqueued. Zero also means no frame ever arrived, which no assertion has to tell
+	// apart: every use of it wants a positive number.
+	atFirstFrame int
 }
 
 func (c *collector) Enqueue(f frame.Frame) error {
@@ -50,6 +57,9 @@ func (c *collector) Enqueue(f frame.Frame) error {
 	defer c.mu.Unlock()
 	if c.err != nil {
 		return c.err
+	}
+	if len(c.frames) == 0 {
+		c.atFirstFrame = len(c.prios)
 	}
 	c.frames = append(c.frames, f)
 	return nil
@@ -65,6 +75,39 @@ func (c *collector) MaxFrameSize() uint32 {
 // forget: this double holds no per-stream state, and the frames it has collected are
 // the test's evidence rather than a queue. The real writer drops the stream's priority.
 func (c *collector) Forget(uint32) {}
+
+// Prioritize is the write side being told what a request asked for, kept in order.
+//
+// Under the same mutex as the frames, and for a reason worth stating rather than
+// copying: the real writer is called from every stream goroutine at once, so a double
+// that is only safe from one is a double that reports the next test's race as a pass.
+// This method happens to be called from the reader goroutine alone — which is the
+// property TestThePrioritySignalIsMadeOnTheGoroutineThatDeliveredTheFrame is about — but
+// the double does not get to assume that.
+func (c *collector) Prioritize(id uint32, p priority.Params) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.prios = append(c.prios, prioritized{id: id, params: p})
+}
+
+// prioritized is one call to Prioritize.
+type prioritized struct {
+	id     uint32
+	params priority.Params
+}
+
+func (c *collector) signals() []prioritized {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]prioritized(nil), c.prios...)
+}
+
+// signalsBeforeTheFirstFrame is the ordering question rather than the goroutine one.
+func (c *collector) signalsBeforeTheFirstFrame() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.atFirstFrame
+}
 
 func (c *collector) snapshot() []frame.Frame {
 	c.mu.Lock()
@@ -211,7 +254,21 @@ func newSilentHarness(t *testing.T, h Handler) *harness {
 	return build(t, h, &safeBuf{}, nil)
 }
 
-func build(t *testing.T, h Handler, logs *safeBuf, lg *log.Logger) *harness {
+// newDeafHarness has nowhere to send a priority signal, which is Config.Priorities'
+// documented nil case: a server that reads §5 of RFC 9218's field and declines to act
+// on it, which §10 permits.
+func newDeafHarness(t *testing.T, h Handler) *harness {
+	t.Helper()
+	logs := &safeBuf{}
+	return build(t, h, logs, log.New(logs, "", 0), noPriorities)
+}
+
+// noPriorities is the one option build takes, and it exists because the nil case of an
+// optional dependency is a case worth exercising through the whole path rather than at
+// the constructor.
+func noPriorities(cfg *Config) { cfg.Priorities = nil }
+
+func build(t *testing.T, h Handler, logs *safeBuf, lg *log.Logger, opts ...func(*Config)) *harness {
 	t.Helper()
 
 	out := &collector{max: 16384}
@@ -219,12 +276,18 @@ func build(t *testing.T, h Handler, logs *safeBuf, lg *log.Logger) *harness {
 	sender := flow.NewSender()
 	rep := &reports{}
 
-	reqs := New(Config{
-		Handler: h,
-		Encoder: enc,
-		Credit:  sender,
-		Log:     lg,
-	})
+	cfg := Config{
+		Handler:    h,
+		Encoder:    enc,
+		Credit:     sender,
+		Priorities: out,
+		Log:        lg,
+	}
+	for _, opt := range opts {
+		opt(&cfg)
+	}
+
+	reqs := New(cfg)
 	tab := stream.New(stream.Config{
 		Codec:    hpack.New(),
 		Requests: reqs,
@@ -566,6 +629,199 @@ func TestTheStreamTableSeesTheResponseEnd(t *testing.T) {
 	}
 	if n := h.tab.Len(); n != 0 {
 		t.Errorf("the table holds %d streams, want 0", n)
+	}
+}
+
+// --- the client's own priority signal ---------------------------------------
+
+// RFC 9218 has two carriers and this package handles one of them: §5's Priority header
+// field, which arrives inside the request. The other is a PRIORITY_UPDATE frame on
+// stream 0 and belongs to internal/server, which never sees a decoded header section.
+//
+// What these assert is the hand-off, not the scheduling. Whether a signal reorders
+// anything on the wire is internal/server/scheduler_test.go's question. Whether it is
+// passed on at all, exactly once, with the parameters the client sent, and never for a
+// request that is not going to be answered, is this one.
+
+// priorityRequest is the header section of a GET carrying a Priority field value.
+func priorityRequest(path, field string) []h2.Field {
+	return append(requestFields(path), h2.Field{Name: "priority", Value: field})
+}
+
+func TestARequestsPriorityFieldReachesTheWriteSide(t *testing.T) {
+	h := newHarness(t, serve200("hello"))
+	h.mustSend(h.headers(1, priorityRequest("/1", "u=0, i"), true))
+	h.waitSent(1)
+
+	got := h.out.signals()
+	if len(got) != 1 {
+		t.Fatalf("%d priority signals reached the write side, want 1: %+v", len(got), got)
+	}
+	if got[0].id != 1 {
+		t.Errorf("the signal named stream %d, want 1", got[0].id)
+	}
+	if u := got[0].params.Urgency(); u != 0 {
+		t.Errorf("urgency %d reached the write side, want the 0 the client asked for", u)
+	}
+	if !got[0].params.Incremental() {
+		t.Error("the signal is not incremental, but the client sent i")
+	}
+}
+
+// A field carrying one parameter is still a complete signal, and the parameter it left
+// out has to arrive as its default rather than as nothing. §4 of RFC 9218: "When
+// receiving an HTTP request that does not carry these priority parameters, a server
+// SHOULD act as if their default values were specified."
+func TestAPriorityFieldWithOneParameterResolvesTheOther(t *testing.T) {
+	h := newHarness(t, serve200("hello"))
+	h.mustSend(h.headers(1, priorityRequest("/1", "u=7"), true))
+	h.waitSent(1)
+
+	got := h.out.signals()
+	if len(got) != 1 {
+		t.Fatalf("%d priority signals reached the write side, want 1: %+v", len(got), got)
+	}
+	if u := got[0].params.Urgency(); u != 7 {
+		t.Errorf("urgency %d, want 7", u)
+	}
+	if got[0].params.Incremental() {
+		t.Error("the signal is incremental, but the client named no i and §4.2's default is not")
+	}
+}
+
+// The three shapes that carry no signal, and none of them may reach the write side.
+//
+// A signal that says nothing is not the same as no signal: the write side keeps one
+// entry per stream it has been told about, and an entry meaning "the defaults" says
+// exactly what having no entry already says. Sending one costs a lock on the reader
+// goroutine and a map entry per request, in exchange for nothing.
+//
+// The third shape is the interesting one. An unparseable field value is not a malformed
+// request — internal/request says why — and what it produces is the defaults, which by
+// the rule above is nothing to pass on.
+func TestARequestThatCarriesNoPriorityIsNotSignalled(t *testing.T) {
+	cases := []struct {
+		name   string
+		fields []h2.Field
+	}{
+		{"no field at all", requestFields("/1")},
+		{"an empty field, which is a Dictionary of no members", priorityRequest("/1", "")},
+		{"a field value that does not parse", priorityRequest("/1", "u=??")},
+		{"a field naming only parameters this server does not know", priorityRequest("/1", "q=1")},
+		{"a field whose urgency is out of §4.1's range", priorityRequest("/1", "u=9")},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			h := newHarness(t, serve200("hello"))
+			h.mustSend(h.headers(1, c.fields, true))
+			h.waitSent(1)
+
+			if got := h.out.signals(); len(got) != 0 {
+				t.Errorf("%d priority signals reached the write side, want none: %+v", len(got), got)
+			}
+			if got := h.reply(1).status(); got != "200" {
+				t.Errorf("status %q, want 200: a priority signal is advice and never makes a request bad", got)
+			}
+		})
+	}
+}
+
+// The signal is made on the goroutine that delivered the frame, and that is the fact
+// internal/server's arbitration between the two carriers rests on. conn.leftIdle applies
+// a buffered PRIORITY_UPDATE after the stream layer has handled the frame that opened
+// the stream, so a signal made from here — synchronously, inside HandleFrame — is
+// necessarily the earlier of the two, which is what §7 of RFC 9218 wants: "the most
+// recently received PRIORITY_UPDATE frame can be considered as the most up-to-date
+// information that overrides any other signal."
+//
+// A signal made from the handler's goroutine instead would be a signal racing the frame
+// that is supposed to override it, and it would win about half the time.
+//
+// The handler is parked to prove that: it has entered Serve and cannot proceed, so
+// nothing it does could have produced the call that has already been made.
+func TestThePrioritySignalIsMadeOnTheGoroutineThatDeliveredTheFrame(t *testing.T) {
+	entered, release := make(chan struct{}), make(chan struct{})
+	h := newHarness(t, handlerFunc(func(w *response.Writer, r *Request) {
+		close(entered)
+		<-release
+		_ = w.WriteBodylessHeader([]h2.Field{{Name: ":status", Value: "204"}})
+	}))
+	h.mustSend(h.headers(1, priorityRequest("/1", "u=1"), true))
+
+	<-entered
+	if got := h.out.signals(); len(got) != 1 {
+		t.Errorf("%d priority signals had been made by the time the parked handler was "+
+			"reached, want 1", len(got))
+	}
+	close(release)
+	h.waitSent(1)
+}
+
+// And made before the goroutine that answers exists, which is the other half of the
+// same line's reason for being where it is.
+//
+// A signal made after start is still on the right goroutine and still ahead of any
+// PRIORITY_UPDATE, so the previous test cannot see the difference — but the handler is
+// running by then, and the frame it enqueues first is the header section of the very
+// response the signal was about. Scheduling that one frame at the default urgency is a
+// small wrong answer, and it is one that appears and disappears with the timing of two
+// goroutines, which is the kind worth ruling out by construction.
+func TestThePrioritySignalIsMadeBeforeTheHandlerCanEnqueueAnything(t *testing.T) {
+	h := newHarness(t, serve200("hello"))
+	h.mustSend(h.headers(1, priorityRequest("/1", "u=0"), true))
+	h.waitSent(1)
+
+	if got := h.out.signalsBeforeTheFirstFrame(); got != 1 {
+		t.Errorf("%d priority signals had been made when the response's first frame was "+
+			"enqueued, want 1", got)
+	}
+}
+
+// A malformed request is a stream error and gets no response, so there is nothing to
+// schedule and the write side must not be told about it. A signal for a stream that is
+// about to be reset is an entry the write side would hold until the connection ended:
+// nothing retires a stream that never opened, and nothing would call Forget for it.
+func TestAMalformedRequestCarryingAPriorityFieldIsNotSignalled(t *testing.T) {
+	h := newHarness(t, serve200("hello"))
+
+	// A connection-specific field, which §8.2.2 makes the request malformed. The
+	// Priority field beside it is perfectly good.
+	fields := append(priorityRequest("/1", "u=0"), h2.Field{Name: "connection", Value: "keep-alive"})
+	err := h.send(h.headers(1, fields, true))
+	assertStreamError(t, err, 1, h2.ProtocolError, "a connection-specific field")
+
+	if got := h.out.signals(); len(got) != 0 {
+		t.Errorf("%d priority signals reached the write side for a request that was refused, "+
+			"want none: %+v", len(got), got)
+	}
+}
+
+// Config.Priorities is optional, and the nil case is a whole server rather than a
+// constructor argument: the request is answered, the field is left in Fields for the
+// handler and for the next hop, and nothing is scheduled.
+//
+// §10 of RFC 9218: "Endpoints cannot depend on particular treatment based on priority
+// signals." Which is what makes this conformant rather than broken.
+func TestARequestIsAnsweredWithNowhereToSendItsPriority(t *testing.T) {
+	var carried string
+	h := newDeafHarness(t, handlerFunc(func(w *response.Writer, r *Request) {
+		carried = value(r.Fields, "priority")
+		_ = w.WriteBodylessHeader([]h2.Field{{Name: ":status", Value: "204"}})
+	}))
+	h.mustSend(h.headers(1, priorityRequest("/1", "u=0, i"), true))
+	h.waitSent(1)
+
+	if got := h.reply(1).status(); got != "204" {
+		t.Errorf("status %q, want 204", got)
+	}
+	if carried != "u=0, i" {
+		t.Errorf("the handler saw a Priority field of %q, want the client's %q: §5 of RFC 9218 "+
+			"makes it an end-to-end signal, so it is not this server's to strip", carried, "u=0, i")
+	}
+	if got := h.out.signals(); len(got) != 0 {
+		t.Errorf("%d priority signals reached the write side, want none: this harness has "+
+			"nowhere to send them: %+v", len(got), got)
 	}
 }
 

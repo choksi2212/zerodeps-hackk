@@ -29,22 +29,22 @@ type connSocket interface {
 	Close() error
 }
 
-// ConnWriter is the connection's write half as a stream sees it: two methods, one
-// that hands a frame to the writer goroutine and one that reports the largest
-// payload the peer is willing to receive.
+// ConnWriter is the connection's write half as everything above it sees it: four
+// methods, and not one of them about the connection's own lifetime.
 //
 // It is deliberately narrower than *frameWriter, which also flushes, shuts down and
 // waits. Those belong to the connection's own lifecycle — a stream goroutine
 // calling Shutdown mid-request would take every other stream's reply down with it —
-// and these two are the only methods on the writer that are safe to call from every
-// stream goroutine at once.
+// and these four are the ones that are safe to call from every stream goroutine at
+// once.
 //
-// Both are needed to write one response. §4.2 caps a frame's payload at the peer's
-// SETTINGS_MAX_FRAME_SIZE, so the layer that turns a header list into HEADERS and
-// CONTINUATION frames has to know the cap before it can decide where to split, and
-// the cap is the connection's rather than the stream's — a stream that read it from
-// its own copy would send an oversized frame the first time the peer raised or
-// lowered it mid-connection.
+// The first two are what writing one response takes. §4.2 caps a frame's payload at
+// the peer's SETTINGS_MAX_FRAME_SIZE, so the layer that turns a header list into
+// HEADERS and CONTINUATION frames has to know the cap before it can decide where to
+// split, and the cap is the connection's rather than the stream's — a stream that read
+// it from its own copy would send an oversized frame the first time the peer raised or
+// lowered it mid-connection. The other two are the write side's memory of what a stream
+// is worth: see Prioritize and Forget.
 type ConnWriter interface {
 	// Enqueue hands f to the writer goroutine. It returns when the frame is queued,
 	// not when it reaches the wire, and it fails only once the write half is
@@ -68,6 +68,20 @@ type ConnWriter interface {
 	// written, which is required rather than merely tolerated — the frame that closed
 	// the stream is one of them. See frameWriter.Forget.
 	Forget(id uint32)
+
+	// Prioritize is the client's priority signal for stream id: a complete set of
+	// parameters, replacing whatever the write side was told before.
+	//
+	// Here for the sake of the other carrier. RFC 9218 has two — the Priority field of
+	// the request (§5) and the PRIORITY_UPDATE frame (§7) — and only the frame belongs
+	// to this package. The field is part of a header section, which this package never
+	// decodes, so the layer that does decode one needs a way to reach the writer, and
+	// this is it. The frame reaches the same method directly.
+	//
+	// Together with Forget these are the two ends of the write side's per-stream
+	// priority memory: one call puts an entry in and one takes it out, and both are on
+	// this interface because neither moment is visible from inside this package.
+	Prioritize(id uint32, p priority.Params)
 }
 
 // StreamHandler receives the frames that belong to a stream rather than to the

@@ -1542,6 +1542,53 @@ func (h *openingHandler) HandleFrame(f frame.Frame) error {
 	return h.recordingHandler.HandleFrame(f)
 }
 
+// signallingHandler is internal/exchange as this file needs it: a stream handler that
+// makes a priority signal from inside HandleFrame, which is what a request carrying §5 of
+// RFC 9218's Priority header field produces.
+//
+// The real one decodes a header section to find the field and parses it. This one is told
+// what the field said, because the question here is when the call happens relative to a
+// PRIORITY_UPDATE and not what produced it — and a double that had to encode HPACK to
+// state a priority would be testing internal/hpack.
+//
+// The signal is made after the embedded handler has taken the frame, which is the order
+// the real layers run in: the stream table opens the stream and then delivers the header
+// section to the request layer.
+type signallingHandler struct {
+	openingHandler
+
+	// w is filled in by capturing when the connection is built, because a handler
+	// cannot be handed the write half of a connection that does not exist yet.
+	w ConnWriter
+
+	// field is what the request's Priority field said.
+	field priority.Params
+
+	// signalled is how many signals this double made. Written from the connection's
+	// reader goroutine and read after awaitServe, by which time Serve has returned and
+	// that goroutine is finished.
+	signalled int
+}
+
+func (h *signallingHandler) HandleFrame(f frame.Frame) error {
+	if err := h.openingHandler.HandleFrame(f); err != nil {
+		return err
+	}
+	if _, ok := f.(frame.HeadersFrame); ok {
+		h.signalled++
+		h.w.Prioritize(f.Stream(), h.field)
+	}
+	return nil
+}
+
+// capturing is the per-connection factory for a handler that needs the write half.
+func capturing(h *signallingHandler) func(ConnWriter) StreamHandler {
+	return func(w ConnWriter) StreamHandler {
+		h.w = w
+		return h
+	}
+}
+
 // priorityOf is what a connection's scheduler was told about a stream.
 //
 // Reaching into the write half is the assertion these tests want, because the effect of
@@ -1580,10 +1627,18 @@ func assertNotPrioritized(t *testing.T, c *conn, id uint32, why string) {
 // goroutine left to race for either.
 func prioritized(t *testing.T, h StreamHandler, frames ...frame.Frame) (*conn, *testSocket, error) {
 	t.Helper()
+	return prioritizedThrough(t, always(h), frames...)
+}
+
+// prioritizedThrough is prioritized for a handler that needs the connection's write half,
+// which it cannot be given until the connection exists. One test needs that; the rest are
+// better off not naming a factory.
+func prioritizedThrough(t *testing.T, mk func(ConnWriter) StreamHandler, frames ...frame.Frame) (*conn, *testSocket, error) {
+	t.Helper()
 	ts := newTestSocket(&testTarget{}).
 		script(append(clientHello(t), encodeFrames(t, frames...)...)).
 		atEOF()
-	c := newConn(ts, always(h), testTimeouts())
+	c := newConn(ts, mk, testTimeouts())
 	return c, ts, awaitServe(t, serveInBackground(c))
 }
 
@@ -1941,6 +1996,87 @@ func TestServeOpeningAStreamRestoresRoomToPrioritize(t *testing.T) {
 	if got, held := priorityOf(t, c, highest); !held || got != want {
 		t.Errorf("the scheduler was told %q (held=%v) for the stream that opened, want %q",
 			got.Field(), held, want.Field())
+	}
+}
+
+// TestServeLetsAPriorityUpdateOverrideTheRequestsOwnPriorityField is §7 of RFC 9218's
+// arbitration between the two carriers, and the demonstration that this server needs no
+// arbitration code to get it right.
+//
+// §7 of RFC 9218: "To solve this condition, for the purposes of scheduling, the most
+// recently received PRIORITY_UPDATE frame can be considered as the most up-to-date
+// information that overrides any other signal."
+//
+// Nothing here compares the two signals, timestamps them, or remembers which is which.
+// Both reach the write half from this connection's reader goroutine, and the frame's call
+// is placed after the field's by construction: handleStreamFrame defers leftIdle past the
+// stream layer, so a buffered frame is applied only after the HEADERS that opened the
+// stream has been all the way through the handler — which is where the request layer
+// signals the field. A frame that arrives later needs no help at all.
+//
+// The first case is the one that would quietly stop being true if that defer were moved,
+// and it is the case a client actually produces: §7 of RFC 9218 lets a PRIORITY_UPDATE be
+// sent before its stream is open, so a client that reprioritizes as it queues requests
+// sends the frame first and the request second. Applying the buffered signal before the
+// header section reached the request layer would let the field it is supposed to override
+// overwrite it, on every such stream, with nothing on the wire to say so.
+//
+// The third case is what stops the other two from passing on a server that ignores the
+// field entirely. It is also §5 of RFC 9218 working: "It is an end-to-end signal that
+// indicates the endpoint's view of how HTTP responses should be prioritized."
+func TestServeLetsAPriorityUpdateOverrideTheRequestsOwnPriorityField(t *testing.T) {
+	field := priority.Params{}.WithUrgency(7).WithIncremental(true)
+	sent := priority.Params{}.WithUrgency(0)
+
+	headers := frame.HeadersFrame{StreamID: 1, EndHeaders: true, Fragment: []byte("x")}
+	update := frame.PriorityUpdateFrame{PrioritizedStreamID: 1, Field: sent.Field()}
+
+	for _, tc := range []struct {
+		name   string
+		script []frame.Frame
+		want   priority.Params
+		why    string
+	}{
+		{
+			name:   "the frame arrived before the request and was buffered",
+			script: []frame.Frame{update, headers},
+			want:   sent,
+			why: "a buffered frame is applied after the request layer has read the " +
+				"field, so it overrides it",
+		},
+		{
+			name:   "the frame arrived after the request",
+			script: []frame.Frame{headers, update},
+			want:   sent,
+			why:    "the frame is the most recently received signal",
+		},
+		{
+			name:   "no frame contradicted it",
+			script: []frame.Frame{headers},
+			want:   field,
+			why:    "the request's own field is the only signal the client sent",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := &signallingHandler{field: field}
+			c, ts, err := prioritizedThrough(t, capturing(h), tc.script...)
+			if err != nil {
+				t.Fatalf("Serve: %v", err)
+			}
+			noGoAwayIn(t, peerSaw(t, ts))
+
+			if h.signalled != 1 {
+				t.Fatalf("the request layer made %d priority signals, want 1: this test "+
+					"means nothing unless the field reached the write half", h.signalled)
+			}
+			if got, held := priorityOf(t, c, 1); !held || got != tc.want {
+				t.Errorf("the scheduler was told %q (held=%v), want %q: %s",
+					got.Field(), held, tc.want.Field(), tc.why)
+			}
+			if n := c.pending.Len(); n != 0 {
+				t.Errorf("%d signals are still buffered, want 0", n)
+			}
+		})
 	}
 }
 

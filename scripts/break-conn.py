@@ -644,7 +644,10 @@ BREAKS = [
         """		c.leftIdle(id)
 	}
 	return c.handler.HandleFrame(f)""",
-        ["TestServeBuffersAPriorityUpdateUntilTheStreamOpens"],
+        [
+            "TestServeBuffersAPriorityUpdateUntilTheStreamOpens",
+            "TestServeLetsAPriorityUpdateOverrideTheRequestsOwnPriorityField",
+        ],
     ),
     (
         "leftIdle: a refused stream's buffered priority is applied, and nothing will ever forget it",
