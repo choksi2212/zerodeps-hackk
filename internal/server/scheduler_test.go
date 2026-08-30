@@ -772,6 +772,24 @@ func TestSchedulerSetPriorityToTheSameValueChangesNothing(t *testing.T) {
 		t.Errorf("order = %q, want %q", got, want)
 	}
 	assertDrained(t, s)
+
+	// Once more with one stream repeating itself rather than both, which is the shape
+	// the assertion above cannot see: re-signalling every participant in turn is a full
+	// rotation of the ring and leaves it where it started, so a scheduler that spent a
+	// turn on every repeat would pass anyway. One repeat is what a client sending the
+	// same PRIORITY_UPDATE for one stream does.
+	s = newScheduler()
+	for _, id := range []uint32{1, 3} {
+		s.SetPriority(id, incremental(3))
+	}
+	pushAll(s, dataOn(1, "1a"), dataOn(1, "1b"), dataOn(3, "3a"), dataOn(3, "3b"))
+
+	s.SetPriority(1, incremental(3))
+
+	if got := popAll(t, s); got != want {
+		t.Errorf("after one stream repeated its signal, order = %q, want %q", got, want)
+	}
+	assertDrained(t, s)
 }
 
 // TestSchedulerSetPriorityForStreamZeroIsIgnored guards the sentinel. A
@@ -1139,13 +1157,18 @@ func TestSchedulerDoesNotGrowOverAConnectionsLife(t *testing.T) {
 	for i := range uint32(rounds) {
 		id := 1 + 2*(i%64)
 		s.SetPriority(id, incremental(int(i%8)))
-		s.Push(headersOn(id, true, "h"))
+		s.Push(headersOn(id, false, "h"))
+		s.Push(contOn(id, true, "c"))
 		s.Push(dataOn(id, "d"))
 		s.Push(frame.RSTStreamFrame{StreamID: id, ErrCode: h2.NoError})
 		s.Push(ping(uint64(i)))
-		// The PING is last because it was pushed last, and the DATA precedes the
-		// RST_STREAM because the reset closes the stream it belongs to.
-		want := fmt.Sprintf("h d rst%d ping%d", id, i)
+		// The header section is spread over two frames so that runs is exercised as
+		// well: it is the one map here that a completed block has to be taken out of,
+		// and a connection whose responses have large header sections would otherwise
+		// leave an entry per stream behind. The PING is last because it was pushed
+		// last, and the DATA precedes the RST_STREAM because the reset closes the
+		// stream it belongs to.
+		want := fmt.Sprintf("h c d rst%d ping%d", id, i)
 		if got := popAll(t, s); got != want {
 			t.Fatalf("round %d order = %q, want %q", i, got, want)
 		}
