@@ -61,6 +61,11 @@ func (c *collector) MaxFrameSize() uint32 {
 	return c.max
 }
 
+// Forget is the stream layer reporting a retirement, and there is nothing here to
+// forget: this double holds no per-stream state, and the frames it has collected are
+// the test's evidence rather than a queue. The real writer drops the stream's priority.
+func (c *collector) Forget(uint32) {}
+
 func (c *collector) snapshot() []frame.Frame {
 	c.mu.Lock()
 	defer c.mu.Unlock()

@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"zerodeps/zdh/internal/frame"
+	"zerodeps/zdh/internal/priority"
 )
 
 // writeTarget is the write half of a connection: somewhere to put octets, with a
@@ -237,6 +238,50 @@ func (w *frameWriter) stopped() error {
 		return errWriterStopped
 	}
 	return nil
+}
+
+// Prioritize records the peer's priority signal for a stream, which is how a
+// PRIORITY_UPDATE frame reaches the scheduler (§7 of RFC 9218).
+//
+// Called from the connection's reader goroutine while stream goroutines sit in
+// Enqueue and the writer goroutine may be part-way through a burst. It takes the
+// same mutex they do, so a reprioritisation lands between two frames and never
+// inside one: the scheduler's own guarantee that a field block is contiguous is not
+// something a caller here has to know about.
+//
+// Nothing is broadcast, unlike Enqueue. Moving a stream's queued DATA into another
+// band changes which frame is next but not whether there is one, so no goroutine
+// waiting on this writer has anything new to wake for — a full queue is still full
+// and an empty one is still empty.
+//
+// No error, and no report of whether anything moved. §10 of RFC 9218: "Endpoints
+// cannot depend on particular treatment based on priority signals." A signal for a
+// stream with nothing queued is remembered for the DATA that has not been produced
+// yet, and a signal for a stream that has stopped producing DATA is remembered
+// until Forget; neither is a failure a caller could act on.
+func (w *frameWriter) Prioritize(id uint32, p priority.Params) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.sched.SetPriority(id, p)
+}
+
+// Forget drops what the scheduler remembers about a stream's priority.
+//
+// This is the only bound on that table, which is why it is on ConnWriter rather
+// than left to this package: a connection that serves a million requests must not
+// remember a million priority signals, and the only layer that knows a stream is
+// over is the one holding the stream table. internal/stream calls this where a
+// stream leaves that table, alongside retiring the stream's send window.
+//
+// Frames already queued for the stream are untouched and still written. A stream
+// closes because this server sent END_STREAM or RST_STREAM, and at the moment it
+// closes that frame is in this queue — dropping the queue would truncate the
+// response that did the closing. The frames that are already classified stay
+// classified; see scheduler.Forget.
+func (w *frameWriter) Forget(id uint32) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.sched.Forget(id)
 }
 
 // Shutdown asks the writer to write what is already queued and then stop. It does

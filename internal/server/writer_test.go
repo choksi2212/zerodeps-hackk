@@ -13,6 +13,7 @@ import (
 
 	"zerodeps/zdh/internal/frame"
 	"zerodeps/zdh/internal/h2"
+	"zerodeps/zdh/internal/priority"
 )
 
 // gateWait bounds every wait in this file. A test that hangs tells you nothing
@@ -608,6 +609,212 @@ func TestFrameWriterAdmitsAContinuationForAFullQueue(t *testing.T) {
 	letPriming(nil)
 	if err := waitStopped(t, w, tt); err != nil {
 		t.Errorf("Wait: %v", err)
+	}
+}
+
+// --- priority ----------------------------------------------------------------
+//
+// dataOn, urgency and incremental are in scheduler_test.go, where the ordering rules
+// they express are tested directly. This section is about the two methods that carry a
+// priority signal from the connection into that scheduler, so it asserts on the octets
+// the peer receives rather than on the structure.
+
+// dataStreams is the stream identifier of each DATA frame the target received, in
+// order, with everything else dropped.
+//
+// The order is the whole assertion in this section, and DATA is the only thing the
+// scheduler reorders — so a priming PING that would otherwise have to be filtered by
+// hand in each test is filtered here instead.
+func dataStreams(t *testing.T, tt *testTarget) []uint32 {
+	t.Helper()
+	var ids []uint32
+	for _, f := range framesWritten(t, tt, frame.ReaderConfig{}) {
+		if f.Type() == frame.TypeData {
+			ids = append(ids, f.Stream())
+		}
+	}
+	return ids
+}
+
+// TestFrameWriterPrioritizeReordersTheQueue is the path a PRIORITY_UPDATE frame
+// travels: the connection's reader goroutine parses one and calls this, and the effect
+// has to be visible in the octets a stream goroutine's frames leave in.
+//
+// The gate is what makes it deterministic rather than probable. While the writer is
+// parked inside the priming write the queue is known to hold both DATA frames, so the
+// order they come out in is the scheduler's decision and not a race between two
+// Enqueue calls and a drain.
+//
+// Stream 3 is enqueued second and written first, which is the reordering §10 of RFC
+// 9218 asks for: "It is RECOMMENDED that, when possible, servers respect the urgency
+// parameter (Section 4.1), sending higher-urgency responses before lower-urgency
+// responses."
+func TestFrameWriterPrioritizeReordersTheQueue(t *testing.T) {
+	tt := newGatedTarget()
+	w := startFrameWriter(tt, time.Second)
+
+	if err := w.Enqueue(ping(0)); err != nil {
+		t.Fatalf("Enqueue priming frame: %v", err)
+	}
+	letPriming := tt.awaitWrite(t)
+
+	w.Prioritize(3, urgency(0))
+	for _, f := range []frame.Frame{dataOn(1, "one"), dataOn(3, "three")} {
+		if err := w.Enqueue(f); err != nil {
+			t.Fatalf("Enqueue DATA on stream %d: %v", f.Stream(), err)
+		}
+	}
+	letPriming(nil)
+	tt.awaitWrite(t)(nil)
+
+	w.Shutdown()
+	if err := waitStopped(t, w, tt); err != nil {
+		t.Fatalf("Wait: %v", err)
+	}
+
+	want := []uint32{3, 1}
+	if got := dataStreams(t, tt); !reflect.DeepEqual(got, want) {
+		t.Errorf("DATA reached the peer on streams %v, want %v: stream 3 was prioritized "+
+			"at urgency 0 and stream 1 is at the default of %d",
+			got, want, priority.DefaultUrgency)
+	}
+}
+
+// TestFrameWriterForgetDropsThePriorityItWasGiven is the bound on the only per-stream
+// table the write half keeps. A Forget that dropped nothing would leak one entry per
+// request for the life of the connection, and nothing on the wire would say so — which
+// is why the assertion is made on the wire instead, through the next response on the
+// same identifier.
+//
+// The two rounds are what make that assertion mean something. Round one is the control:
+// the same two Enqueue calls in the same order come out reordered, so the signal is
+// demonstrably in effect. Round two repeats them after a Forget and they come out in
+// the order stream identifiers ask for, which they could only do if the entry were
+// gone. Without round one this test would pass on a writer whose Prioritize did nothing
+// at all.
+//
+// Identifiers are reused across the rounds on purpose. A real connection never does
+// that — §5.1.1 of RFC 9113 forbids it — but the scheduler is keyed by identifier and
+// reusing one is the only way to ask it about an entry that should not be there.
+func TestFrameWriterForgetDropsThePriorityItWasGiven(t *testing.T) {
+	tt := newGatedTarget()
+	w := startFrameWriter(tt, time.Second)
+
+	if err := w.Enqueue(ping(0)); err != nil {
+		t.Fatalf("Enqueue priming frame: %v", err)
+	}
+	letPriming := tt.awaitWrite(t)
+
+	w.Prioritize(3, urgency(0))
+	for _, f := range []frame.Frame{dataOn(1, "one"), dataOn(3, "three")} {
+		if err := w.Enqueue(f); err != nil {
+			t.Fatalf("round 1: Enqueue DATA on stream %d: %v", f.Stream(), err)
+		}
+	}
+	letPriming(nil)
+
+	// The burst carrying round one is in progress, so both streams' queues are empty
+	// again and the priority table is all that is left of them. This is where a stream
+	// closing lands: internal/stream retires it and the retirement reaches Forget.
+	letRound1 := tt.awaitWrite(t)
+	w.Forget(3)
+	for _, f := range []frame.Frame{dataOn(1, "four"), dataOn(3, "two")} {
+		if err := w.Enqueue(f); err != nil {
+			t.Fatalf("round 2: Enqueue DATA on stream %d: %v", f.Stream(), err)
+		}
+	}
+	letRound1(nil)
+	tt.awaitWrite(t)(nil)
+
+	w.Shutdown()
+	if err := waitStopped(t, w, tt); err != nil {
+		t.Fatalf("Wait: %v", err)
+	}
+
+	// Round two in ascending identifier order is §10 of RFC 9218's rule for one band:
+	// "Non-incremental responses of the same urgency SHOULD be served by prioritizing
+	// bandwidth allocation in ascending order of the stream ID, which corresponds to
+	// the order in which clients make requests."
+	want := []uint32{3, 1, 1, 3}
+	if got := dataStreams(t, tt); !reflect.DeepEqual(got, want) {
+		t.Errorf("DATA reached the peer on streams %v, want %v: the first two are the "+
+			"control and the last two are after Forget, where stream 3 is back at the "+
+			"default urgency of %d", got, want, priority.DefaultUrgency)
+	}
+}
+
+// TestFrameWriterForgetKeepsTheFramesAlreadyQueued is the property that makes Forget
+// safe to call from a stream's retirement rather than after it.
+//
+// A stream closes because this server sent END_STREAM or RST_STREAM, and at the moment
+// it closes that frame is in this queue. A Forget that dropped the stream's queued
+// frames would therefore truncate the very response that closed the stream — turning a
+// bound on a map into lost content, which is the worse of the two failures by a long
+// way.
+func TestFrameWriterForgetKeepsTheFramesAlreadyQueued(t *testing.T) {
+	tt := newGatedTarget()
+	w := startFrameWriter(tt, time.Second)
+
+	if err := w.Enqueue(ping(0)); err != nil {
+		t.Fatalf("Enqueue priming frame: %v", err)
+	}
+	letPriming := tt.awaitWrite(t)
+
+	body := frame.DataFrame{StreamID: 1, Data: []byte("content"), EndStream: true}
+	if err := w.Enqueue(body); err != nil {
+		t.Fatalf("Enqueue the closing DATA frame: %v", err)
+	}
+	w.Forget(1)
+	letPriming(nil)
+	tt.awaitWrite(t)(nil)
+
+	w.Shutdown()
+	if err := waitStopped(t, w, tt); err != nil {
+		t.Fatalf("Wait: %v", err)
+	}
+
+	want := []uint32{1}
+	if got := dataStreams(t, tt); !reflect.DeepEqual(got, want) {
+		t.Fatalf("DATA reached the peer on streams %v, want %v: Forget dropped the frame "+
+			"that closed the stream", got, want)
+	}
+	for _, f := range framesWritten(t, tt, frame.ReaderConfig{}) {
+		if d, ok := f.(frame.DataFrame); ok && !bytes.Equal(d.Data, body.Data) {
+			t.Errorf("the DATA frame carried %q, want %q", d.Data, body.Data)
+		}
+	}
+}
+
+// TestFrameWriterPrioritizeAfterTheLoopDiesIsHarmless covers the call this server
+// cannot avoid making. A connection whose socket has failed still runs its stream
+// table down, and retiring a stream calls Forget — so both of these are reached on a
+// writer that has already stopped, and neither may panic or wait for a loop that is
+// never coming back.
+//
+// The timeout is the assertion. A mutex the dead loop failed to release turns both
+// calls into a hang, and a hang here is a connection goroutine that never exits.
+func TestFrameWriterPrioritizeAfterTheLoopDiesIsHarmless(t *testing.T) {
+	errBoom := errors.New("connection reset by peer")
+	tt := &testTarget{writeErr: errBoom}
+	w := startFrameWriter(tt, time.Second)
+
+	if err := w.Enqueue(ping(0)); err != nil {
+		t.Fatalf("Enqueue the frame that kills the loop: %v", err)
+	}
+	if err := waitStopped(t, w, tt); !errors.Is(err, errBoom) {
+		t.Fatalf("Wait = %v, want %v", err, errBoom)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		w.Prioritize(1, urgency(0))
+		w.Forget(1)
+	}()
+	select {
+	case <-done:
+	case <-time.After(gateWait):
+		t.Fatalf("Prioritize and Forget did not return within %v on a stopped writer", gateWait)
 	}
 }
 
@@ -1265,6 +1472,95 @@ func TestFrameWriterSurvivesConcurrentEnqueue(t *testing.T) {
 	for g := 0; g < senders; g++ {
 		for i := 0; i < each; i++ {
 			want := ping(uint64(g)<<32 | uint64(i)).Data
+			if n := seen[want]; n != 1 {
+				t.Errorf("frame from sender %d sequence %d arrived %d times, want once", g, i, n)
+			}
+		}
+	}
+}
+
+// TestFrameWriterSurvivesConcurrentPrioritize is the same invariant against the second
+// caller this type has. Prioritize and Forget are called from the connection's reader
+// goroutine while every stream goroutine is in Enqueue, so the scheduler — which holds
+// no lock of its own and says so — is being mutated from two directions at once.
+//
+// The assertion is a multiset rather than an order, which is the honest one: the order
+// is what the priority signals are asking to change, and a test that pinned it would be
+// asserting a schedule nobody promised. What must survive is every frame, exactly once
+// and decodable, because a lost frame is a truncated response and a torn one desynchronises
+// the peer for good. The rest is the race detector's, and it runs over this package in
+// the gate.
+//
+// The signals themselves are deliberately hostile: every urgency, both kinds of
+// participant, and a Forget arriving while the stream still has frames coming — which is
+// not a sequence a correct peer produces, and is exactly the sequence that moves a stream
+// between rings while another goroutine is appending to its queue.
+func TestFrameWriterSurvivesConcurrentPrioritize(t *testing.T) {
+	const senders, each = 8, 64
+	tt := &testTarget{}
+	w := startFrameWriter(tt, 10*time.Second)
+
+	// streamOf spreads the senders over odd identifiers, the way §5.1.1 of RFC 9113
+	// says a client's streams arrive.
+	streamOf := func(g int) uint32 { return uint32(2*g + 1) }
+
+	var wg sync.WaitGroup
+	for g := 0; g < senders; g++ {
+		wg.Add(1)
+		go func(g int) {
+			defer wg.Done()
+			for i := 0; i < each; i++ {
+				f := frame.DataFrame{StreamID: streamOf(g), Data: []byte{byte(g), byte(i)}}
+				if err := w.Enqueue(f); err != nil {
+					t.Errorf("sender %d frame %d: Enqueue: %v", g, i, err)
+					return
+				}
+			}
+		}(g)
+	}
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < senders*each; i++ {
+			id := streamOf(i % senders)
+			w.Prioritize(id, urgency(i%numBands).WithIncremental(i%2 == 0))
+			if i%16 == 0 {
+				w.Forget(id)
+			}
+		}
+	}()
+
+	// Every sender is finished before the shutdown, for the reason
+	// TestFrameWriterSurvivesConcurrentEnqueue gives: Enqueue after a Shutdown is
+	// refused by design, and a test that raced the two would be asserting that frames
+	// it never handed over went missing.
+	wg.Wait()
+
+	w.Shutdown()
+	if err := waitStopped(t, w, tt); err != nil {
+		t.Fatalf("Wait: %v", err)
+	}
+
+	got := framesWritten(t, tt, frame.ReaderConfig{})
+	if len(got) != senders*each {
+		t.Fatalf("read back %d frames, want %d", len(got), senders*each)
+	}
+	type payload struct {
+		id   uint32
+		body string
+	}
+	seen := make(map[payload]int, len(got))
+	for i, f := range got {
+		d, ok := f.(frame.DataFrame)
+		if !ok {
+			t.Fatalf("frame %d is a %s, want DATA", i, f.Type())
+		}
+		seen[payload{d.StreamID, string(d.Data)}]++
+	}
+	for g := 0; g < senders; g++ {
+		for i := 0; i < each; i++ {
+			want := payload{streamOf(g), string([]byte{byte(g), byte(i)})}
 			if n := seen[want]; n != 1 {
 				t.Errorf("frame from sender %d sequence %d arrived %d times, want once", g, i, n)
 			}

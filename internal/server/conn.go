@@ -11,6 +11,7 @@ import (
 	"zerodeps/zdh/internal/frame"
 	"zerodeps/zdh/internal/h2"
 	"zerodeps/zdh/internal/limits"
+	"zerodeps/zdh/internal/priority"
 )
 
 // connSocket is one connection: both halves, both deadlines, and the close.
@@ -53,6 +54,20 @@ type ConnWriter interface {
 	// MaxFrameSize is the peer's SETTINGS_MAX_FRAME_SIZE, never below §6.5.2's
 	// 16384. It may change between two calls: see frameWriter.MaxFrameSize.
 	MaxFrameSize() uint32
+
+	// Forget says stream id is over and nothing further will be sent on it, so
+	// whatever the write side remembers about it may be dropped.
+	//
+	// It is here rather than inside this package because the write side remembers a
+	// stream's priority for as long as the stream might still produce DATA, and only
+	// the layer holding the stream table knows when that stops. Without this call
+	// that memory is unbounded: one entry per prioritized stream, for the life of a
+	// connection that may serve a million requests.
+	//
+	// It is not a cancellation. Frames already queued for the stream are still
+	// written, which is required rather than merely tolerated — the frame that closed
+	// the stream is one of them. See frameWriter.Forget.
+	Forget(id uint32)
 }
 
 // StreamHandler receives the frames that belong to a stream rather than to the
@@ -76,6 +91,34 @@ type ConnWriter interface {
 // server to be constructible from outside it.
 type StreamHandler interface {
 	HandleFrame(f frame.Frame) error
+
+	// Live reports whether stream id exists: open, or half-closed in either
+	// direction. An identifier that is idle or closed is not live, and §5.1 of RFC
+	// 9113 makes those the only five states there are.
+	//
+	// Len is how many streams count towards SETTINGS_MAX_CONCURRENT_STREAMS
+	// (§5.1.2), which is the same set: this connection advertised a number, and this
+	// is what that number is measured against.
+	//
+	// Both are here for PRIORITY_UPDATE, and they are the smallest questions that
+	// frame's two rules can be asked in. §7.1 of RFC 9218 caps the streams that have
+	// been prioritized but remain idle plus the active streams at
+	// SETTINGS_MAX_CONCURRENT_STREAMS, which needs the second; and §7 makes a signal
+	// for a stream that does not exist yet something to buffer rather than apply,
+	// which needs the first. Neither can be answered from this file — a connection
+	// that kept its own count of open streams would be keeping a second copy of the
+	// stream table's most important number, and the copy would be the one that was
+	// wrong.
+	//
+	// Queries rather than notifications, and that is the direction that matters: this
+	// interface is what the connection asks the stream layer, so the stream layer
+	// needs to know nothing about priority at all.
+	//
+	// Called only from the connection's reader goroutine, which is the same goroutine
+	// HandleFrame is called from, so an implementation needs no more locking for these
+	// than it has already.
+	Live(id uint32) bool
+	Len() int
 
 	// ConnWindowUpdate applies a stream-0 WINDOW_UPDATE (§6.9).
 	//
@@ -247,12 +290,21 @@ type conn struct {
 	// field's zero value and the value the RFC gives a connection where it never
 	// arrives — the absence needs no special case.
 	//
-	// Nothing is scheduled on it, and nothing will be. This server ignores RFC 9113
-	// priority signals from every peer, which §2.1 permits because it says so in its
-	// own SETTINGS, so the value changes no behaviour here. It is remembered because
-	// §2.1 forbids the peer to change it, and a rule about a value changing needs the
-	// value it changed from.
+	// Nothing is scheduled on it, and nothing will be. This server ignores RFC 9113's
+	// priority signals from every peer whatever this says, which §2.1 permits because
+	// this server sends SETTINGS_NO_RFC7540_PRIORITIES itself, so the value changes no
+	// behaviour here. What it does not mean is that priority changes nothing: RFC
+	// 9218's own signal, PRIORITY_UPDATE, is read below and does reach the scheduler.
+	// This field is about the scheme that replaced it, and it is remembered because
+	// §2.1 forbids the peer to change the value — and a rule about a value changing
+	// needs the value it changed from.
 	peerNoRFC7540Priorities bool
+
+	// pending holds the priorities of streams a client has prioritized before
+	// opening, which §7 of RFC 9218 asks a server to buffer and apply at open. It is
+	// this goroutine's alone, like every field above; see handlePriorityUpdate for the
+	// rule that bounds it and internal/priority.Pending for why that rule is enough.
+	pending priority.Pending
 
 	// lastStreamID is the highest stream identifier this connection has
 	// dispatched, which is what a GOAWAY has to carry: §6.8 makes it the promise
@@ -935,20 +987,52 @@ func (c *conn) handleConnectionWindowUpdate(f frame.WindowUpdateFrame) error {
 	return c.handler.ConnWindowUpdate(f.Increment)
 }
 
-// handlePriorityUpdate takes a client's extensible-priority signal (RFC 9218 §7.1).
+// handlePriorityUpdate takes a client's extensible-priority signal (RFC 9218 §7.1)
+// and gives it to the scheduler.
 //
 // Absorbed at this level for the same reason a stream-0 WINDOW_UPDATE is: the frame
 // arrives on the connection, so there is no stream to hand it to. It is a stronger
 // reason here, because §7 makes it legal for the stream the frame names not to exist
 // yet — so the stream table is not where this frame's rules live even in principle.
 //
-// One of the two rules §7.1 gives a server is enforced, and it is enforced by what
-// this server is rather than by any state it keeps. The other is satisfied for the
-// same kind of reason: §7.1 requires the number of streams that have been prioritized
-// but remain idle, plus the number of active streams, not to exceed
-// SETTINGS_MAX_CONCURRENT_STREAMS — and this connection remembers no priorities, so
-// that number is the active streams alone, which internal/stream already bounds by
-// the value we advertised. A rule cannot be broken by a count that cannot rise.
+// # Three destinations, decided by one state
+//
+// §5.1 of RFC 9113 gives a stream five states, and §7.1 of RFC 9218 wants a different
+// answer for three groups of them. A live stream — open, or half-closed in either
+// direction — is prioritized now. An idle stream is buffered until it opens, because
+// §7 of RFC 9218 says so: "A client MAY send a PRIORITY_UPDATE frame before the
+// stream that it references is open (except for HTTP/2 push streams; see Section
+// 7.1)." And a closed stream is discarded, which §7.1 of RFC 9218 permits in as many
+// words: "Servers can discard frames where the prioritized stream ID refers to a
+// stream in the 'half-closed (local)' or 'closed' state (i.e., streams where no
+// further data will be sent)."
+//
+// Half-closed (local) is in that sentence and is treated as live here, which is the
+// one place this function is more generous than it has to be. The frame is applied to
+// a stream that will send no more DATA, so applying it changes nothing on the wire —
+// but it costs one map entry that the stream's retirement drops anyway, and buying the
+// distinction would mean asking the stream layer which half of half-closed it is in.
+// A discard this server is permitted to make is not worth an interface method.
+//
+// # What bounds the buffer
+//
+// §7.1 of RFC 9218: "The number of streams that have been prioritized but remain in
+// the 'idle' state plus the number of active streams (those in the 'open' state or in
+// either of the 'half-closed' states; see Section 5.1.2 of [HTTP/2]) MUST NOT exceed
+// the value of the SETTINGS_MAX_CONCURRENT_STREAMS parameter. Servers that receive
+// such a PRIORITY_UPDATE MUST respond with a connection error of type
+// PROTOCOL_ERROR."
+//
+// Both terms are counted rather than estimated: the left is the buffer's own length,
+// the right is the stream layer's, and the limit is the constant this connection put
+// in its own SETTINGS frame above rather than a number repeated here. The check is
+// skipped for a stream already buffered, because §7 makes a second frame for one
+// stream replace the first — a count that does not rise cannot cross a limit.
+//
+// This is the rule that makes the buffer safe to have at all, and it is worth being
+// clear that it is the specification's bound and not a local one: a peer that
+// prioritizes ten thousand streams it never opens is refused at the hundredth, by a
+// number it was told in advance.
 func (c *conn) handlePriorityUpdate(f frame.PriorityUpdateFrame) error {
 	if f.PrioritizedStreamID%2 == 0 {
 		// An even identifier belongs to a server-initiated stream (§5.1.1), which is
@@ -967,17 +1051,87 @@ func (c *conn) handlePriorityUpdate(f frame.PriorityUpdateFrame) error {
 				"idle and cannot be prioritized (RFC 9218 §7.1)",
 			f.PrioritizedStreamID)
 	}
-	// The signal itself is not acted on. Responses go out in the order the streams
-	// produce them, so there is no ordering here for a priority to change — and the
-	// rule above is a connection error whether or not anything is scheduled on the
-	// frame, which is why it is checked rather than the frame discarded unread.
+
+	// The parse error is dropped, and internal/request's setPriority drops the same
+	// one for the same reason: §7 of RFC 9218 makes failing to parse a priority field
+	// value a MAY-treat-as-connection-error, this server declines that MAY, and what
+	// internal/priority returns alongside the error is a Params with no parameters set
+	// — which is exactly the right reading of a frame whose parameters could not be
+	// read. §7 of RFC 9218: "A PRIORITY_UPDATE frame communicates a complete
+	// set of all priority parameters in the Priority Field Value field. Omitting a
+	// priority parameter is a signal to use its default value. Failure to parse the
+	// Priority Field Value MAY be treated as a connection error."
+	//
+	// So an unreadable frame is a request to schedule the stream at the defaults, and
+	// it still overrides whatever the client said before — because the frame carries a
+	// complete set, not a patch.
+	p, _ := priority.Parse(f.Field)
+
+	id := f.PrioritizedStreamID
+	switch {
+	case c.handler.Live(id):
+		c.w.Prioritize(id, p)
+
+	case id > c.lastStreamID:
+		// Idle: never used, so §7 of RFC 9218 says to hold the signal for it. The
+		// test is this connection's own high-water mark rather than a question for
+		// the stream layer, because an identifier above every one dispatched has by
+		// definition never been anything but idle — and §5.1.1 of RFC 9113 makes
+		// every identifier at or below it that is not live closed.
+		if !c.pending.Held(id) && c.pending.Len()+c.handler.Len() >= limits.MaxConcurrentStreams {
+			return h2.ConnErrorf(h2.ProtocolError,
+				"PRIORITY_UPDATE prioritizes idle stream %d, which would make %d "+
+					"prioritized idle streams and %d active ones, above the "+
+					"SETTINGS_MAX_CONCURRENT_STREAMS of %d this connection advertised "+
+					"(RFC 9218 §7.1)",
+				id, c.pending.Len()+1, c.handler.Len(), limits.MaxConcurrentStreams)
+		}
+		c.pending.Put(id, p)
+
+	default:
+		// Closed, or skipped past and so closed by §5.1.1 of RFC 9113. Discarded:
+		// there is no stream to schedule and there will not be one, and remembering
+		// the signal would be remembering it forever.
+	}
 	return nil
 }
 
 // handleStreamFrame hands a frame to the stream layer.
+//
+// A frame on an identifier above every one dispatched so far is the moment that
+// stream leaves the idle state, and that moment is where two of RFC 9218's rules
+// land. Both are deferred past the stream layer's own handling, because whether the
+// stream really opened is the stream layer's answer to give: a stream refused over
+// the concurrency limit leaves the idle state too, and it leaves it closed.
 func (c *conn) handleStreamFrame(f frame.Frame) error {
 	if id := f.Stream(); id > c.lastStreamID {
 		c.lastStreamID = id
+		defer c.leftIdle(id)
 	}
 	return c.handler.HandleFrame(f)
+}
+
+// leftIdle applies what a client buffered for a stream that has just left the idle
+// state, and forgets what it buffered for the streams that leaving closed.
+//
+// §7 of RFC 9218: "Servers SHOULD buffer the most recently received PRIORITY_UPDATE
+// frame and apply it once the referenced stream is opened." This is that moment, and
+// it is the only one: from here on the stream is live and handlePriorityUpdate
+// prioritizes it directly.
+//
+// The Live test is what keeps the scheduler's priority table bounded. A stream the
+// table refused, or whose first frame was a protocol error, never becomes a stream and
+// so is never retired — and retirement is what tells the writer to forget a priority.
+// Applying one here would be the one entry nothing ever removes. The buffered signal
+// is consumed in either case, because §5.1.1 of RFC 9113 has closed that stream
+// whether or not it opened.
+//
+// Pruning is the other half of that bound, and Prune's own comment carries the
+// argument: a client that skips identifiers to escape the concurrency limit closes
+// every identifier it skipped in the act of skipping.
+func (c *conn) leftIdle(id uint32) {
+	if p, ok := c.pending.Take(id); ok && c.handler.Live(id) {
+		c.w.Prioritize(id, p)
+	}
+	c.pending.Prune(id)
 }

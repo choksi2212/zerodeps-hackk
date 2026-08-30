@@ -15,6 +15,7 @@ import (
 	"zerodeps/zdh/internal/frame"
 	"zerodeps/zdh/internal/h2"
 	"zerodeps/zdh/internal/limits"
+	"zerodeps/zdh/internal/priority"
 )
 
 // shortTimeout is every deadline a test is waiting to fire. longTimeout is every
@@ -194,9 +195,17 @@ func (ts *testSocket) pendingLen() int {
 // context, and answering the two that can fail with a failure instead would make every
 // dispatch test that happens to carry a stream-0 WINDOW_UPDATE fail for a reason it is
 // not about. recordingHandler is the double that watches them.
+//
+// The two stream-set queries answer as an empty table would: no stream is live and none
+// is active. That is what a double which keeps no streams honestly is, and it makes a
+// PRIORITY_UPDATE dispatched through this handler take the buffer-it branch — so the
+// tests that only care that the frame was routed get the simple case, and the tests
+// about the branches use recordingHandler.
 type handlerFunc func(frame.Frame) error
 
 func (h handlerFunc) HandleFrame(f frame.Frame) error   { return h(f) }
+func (h handlerFunc) Live(uint32) bool                  { return false }
+func (h handlerFunc) Len() int                          { return 0 }
 func (h handlerFunc) ConnWindowUpdate(uint32) error     { return nil }
 func (h handlerFunc) SetInitialWindowSize(uint32) error { return nil }
 func (h handlerFunc) SetHeaderTableSize(uint32)         {}
@@ -231,6 +240,38 @@ type recordingHandler struct {
 	// hookErr is what the two hooks that can fail return, kept apart from err so
 	// that a test can fail one without failing frame dispatch.
 	hookErr error
+
+	// live is the set of streams this double reports as open or half-closed, and
+	// active is what it reports as the count of them. They are separate, and
+	// deliberately not derived from each other: §7.1 of RFC 9218's limit is about
+	// the count, the routing decision is about the membership, and a test that wants
+	// a full table without naming a hundred streams sets only the count.
+	live   map[uint32]bool
+	active int
+}
+
+func (h *recordingHandler) Live(id uint32) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.live[id]
+}
+
+func (h *recordingHandler) Len() int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.active
+}
+
+// setLive makes this double report id as a live stream, as the real table does between
+// a stream's first frame and its retirement.
+func (h *recordingHandler) setLive(id uint32) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.live == nil {
+		h.live = make(map[uint32]bool)
+	}
+	h.live[id] = true
+	h.active = len(h.live)
 }
 
 func (h *recordingHandler) HandleFrame(f frame.Frame) error {
@@ -1470,6 +1511,436 @@ func TestServeRefusesAPriorityUpdateForAPushStream(t *testing.T) {
 			t.Errorf("prioritized stream %d: the GOAWAY carries %s, want PROTOCOL_ERROR",
 				id, ga.ErrCode)
 		}
+	}
+}
+
+// openingHandler is a stream layer that opens every stream it is handed a frame for,
+// except the ones named in refuse.
+//
+// The buffer-then-apply path of §7 of RFC 9218 cannot be reached without it. A
+// PRIORITY_UPDATE for an idle stream is held until the stream opens, and "opens" is the
+// stream layer's answer, not the connection's — so a double that never reports a live
+// stream, as recordingHandler does not, only ever exercises the buffering half.
+//
+// refuse is the other half of that answer, and it is not a decoration: a stream over
+// SETTINGS_MAX_CONCURRENT_STREAMS leaves the idle state and lands in closed without ever
+// entering the stream table, so nothing will ever retire it and nothing will ever tell
+// the write half to forget it. That makes it the one case where applying a buffered
+// signal would leak, which is why it has a test of its own.
+//
+// refuse is written before Serve starts and only read after, so it needs no lock of its
+// own; everything the embedded double records is locked as it always was.
+type openingHandler struct {
+	recordingHandler
+	refuse map[uint32]bool
+}
+
+func (h *openingHandler) HandleFrame(f frame.Frame) error {
+	if id := f.Stream(); id != 0 && !h.refuse[id] {
+		h.setLive(id)
+	}
+	return h.recordingHandler.HandleFrame(f)
+}
+
+// priorityOf is what a connection's scheduler was told about a stream.
+//
+// Reaching into the write half is the assertion these tests want, because the effect of
+// a PRIORITY_UPDATE is a scheduling decision and a scheduling decision is invisible on a
+// connection with one stream's worth of frames on it. That the scheduler then acts on
+// what it was told is writer_test.go's and scheduler_test.go's; that the frame reaches it
+// at all, and only when it should, is this file's.
+//
+// It is safe to read after Serve returns without racing the reader goroutine: Serve stops
+// the writer and waits for it before returning, so both goroutines that touch this are
+// finished. The mutex is taken anyway, because a helper that documented why it did not
+// need one would be wrong the day Serve changed.
+func priorityOf(t *testing.T, c *conn, id uint32) (priority.Params, bool) {
+	t.Helper()
+	c.w.mu.Lock()
+	defer c.w.mu.Unlock()
+	p, held := c.w.sched.prio[id]
+	return p, held
+}
+
+// assertNotPrioritized is the negative of priorityOf, phrased so that a failure says
+// what was remembered rather than that something was.
+func assertNotPrioritized(t *testing.T, c *conn, id uint32, why string) {
+	t.Helper()
+	if p, held := priorityOf(t, c, id); held {
+		t.Errorf("the scheduler was told stream %d is %q, but %s",
+			id, p.Field(), why)
+	}
+}
+
+// prioritized runs one connection whose script is the client preface followed by
+// frames, and returns it for inspection.
+//
+// The conn is built rather than served through serve() because the assertions are about
+// what it remembers, not about what the peer received — and after awaitServe there is no
+// goroutine left to race for either.
+func prioritized(t *testing.T, h StreamHandler, frames ...frame.Frame) (*conn, *testSocket, error) {
+	t.Helper()
+	ts := newTestSocket(&testTarget{}).
+		script(append(clientHello(t), encodeFrames(t, frames...)...)).
+		atEOF()
+	c := newConn(ts, always(h), testTimeouts())
+	return c, ts, awaitServe(t, serveInBackground(c))
+}
+
+// TestServePrioritizesALiveStreamStraightAway is the first of the three destinations a
+// PRIORITY_UPDATE has. The stream exists, so there is nothing to decide and nothing to
+// remember: the signal goes to the scheduler and the buffer stays empty.
+func TestServePrioritizesALiveStreamStraightAway(t *testing.T) {
+	h := &openingHandler{}
+	c, ts, err := prioritized(t, h,
+		frame.HeadersFrame{StreamID: 1, EndHeaders: true, Fragment: []byte("x")},
+		frame.PriorityUpdateFrame{PrioritizedStreamID: 1, Field: "u=0, i"},
+	)
+	if err != nil {
+		t.Fatalf("Serve: %v", err)
+	}
+	noGoAwayIn(t, peerSaw(t, ts))
+
+	want := priority.Params{}.WithUrgency(0).WithIncremental(true)
+	if got, held := priorityOf(t, c, 1); !held || got != want {
+		t.Errorf("the scheduler was told %q (held=%v), want %q",
+			got.Field(), held, want.Field())
+	}
+	if n := c.pending.Len(); n != 0 {
+		t.Errorf("%d signals were buffered for a stream that was already open, want 0", n)
+	}
+}
+
+// TestServeBuffersAPriorityUpdateUntilTheStreamOpens is the second destination, and it is
+// a SHOULD this server chose to honour. §7 of RFC 9218: "A client MAY send a
+// PRIORITY_UPDATE frame before the stream that it references is open (except for HTTP/2
+// push streams; see Section 7.1)." And §7 of RFC 9218: "Servers SHOULD buffer the most
+// recently received PRIORITY_UPDATE frame and apply it once the referenced stream is
+// opened."
+//
+// The HEADERS frame is what makes the test mean something. Without it the assertion would
+// be that the signal was buffered, which a server that buffered signals and never applied
+// them would also pass — and that server would schedule every reprioritized response at
+// the default urgency.
+func TestServeBuffersAPriorityUpdateUntilTheStreamOpens(t *testing.T) {
+	h := &openingHandler{}
+	c, ts, err := prioritized(t, h,
+		frame.PriorityUpdateFrame{PrioritizedStreamID: 5, Field: "u=1"},
+		frame.HeadersFrame{StreamID: 5, EndHeaders: true, Fragment: []byte("x")},
+	)
+	if err != nil {
+		t.Fatalf("Serve: %v", err)
+	}
+	noGoAwayIn(t, peerSaw(t, ts))
+
+	want := priority.Params{}.WithUrgency(1)
+	if got, held := priorityOf(t, c, 5); !held || got != want {
+		t.Errorf("the scheduler was told %q (held=%v) for the stream that opened, want %q",
+			got.Field(), held, want.Field())
+	}
+	if n := c.pending.Len(); n != 0 {
+		t.Errorf("%d signals are still buffered after the stream they name opened, want 0: "+
+			"a buffer that is not emptied on use is a buffer that grows", n)
+	}
+}
+
+// TestServeKeepsOnlyTheLastBufferedPriorityUpdate is the "most recently received" of §7
+// of RFC 9218, and it is what makes the buffer's bound a bound at all.
+//
+// A client may send as many PRIORITY_UPDATE frames for one idle stream as it likes, and
+// none of them is a protocol error. If each were remembered, or if each counted towards
+// §7.1's limit, a client could exhaust either with frames it is entitled to send — so the
+// two hundred frames here are both a correctness case and an attack.
+func TestServeKeepsOnlyTheLastBufferedPriorityUpdate(t *testing.T) {
+	var script []frame.Frame
+	for u := range 200 {
+		script = append(script, frame.PriorityUpdateFrame{
+			PrioritizedStreamID: 5,
+			Field:               priority.Params{}.WithUrgency(u % numBands).Field(),
+		})
+	}
+	last := priority.Params{}.WithUrgency(199 % numBands)
+	script = append(script, frame.HeadersFrame{
+		StreamID: 5, EndHeaders: true, Fragment: []byte("x"),
+	})
+
+	h := &openingHandler{}
+	c, ts, err := prioritized(t, h, script...)
+	if err != nil {
+		t.Fatalf("Serve: %v", err)
+	}
+	noGoAwayIn(t, peerSaw(t, ts))
+
+	if got, held := priorityOf(t, c, 5); !held || got != last {
+		t.Errorf("the scheduler was told %q (held=%v), want the last of the 200 signals, %q",
+			got.Field(), held, last.Field())
+	}
+}
+
+// TestServeDiscardsAPriorityUpdateForAClosedStream is the third destination, and the one
+// that has to be a discard rather than a buffer: a signal for a stream that will never
+// exist would otherwise be remembered for the life of the connection, one entry per
+// frame, with no rule ever taking it away.
+//
+// Both identifiers here are closed, by different routes. Stream 5 was used and this
+// double never opened it; stream 3 was never used at all, and §5.1.1 of RFC 9113: "When
+// a stream transitions out of the 'idle' state, all streams in the 'idle' state that
+// might have been opened by the peer with a lower-valued stream identifier immediately
+// transition to 'closed'."
+func TestServeDiscardsAPriorityUpdateForAClosedStream(t *testing.T) {
+	h := &recordingHandler{}
+	c, ts, err := prioritized(t, h,
+		frame.HeadersFrame{StreamID: 5, EndHeaders: true, Fragment: []byte("x")},
+		frame.PriorityUpdateFrame{PrioritizedStreamID: 5, Field: "u=0"},
+		frame.PriorityUpdateFrame{PrioritizedStreamID: 3, Field: "u=0"},
+	)
+	if err != nil {
+		t.Fatalf("Serve: %v", err)
+	}
+	noGoAwayIn(t, peerSaw(t, ts))
+
+	assertNotPrioritized(t, c, 5, "the stream never opened and never will")
+	assertNotPrioritized(t, c, 3, "§5.1.1 of RFC 9113 closed it when stream 5 was used")
+	if n := c.pending.Len(); n != 0 {
+		t.Errorf("%d signals were buffered for streams that are closed, want 0", n)
+	}
+}
+
+// TestServeDoesNotPrioritizeARefusedStream is the hole the buffer would leave if it
+// applied a signal to every stream that leaves the idle state rather than to the ones
+// that open.
+//
+// A stream refused over SETTINGS_MAX_CONCURRENT_STREAMS never enters the stream table, so
+// it is never retired, so the write half is never told to forget it — and the signal
+// applied to it would be the one entry in the scheduler's priority table that nothing
+// removes. A client that wanted to grow that table without bound would send exactly this:
+// a PRIORITY_UPDATE and a HEADERS for a stream it knows will be refused, over and over.
+//
+// The buffered signal is consumed either way, which is the other half of the bound.
+// §5.1.1 of RFC 9113 has closed the stream whether or not it opened, so there is nothing
+// left for the entry to be for.
+func TestServeDoesNotPrioritizeARefusedStream(t *testing.T) {
+	h := &openingHandler{refuse: map[uint32]bool{5: true}}
+	c, ts, err := prioritized(t, h,
+		frame.PriorityUpdateFrame{PrioritizedStreamID: 5, Field: "u=0"},
+		frame.HeadersFrame{StreamID: 5, EndHeaders: true, Fragment: []byte("x")},
+	)
+	if err != nil {
+		t.Fatalf("Serve: %v", err)
+	}
+	noGoAwayIn(t, peerSaw(t, ts))
+
+	assertNotPrioritized(t, c, 5, "the stream layer refused it, so nothing will ever "+
+		"retire it and nothing will ever forget this")
+	if n := c.pending.Len(); n != 0 {
+		t.Errorf("%d signals are still buffered for the refused stream, want 0", n)
+	}
+}
+
+// TestServeAppliesAnUnparseablePriorityFieldAsTheDefaults is the MAY this server declines,
+// and the reading it takes instead.
+//
+// §7 of RFC 9218: "A PRIORITY_UPDATE frame communicates a complete set of all priority
+// parameters in the Priority Field Value field. Omitting a priority parameter is a signal
+// to use its default value. Failure to parse the Priority Field Value MAY be treated as a
+// connection error." A field value that cannot be read is therefore a frame whose
+// parameters are all omitted, which is a request for the defaults — and because the frame
+// carries a complete set rather than a patch, it replaces what the client said before
+// rather than leaving it standing.
+//
+// Killing the connection instead would be within the letter of §7 and against the point
+// of it: the client is asking for a scheduling preference, and there is a defined answer
+// to "no preference expressed".
+func TestServeAppliesAnUnparseablePriorityFieldAsTheDefaults(t *testing.T) {
+	h := &openingHandler{}
+	c, ts, err := prioritized(t, h,
+		frame.HeadersFrame{StreamID: 1, EndHeaders: true, Fragment: []byte("x")},
+		frame.PriorityUpdateFrame{PrioritizedStreamID: 1, Field: "u=0, i"},
+		frame.PriorityUpdateFrame{PrioritizedStreamID: 1, Field: ")("},
+	)
+	if err != nil {
+		t.Fatalf("Serve: %v", err)
+	}
+	noGoAwayIn(t, peerSaw(t, ts))
+
+	got, held := priorityOf(t, c, 1)
+	if !held {
+		t.Fatalf("the scheduler was told nothing about stream 1, want the defaults")
+	}
+	if want := (priority.Params{}); got != want {
+		t.Errorf("the scheduler was told %q, want the defaults %q: an unreadable field "+
+			"value carries a complete set of omitted parameters, so it must replace the "+
+			"u=0, i that came before it", got.Field(), want.Field())
+	}
+	if got.Urgency() != priority.DefaultUrgency || got.Incremental() {
+		t.Errorf("the defaults read back as urgency %d incremental %v, want %d and false",
+			got.Urgency(), got.Incremental(), priority.DefaultUrgency)
+	}
+}
+
+// TestServeAcceptsPrioritizedIdleStreamsUpToTheLimit and the test after it are the two
+// sides of §7.1 of RFC 9218's bound on the buffer: "The number of streams that have been
+// prioritized but remain in the 'idle' state plus the number of active streams (those in
+// the 'open' state or in either of the 'half-closed' states; see Section 5.1.2 of
+// [HTTP/2]) MUST NOT exceed the value of the SETTINGS_MAX_CONCURRENT_STREAMS parameter.
+// Servers that receive such a PRIORITY_UPDATE MUST respond with a connection error of
+// type PROTOCOL_ERROR."
+//
+// This one is the side that must not fire. A client entitled to prioritize a hundred idle
+// streams and refused at the hundredth would be a server that made the feature unusable
+// at exactly the point a client with a hundred requests in flight wants it.
+func TestServeAcceptsPrioritizedIdleStreamsUpToTheLimit(t *testing.T) {
+	var script []frame.Frame
+	for i := range limits.MaxConcurrentStreams {
+		script = append(script, frame.PriorityUpdateFrame{
+			PrioritizedStreamID: uint32(2*i + 1), Field: "u=2",
+		})
+	}
+
+	h := &recordingHandler{}
+	c, ts, err := prioritized(t, h, script...)
+	if err != nil {
+		t.Fatalf("Serve after %d prioritized idle streams, the advertised maximum: %v",
+			limits.MaxConcurrentStreams, err)
+	}
+	noGoAwayIn(t, peerSaw(t, ts))
+	if got := c.pending.Len(); got != limits.MaxConcurrentStreams {
+		t.Errorf("%d signals are buffered, want all %d", got, limits.MaxConcurrentStreams)
+	}
+}
+
+// TestServeRefusesPrioritizedIdleStreamsPastTheLimit is the side that must fire, and the
+// arithmetic is the interesting part: the limit counts prioritized idle streams together
+// with active ones, so a connection with streams open has less room to buffer.
+//
+// The limit is measured against limits.MaxConcurrentStreams because that is the value this
+// connection puts in its own SETTINGS frame. A server that enforced a different number
+// from the one it advertised would be refusing frames the peer was told it could send.
+func TestServeRefusesPrioritizedIdleStreamsPastTheLimit(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		active int
+	}{
+		{"with nothing else open", 0},
+		{"with half the limit already open", limits.MaxConcurrentStreams / 2},
+		{"with the limit already open", limits.MaxConcurrentStreams},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// One more than there is room for. The identifiers start above every
+			// stream the handler claims is active so that each one is idle.
+			room := limits.MaxConcurrentStreams - tc.active
+			var script []frame.Frame
+			for i := range room + 1 {
+				script = append(script, frame.PriorityUpdateFrame{
+					PrioritizedStreamID: uint32(2*(i+limits.MaxConcurrentStreams) + 1),
+					Field:               "u=2",
+				})
+			}
+
+			h := &recordingHandler{active: tc.active}
+			c, ts, err := prioritized(t, h, script...)
+			if ce := connErrorOf(t, err); ce.Code != h2.ProtocolError {
+				t.Errorf("Serve returned %s, want PROTOCOL_ERROR (RFC 9218 §7.1)", ce.Code)
+			}
+			if !strings.Contains(err.Error(), "SETTINGS_MAX_CONCURRENT_STREAMS") {
+				t.Errorf("the error does not name the limit it is enforcing: %v", err)
+			}
+			if ga := goAwayIn(t, peerSaw(t, ts)); ga.ErrCode != h2.ProtocolError {
+				t.Errorf("the GOAWAY carries %s, want PROTOCOL_ERROR", ga.ErrCode)
+			}
+			// The refused frame is not buffered, which is what makes the error a
+			// bound rather than an announcement: a connection error that also kept
+			// the entry would be a server that complained and complied.
+			if got := c.pending.Len(); got != room {
+				t.Errorf("%d signals are buffered, want the %d there was room for",
+					got, room)
+			}
+		})
+	}
+}
+
+// TestServeReprioritizingABufferedStreamDoesNotUseUpMoreRoom is the exemption that makes
+// the limit enforceable at all. A client that has prioritized a hundred idle streams and
+// changes its mind about one of them has not asked the server to remember a hundred and
+// one things, and refusing the change would make the limit punish a client for using the
+// feature correctly.
+//
+// The frames here would be a connection error if each counted: a hundred streams
+// prioritized to fill the buffer, and then a hundred more frames for streams already in
+// it.
+func TestServeReprioritizingABufferedStreamDoesNotUseUpMoreRoom(t *testing.T) {
+	var script []frame.Frame
+	for i := range limits.MaxConcurrentStreams {
+		script = append(script, frame.PriorityUpdateFrame{
+			PrioritizedStreamID: uint32(2*i + 1), Field: "u=2",
+		})
+	}
+	for i := range limits.MaxConcurrentStreams {
+		script = append(script, frame.PriorityUpdateFrame{
+			PrioritizedStreamID: uint32(2*i + 1), Field: "u=5, i",
+		})
+	}
+
+	h := &recordingHandler{}
+	c, ts, err := prioritized(t, h, script...)
+	if err != nil {
+		t.Fatalf("Serve: %v", err)
+	}
+	noGoAwayIn(t, peerSaw(t, ts))
+	if got := c.pending.Len(); got != limits.MaxConcurrentStreams {
+		t.Errorf("%d signals are buffered after reprioritizing every one of them, want %d",
+			got, limits.MaxConcurrentStreams)
+	}
+}
+
+// TestServeOpeningAStreamRestoresRoomToPrioritize is the third part of the buffer's bound,
+// and the one that is not a limit: the entries go away on their own as the connection
+// proceeds.
+//
+// §5.1.1 of RFC 9113 is what makes it sound. Using one identifier closes every lower idle
+// one, so a client that prioritized a hundred idle streams and then opened the highest of
+// them has closed the other ninety-nine — and a signal for a closed stream is a signal
+// for a stream that will never be scheduled.
+//
+// The boundary is the assertion. Filling the buffer exactly, opening one stream, and then
+// sending one more frame is the sequence a client with a long-lived connection produces
+// all day, and a server that only freed the entries on the next connection error would
+// stop scheduling for it after a hundred requests.
+func TestServeOpeningAStreamRestoresRoomToPrioritize(t *testing.T) {
+	const highest = uint32(2*limits.MaxConcurrentStreams - 1)
+	var script []frame.Frame
+	for i := range limits.MaxConcurrentStreams {
+		script = append(script, frame.PriorityUpdateFrame{
+			PrioritizedStreamID: uint32(2*i + 1), Field: "u=2",
+		})
+	}
+	script = append(script,
+		frame.HeadersFrame{StreamID: highest, EndHeaders: true, Fragment: []byte("x")},
+		frame.PriorityUpdateFrame{PrioritizedStreamID: highest + 2, Field: "u=0"},
+	)
+
+	h := &openingHandler{}
+	c, ts, err := prioritized(t, h, script...)
+	if err != nil {
+		t.Fatalf("Serve: %v", err)
+	}
+	noGoAwayIn(t, peerSaw(t, ts))
+
+	// One entry: the stream prioritized after the buffer was pruned. The stream that
+	// opened took its own signal out of the buffer and into the scheduler, and the
+	// ninety-nine below it went with it.
+	if got := c.pending.Len(); got != 1 {
+		t.Errorf("%d signals are buffered, want only the one sent after stream %d opened",
+			got, highest)
+	}
+	if !c.pending.Held(highest + 2) {
+		t.Errorf("the signal for stream %d was not buffered, so opening a stream did not "+
+			"make room (RFC 9113 §5.1.1)", highest+2)
+	}
+	want := priority.Params{}.WithUrgency(2)
+	if got, held := priorityOf(t, c, highest); !held || got != want {
+		t.Errorf("the scheduler was told %q (held=%v) for the stream that opened, want %q",
+			got.Field(), held, want.Field())
 	}
 }
 
