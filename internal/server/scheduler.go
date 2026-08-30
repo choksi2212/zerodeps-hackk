@@ -283,6 +283,18 @@ func (s *scheduler) ContinuesBlock(f frame.Frame) bool {
 	return f.Type() == frame.TypeContinuation && s.runs[f.Stream()] != nil
 }
 
+// MidBlock reports whether the frames handed out so far end part-way through a field
+// block, so that the next Pop is the rest of it.
+//
+// The writer needs this because it stops buffering at a high-water mark, and stopping
+// there mid-block would put a HEADERS frame on the wire with its CONTINUATION frames
+// still here — which §6.10 of RFC 9113 makes a connection error for the peer that
+// reads it, and which no later burst can repair if the connection stops first.
+// Continuing past the mark is safe in a way that waiting for a fragment would not be:
+// every frame of a pinned block is already in this structure, so the next Pop returns
+// one immediately rather than blocking.
+func (s *scheduler) MidBlock() bool { return len(s.pinned) > 0 }
+
 // SetPriority records the peer's priority signal for a stream, moving any DATA the
 // stream already has waiting into its new band.
 //
