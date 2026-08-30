@@ -81,6 +81,35 @@ Everything else is left alone, and deliberately. These comments quote ordinary E
 constantly, and a rule that flagged that would produce a hundred findings a run, which
 is the same as producing none.
 
+# The span neither rule selects
+
+A quotation is invisible to both rules when it carries no normative keyword and no
+reference reaches it, and that is not a hypothetical: seven spans in this tree were RFC
+9113's own sentences, sitting unchecked. Two failure modes put them there, and neither
+looks like anything when you read the comment.
+
+The first is distance. introducing looks back WINDOW characters and the whole reference
+has to fit inside that window, so "§6.5.2" followed by forty-five characters of English
+before the quotation opens is a citation the script cannot see — internal/response was
+two characters over. The second is a nested quotation mark: introducing cuts its window
+at the last one, so "§8.3.1: ':path' is '...'" attributes nothing to anything, because
+the mark that closes ':path' discards the citation along with the prose before it. Both
+are silent, and a span nothing selects is reported exactly as loudly as a span that was
+selected and passed, which is not at all.
+
+Widening the rules is not the answer. Fifteen spans in this tree are six words or longer,
+uncited and non-normative, and every one is ordinary English in scare quotes — a paragraph
+of findings a run, on prose. So the question is put to the RFC instead: a declined span
+that appears verbatim in one of these documents is a quotation of it that no reference
+reaches, and is reported as one. Of the fifteen, none does. Of the seven, all seven did.
+The fix is mechanical and is named in the output — move the citation to within WINDOW
+characters of the opening quote, and after any nested mark.
+
+What remains uncovered is a span that is both unattributed and misquoted, which is
+verbatim nowhere and so matches nothing. That is a smaller hole than the one this closes
+and it is narrowed by the same fix: a citation put within reach moves the span into the
+checked set, where being a misquotation is the whole of what gets caught.
+
 # What counts as verbatim
 
 The RFC is a hard-wrapped 72-column text file that sets its notes off with a leading
@@ -122,8 +151,9 @@ you have room for:
     curl -o ../rfc7541.txt https://www.rfc-editor.org/rfc/rfc7541.txt
 
 Exit: 0 = every quotation whose document is here checks out, or RFC 9113 was not found;
-1 = a quotation does not appear in the document it names, in the form it is quoted;
-2 = a path was named and is not there.
+1 = a quotation does not appear in the document it names, in the form it is quoted, or a
+quotation of one of these documents has no reference that reaches it; 2 = a path was
+named and is not there.
 """
 
 import os
@@ -385,12 +415,17 @@ def document(ref, secs):
 
 
 def quotations(path, secs):
-	"""Yield (line number, span, document) for every candidate quotation in path.
+	"""Yield (line number, span, document, selected) for every quoted span in path.
 
 	document is the four digits of the RFC the reference introducing the span attributes
 	it to, "9113" when nothing attributes it elsewhere, and None for a bare section
 	number RFC 9113 does not have — which names a document without saying which, and is
 	the one case this script cannot resolve.
+
+	selected is whether either rule reached the span. A span neither rule reaches is
+	yielded too, with no document, because it is not finished with: main asks whether it
+	is verbatim RFC text anyway, which is what the docstring's third finding class is.
+	Dropping it here instead is how seven of RFC 9113's sentences went unchecked.
 	"""
 	for start, text in comment_blocks(path):
 		for at, span in spans(text):
@@ -400,8 +435,9 @@ def quotations(path, secs):
 			normative = NORMATIVE.search(span) is not None
 			cited = ref is not None and len(span.split()) >= MIN_WORDS
 			if not (normative or cited):
+				yield start, span, None, False
 				continue
-			yield start, span, "9113" if ref is None else document(ref, secs)
+			yield start, span, "9113" if ref is None else document(ref, secs), True
 
 
 def variants(fragment, first, last):
@@ -436,6 +472,26 @@ def verbatim(span, rfc):
 	return True
 
 
+def unattributed(span, texts):
+	"""The document a declined span is verbatim in, or None.
+
+	A span neither rule reached is one of two things — a quotation whose citation this
+	script cannot see, or a bit of ordinary English in scare quotes — and the documents
+	themselves are what tell them apart. Fifteen of the second kind are in this tree and
+	not one of them appears in an RFC; all seven of the first kind did.
+
+	Below MIN_WORDS the question is not worth asking. A phrase of five words can land in
+	two hundred pages of somebody else's English by coincidence, and a finding about the
+	coincidence is not a finding about the comment.
+	"""
+	if len(span.split()) < MIN_WORDS:
+		return None
+	for num in sorted(texts):
+		if verbatim(span, texts[num]):
+			return num
+	return None
+
+
 def main(argv):
 	rfc_path = find_rfc(argv)
 	if rfc_path is None:
@@ -458,10 +514,15 @@ def main(argv):
 
 	root = pathlib.Path(__file__).resolve().parent.parent
 	checked = 0
-	bad, unread = [], []
+	bad, unread, stray = [], [], []
 	for path in sorted(root.rglob("*.go")):
-		for line, span, doc in quotations(path, secs):
+		for line, span, doc, selected in quotations(path, secs):
 			where = (path.relative_to(root), line, span)
+			if not selected:
+				num = unattributed(span, texts)
+				if num is not None:
+					stray.append(where + (num,))
+				continue
 			if doc not in texts:
 				unread.append(where + (doc,))
 				continue
@@ -472,6 +533,17 @@ def main(argv):
 	for path, line, span, doc in bad:
 		print("%s:%d does not quote RFC %s:" % (path, line, doc))
 		print("    %s" % span)
+		print()
+
+	# A quotation of one of these documents that no reference reaches. Not a
+	# misquotation — the words are the RFC's — but not a checked quotation either, and it
+	# was reported as neither until this was here. The fix is always the same, so it is
+	# printed rather than left to be rediscovered.
+	for path, line, span, doc in stray:
+		print("%s:%d quotes RFC %s and no reference reaches it:" % (path, line, doc))
+		print("    %s" % span)
+		print("    Cite it within %d characters of the opening quote, after any nested mark."
+			% WINDOW)
 		print()
 
 	print("%d quotations checked against %s"
@@ -501,11 +573,16 @@ def main(argv):
 				print("    curl -o ../%s https://www.rfc-editor.org/rfc/%s"
 					% (OTHERS[num], OTHERS[num]))
 
-	if bad:
-		print("%d of them are not in the document they name, in the form they are quoted."
-			% len(bad))
+	if bad or stray:
+		if bad:
+			print("%d of them are not in the document they name, in the form they are quoted."
+				% len(bad))
+		if stray:
+			print("%d more quote one of these documents with nothing to attribute them to."
+				% len(stray))
 		return 1
-	print("all of them appear in the document they name.")
+	print("all of them appear in the document they name, and nothing quotes one of these")
+	print("documents without a reference that reaches it.")
 	return 0
 
 

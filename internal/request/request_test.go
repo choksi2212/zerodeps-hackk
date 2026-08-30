@@ -439,10 +439,11 @@ func TestParseRejectsAnEmptyPath(t *testing.T) {
 }
 
 func TestParseRejectsAPathThatIsNotAnAbsolutePath(t *testing.T) {
-	// §8.3.1: ":path" is "the absolute-path production and, optionally, a '?'
-	// character followed by the query production". The absolute-URI case is the one
-	// with teeth: a ":path" of "https://elsewhere/" is how a request gets routed
-	// somewhere its authority never named.
+	// The ":path" of an "http" or "https" request carries, per §8.3.1, "the path and
+	// query parts of the target URI (the absolute-path production and, optionally, a
+	// '?' character followed by the query production; see Section 4.1 of [HTTP])".
+	// The absolute-URI case is the one with teeth: a ":path" of "https://elsewhere/"
+	// is how a request gets routed somewhere its authority never named.
 	for _, path := range []string{"foo", "https://elsewhere/", "?q=1", "index.html", "../etc"} {
 		t.Run(path, func(t *testing.T) {
 			reason := refuse(t, with(pseudoPath, path), true)

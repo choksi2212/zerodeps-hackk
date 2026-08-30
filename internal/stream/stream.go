@@ -25,12 +25,13 @@
 //
 // # Why the table decodes HPACK
 //
-// Decoding looks like the business of the layer above, and it is not. §5.1
-// requires an endpoint to "minimally process and then discard" frames on a
-// closed stream, and says what that means: "updating header compression state
-// for HEADERS and PUSH_PROMISE frames". A header block whose stream has been
-// reset must still be decoded, because the HPACK dynamic table is
-// connection-scoped and order-dependent — skipping one block desynchronises
+// Decoding looks like the business of the layer above, and it is not. Of a
+// frame that arrives on a stream this endpoint has already reset, §5.1 says:
+// "An endpoint MUST minimally process and then discard any frames it receives
+// in this state." What that processing is, per §5.1, is "updating header
+// compression state for HEADERS and PUSH_PROMISE frames". A header block whose
+// stream has been reset must still be decoded, because the HPACK dynamic table
+// is connection-scoped and order-dependent — skipping one block desynchronises
 // every block after it. So the decode belongs to the layer that knows a stream
 // is gone, which is this one, and the layer above is handed fields rather than
 // octets.

@@ -72,11 +72,12 @@ type Transport interface {
 	MaxFrameSize() uint32
 }
 
-// fieldOverhead is what §6.5.2 charges for a field line on top of its name and
-// value: "an overhead of 32 octets for each field line", which stands for the space
-// an implementation needs to hold the field rather than for anything on the wire. It
-// is the reason SETTINGS_MAX_HEADER_LIST_SIZE cannot be checked against the encoded
-// block — the number the peer advertised is about a list, not about octets we send.
+// fieldOverhead is what a field line costs on top of its name and value, per
+// §6.5.2: "an overhead of 32 octets for each field line", which stands for the
+// space an implementation needs to hold the field rather than for anything on the
+// wire. It is the reason SETTINGS_MAX_HEADER_LIST_SIZE cannot be checked against
+// the encoded block — the number the peer advertised is about a list, not about
+// octets we send.
 const fieldOverhead = 32
 
 // noHeaderListLimit is maxList when the peer has advertised no

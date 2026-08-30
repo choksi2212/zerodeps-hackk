@@ -81,9 +81,9 @@ func checkSection(kind section, fields []h2.Field) error {
 		}
 
 		// §8.3: "All pseudo-header fields MUST appear in a field block before all
-		// regular field lines." Checked as "no pseudo-header field after a regular
-		// one", which is the same rule stated in the order the list arrives in, and
-		// so needs no second pass.
+		// regular field lines." Checked as the same rule read in the order the list
+		// arrives in — no pseudo-header field after a regular one — which is why it
+		// needs no second pass.
 		if regular {
 			return malformedf("the pseudo-header field %q after a regular field line (RFC 9113 §8.3)", f.Name)
 		}

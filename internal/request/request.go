@@ -20,13 +20,13 @@
 // uppercase field name on stream 7 tells you nothing about stream 9. A browser with
 // six requests in flight should not lose five of them to the sixth's mistake.
 //
-// §8.1.1 also explains why the rules are as unforgiving as they are, and it is
-// worth quoting because it is the justification for every refusal here: "These
-// requirements are intended to protect against several types of common attacks
-// against HTTP; they are deliberately strict because being permissive can expose
-// implementations to these vulnerabilities." The vulnerability is request
-// smuggling, and the mechanism is a field that this server and the next hop read
-// differently.
+// The same section explains why the rules are as unforgiving as they are, and the
+// sentence is worth reproducing because it is the justification for every refusal
+// in this file. §8.1.1: "These requirements are intended to protect against
+// several types of common attacks against HTTP; they are deliberately strict
+// because being permissive can expose implementations to these vulnerabilities."
+// The vulnerability is request smuggling, and the mechanism is a field that this
+// server and the next hop read differently.
 //
 // # What is not here
 //
@@ -42,10 +42,10 @@
 // compressed block, held by internal/frame as limits.MaxHeaderBlockSize and
 // limits.MaxContinuationFrames, which is the pair that answers CVE-2023-45288.
 //
-// Cookie concatenation (§8.2.3). It is a MAY, and it is required only before a
-// field list is passed "into a non-HTTP/2 context, such as an HTTP/1.1 connection,
-// or a generic HTTP server application". This server has no such context: it is not
-// a proxy, and its handler reads the fields as they arrived.
+// Cookie concatenation. It is a MAY, and §8.2.3 asks for it only before a field
+// list is passed "into a non-HTTP/2 context, such as an HTTP/1.1 connection, or a
+// generic HTTP server application". This server has no such context: it is not a
+// proxy, and its handler reads the fields as they arrived.
 //
 // Server push (§8.4). SETTINGS_ENABLE_PUSH is 0 and this server never sends
 // PUSH_PROMISE, so §8.4's request and response rules describe frames that cannot
@@ -381,11 +381,13 @@ func (r *Request) checkPath(id uint32) error {
 		return nil
 	}
 	if r.Path[0] != '/' {
-		// §8.3.1: ":path" is "the absolute-path production and, optionally, a '?'
-		// character followed by the query production". An absolute-path begins with
-		// a slash, so anything else is an absolute URI or a relative reference in a
-		// place neither belongs — and an ":path" of "http://elsewhere/" is how a
-		// request gets routed somewhere its authority never named.
+		// The ":path" of an "http" or "https" request carries, per §8.3.1, "the path
+		// and query parts of the target URI (the absolute-path production and,
+		// optionally, a '?' character followed by the query production; see Section
+		// 4.1 of [HTTP])". An absolute-path begins with a slash, so anything else is
+		// an absolute URI or a relative reference in a place neither belongs — and a
+		// ":path" of "http://elsewhere/" is how a request gets routed somewhere its
+		// authority never named.
 		return malformedf(id, "%s %q is not an absolute path (RFC 9113 §8.3.1)", pseudoPath, r.Path)
 	}
 	return nil
