@@ -67,18 +67,22 @@ const (
 	anEntityTagWeak  = `W/"cafe"`
 )
 
-// stamped is an fs.FileInfo that reports one modification time and nothing else worth
-// reading.
+// stamped is an fs.FileInfo that reports one modification time, one length, and nothing else
+// worth reading.
 //
 // modTime is tested through this rather than through a real file because the three cases that
 // matter cannot be produced on disk. A sub-second timestamp survives on NTFS and is quietly
 // truncated by some filesystems, a future timestamp would have to be written relative to the
 // test's own clock rather than the handler's, and a zero one cannot be set at all: os.Chtimes
-// reads the zero time as "leave this alone".
-type stamped struct{ mod time.Time }
+// reads the zero time as "leave this alone". versionOf is tested through it for the same first
+// reason, and for one more: no filesystem will hold a file at a date before its own epoch.
+type stamped struct {
+	mod  time.Time
+	size int64
+}
 
 func (s stamped) Name() string       { return "stamped" }
-func (s stamped) Size() int64        { return 0 }
+func (s stamped) Size() int64        { return s.size }
 func (s stamped) Mode() fs.FileMode  { return 0o644 }
 func (s stamped) ModTime() time.Time { return s.mod }
 func (s stamped) IsDir() bool        { return false }

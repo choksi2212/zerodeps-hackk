@@ -305,6 +305,54 @@ func TestEtagIsAbsentWhenTheContentCannotBeRead(t *testing.T) {
 
 // --- the cache --------------------------------------------------------------
 
+// TestVersionOfIsTheWholeOfWhatTheFilesystemKnows is the cache key: every part of the stat that a
+// rewrite could change, in the form it is compared in.
+//
+// A tagVersion is compared with ==, so this struct is the whole of what "the same file" means to
+// the cache. Anything a rewrite can change that is not in here is a stale tag until the entry is
+// evicted, and the length is the field that carries that weight — a timestamp can be forced back
+// to what it was, by hand or by a filesystem too coarse to tell two writes apart, and the length
+// then is all that is left to notice with.
+//
+// The second and the nanosecond are separate fields rather than one count of nanoseconds because
+// time.Time.UnixNano is only defined for the years 1678 to 2262, and a file whose date falls
+// outside that range is not an exotic case: an archive unpacked with its original stamps, or a
+// Windows tree whose timestamps were zeroed to the 1601 epoch, both land there. Folding them
+// would give every such file the same version as every other one.
+func TestVersionOfIsTheWholeOfWhatTheFilesystemKnows(t *testing.T) {
+	for _, c := range []struct {
+		name string
+		info stamped
+		want tagVersion
+	}{
+		{
+			name: "an empty file at the epoch, which is a version like any other",
+			info: stamped{mod: time.Unix(0, 0).UTC(), size: 0},
+			want: tagVersion{},
+		}, {
+			name: "the second and the nanosecond are both carried",
+			info: stamped{mod: time.Date(1970, time.January, 1, 0, 0, 1, 2, time.UTC), size: 1},
+			want: tagVersion{size: 1, sec: 1, nsec: 2},
+		}, {
+			// 134774 days from 1601-01-01 to 1970-01-01, which is where a Windows
+			// timestamp of zero lands.
+			name: "the 1601 epoch, which has no UnixNano",
+			info: stamped{mod: time.Date(1601, time.January, 1, 0, 0, 0, 0, time.UTC), size: 12},
+			want: tagVersion{size: 12, sec: -11644473600, nsec: 0},
+		}, {
+			name: "one second past the 32-bit rollover, at a length past it too",
+			info: stamped{mod: time.Date(2038, time.January, 19, 3, 14, 8, 0, time.UTC), size: 1 << 32},
+			want: tagVersion{size: 1 << 32, sec: 2147483648, nsec: 0},
+		},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			if got := versionOf(c.info); got != c.want {
+				t.Errorf("versionOf = %+v, want %+v", got, c.want)
+			}
+		})
+	}
+}
+
 // TestTagCacheHashesOncePerVersion is the cache doing the job it exists for, counted rather than
 // assumed: a hash per version of the file, however many times it is asked for.
 func TestTagCacheHashesOncePerVersion(t *testing.T) {
@@ -540,8 +588,21 @@ func TestTagCacheJoinsOnlyTheSameVersion(t *testing.T) {
 
 	// Both hashes are held until both have started, so the two calls are genuinely in flight at
 	// once and neither can be answered from a completed entry.
+	//
+	// The wait is bounded, because the fault this test looks for is the one that stops the second
+	// hash from ever starting: a single-flight keyed on the name alone would park the second
+	// caller on the first caller's channel, leaving the first waiting for a partner that cannot
+	// arrive. An unbounded barrier would deadlock there, and a deadlock reports a minute of
+	// nothing and then every goroutine in the binary, instead of the two answers this test has
+	// already caught. Nothing correct waits here at all.
+	const pairing = 5 * time.Second
 	var both sync.WaitGroup
 	both.Add(2)
+	paired := make(chan struct{})
+	go func() {
+		both.Wait()
+		close(paired)
+	}()
 
 	answers := make([]string, 2)
 	var done sync.WaitGroup
@@ -557,7 +618,10 @@ func TestTagCacheJoinsOnlyTheSameVersion(t *testing.T) {
 			defer done.Done()
 			answers[i], _ = cache.get("a", c.version, func() (string, error) {
 				both.Done()
-				both.Wait()
+				select {
+				case <-paired:
+				case <-time.After(pairing):
+				}
 				return c.tag, nil
 			})
 		}()
@@ -598,6 +662,75 @@ func TestTagCacheDoesNotHoldItsLockAcrossTheHash(t *testing.T) {
 	}
 	close(other)
 	<-slow
+}
+
+// TestTagCacheForgetsAFinishedCall is the in-flight map being emptied rather than accumulated.
+//
+// Nothing a peer can see depends on this, which is why it is asserted here: an abandoned entry is
+// a live *tagCall holding a closed channel, one for every version of every file ever asked for,
+// and a map that only grows is the shape of every slow leak. The entries map has a bound because
+// it is meant to hold things; this one needs none, on the single condition that it is empty
+// whenever no read is in progress.
+func TestTagCacheForgetsAFinishedCall(t *testing.T) {
+	c := newTagCache(maxTagCacheEntries)
+
+	for i := range 3 {
+		v := tagVersion{size: int64(i), sec: 1}
+		if _, err := c.get("a", v, func() (string, error) { return `"tag"`, nil }); err != nil {
+			t.Fatalf("version %d: %v", i, err)
+		}
+	}
+
+	c.mu.Lock()
+	n := len(c.calls)
+	c.mu.Unlock()
+	if n != 0 {
+		t.Errorf("%d calls still in flight after three finished reads, want 0", n)
+	}
+}
+
+// TestTagCacheSurvivesAPanicInTheHash is the worst thing that can happen inside the single-flight,
+// and the reason the bookkeeping is deferred rather than written after the call.
+//
+// A hash that panics has no business stopping the server, but the shape of a single-flight makes
+// it able to: one goroutine has published a channel that every later request for that file waits
+// on, and if it leaves without closing that channel, every one of those requests waits forever.
+// A panic here would be a bug in this package, so the tag the survivors get does not matter much
+// — that they get one at all is the whole point.
+func TestTagCacheSurvivesAPanicInTheHash(t *testing.T) {
+	const answering = 5 * time.Second
+
+	c := newTagCache(maxTagCacheEntries)
+	v := tagVersion{size: 1, sec: 1}
+
+	died := make(chan struct{})
+	go func() {
+		defer close(died)
+		defer func() { _ = recover() }()
+		c.get("a", v, func() (string, error) { panic("the read panicked") })
+	}()
+	<-died
+
+	answered := make(chan string, 1)
+	go func() {
+		tag, _ := c.get("a", v, func() (string, error) { return `"after"`, nil })
+		answered <- tag
+	}()
+	select {
+	case got := <-answered:
+		if got != `"after"` {
+			t.Errorf("the request after a panic got %q, want the fresh hash", got)
+		}
+	case <-time.After(answering):
+		t.Fatal("a request for a file whose hash panicked never returned")
+	}
+
+	c.mu.Lock()
+	n := len(c.calls)
+	c.mu.Unlock()
+	if n != 0 {
+		t.Errorf("%d calls still in flight, want 0; the panicking call was not cleared", n)
+	}
 }
 
 // --- the settle window ------------------------------------------------------
@@ -698,6 +831,67 @@ func TestEtagOfAnUnsettledFileIsRecomputed(t *testing.T) {
 	if got := a.get("last-modified"); got != fileTimeField {
 		t.Errorf("last-modified = %q, want %q; the date validator is the one that was fooled",
 			got, fileTimeField)
+	}
+}
+
+// TestTagSettleWindowCoversTheCoarsestFilesystem pins the one number in this file that no other
+// test can see.
+//
+// Every other assertion about the window is written relative to the constant, deliberately: they
+// are about the rule, and a test that hard-coded two seconds into the rule would have to be
+// rewritten to tune the value. The cost is that all of them would also pass with the window
+// shortened to a nanosecond, which would leave the cache trusting a timestamp for a file that
+// was written this instant.
+//
+// So the value is asserted once, here, against what the number is for: the coarsest modification
+// time a served directory is likely to sit on. FAT records two seconds, so two writes a second
+// apart can carry one identical stamp, and a cache that settled sooner than the granularity of
+// the clock underneath it would file the first write's tag and then serve the second write's
+// content beside it.
+func TestTagSettleWindowCoversTheCoarsestFilesystem(t *testing.T) {
+	const fatGranularity = 2 * time.Second
+
+	if tagSettleWindow < fatGranularity {
+		t.Errorf("tagSettleWindow is %v, want at least %v, which is what FAT records",
+			tagSettleWindow, fatGranularity)
+	}
+}
+
+// TestTagCacheNoticesALengthChangeUnderARestoredTimestamp is the far side of the boundary the
+// window draws. Outside it the stat is trusted, and the length is the part of the stat that a
+// rewrite cannot quietly keep.
+//
+// The file here is a month settled, so the answer comes from the cache, and its modification time
+// has been forced back to the value the first version carried — the lie tagSettleWindow admits to
+// believing. The length is different, the length is part of the version, and so the lie is caught
+// anyway. This is the strongest thing the cache can promise about a settled file, and it is one
+// field of one struct away from not being true.
+func TestTagCacheNoticesALengthChangeUnderARestoredTimestamp(t *testing.T) {
+	const first = "aaaa\n"
+	const second = "bbbbbbbb\n"
+
+	dir := tree(t, map[string]string{"a.txt": first})
+	h := handlerFor(t, dir)
+	name := filepath.Join(dir, "a.txt")
+
+	if got := serve(t, h, methodGet, "/a.txt").get("etag"); got != tagOf(first) {
+		t.Fatalf("etag = %s, want %s", got, tagOf(first))
+	}
+
+	if err := os.WriteFile(name, []byte(second), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(name, fileTime, fileTime); err != nil {
+		t.Fatal(err)
+	}
+
+	a := serve(t, h, methodGet, "/a.txt")
+	if a.body != second {
+		t.Fatalf("the response is %q, want %q", a.body, second)
+	}
+	if got := a.get("etag"); got != tagOf(second) {
+		t.Errorf("etag = %s, want %s; the timestamp was restored, but the length is part of "+
+			"the version too", got, tagOf(second))
 	}
 }
 

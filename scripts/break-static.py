@@ -229,6 +229,7 @@ SRC = [
     "internal/static/static.go",
     "internal/static/conditional.go",
     "internal/static/ranges.go",
+    "internal/static/etag.go",
 ]
 PKG = "./internal/static/"
 
@@ -874,8 +875,8 @@ BREAKS = [
     ),
     (
         "a file's length is not the file's length",
-        """	fields := withRanges(withValidator(h.fields(now, status200, kind, size), mod))""",
-        """	fields := withRanges(withValidator(h.fields(now, status200, kind, 0), mod))""",
+        """	fields := withRanges(withValidator(h.fields(now, status200, kind, size), tag, mod))""",
+        """	fields := withRanges(withValidator(h.fields(now, status200, kind, 0), tag, mod))""",
         [
             "TestContentLengthIsTheContent",
             "TestServeFile",
@@ -965,25 +966,25 @@ BREAKS = [
     ),
     (
         "two if-match lines are read as a wildcard, which 13.1.1 says a list holding one is not",
-        '''		if lines > 1 || value != "*" {''',
-        '''		if value != "*" {''',
+        '''		if lines > 1 || (value != "*" && !matchesStrong(value, tag)) {''',
+        '''		if value != "*" && !matchesStrong(value, tag) {''',
         ["TestEvaluateIgnoresRepeatedFieldLines"],
     ),
     (
         "any if-match value that is not empty is a wildcard, so no entity tag can fail",
-        '''		if lines > 1 || value != "*" {''',
+        '''		if lines > 1 || (value != "*" && !matchesStrong(value, tag)) {''',
         '''		if lines > 1 || value == "" {''',
         ["TestEvaluateFollowsSectionOrder", "TestEvaluateWithoutAValidator"],
     ),
     (
         "step 2 runs even when if-match is present, which 13.1.4 says to ignore it for",
         '''	if value, lines := lookup(r.Fields, fieldIfMatch); lines > 0 {
-		if lines > 1 || value != "*" {
+		if lines > 1 || (value != "*" && !matchesStrong(value, tag)) {
 			return verdictFailed
 		}
 	} else if date, ok := condDate(r, fieldIfUnmodifiedSince, mod, now); ok && mod.After(date) {''',
         '''	if value, lines := lookup(r.Fields, fieldIfMatch); lines > 0 {
-		if lines > 1 || value != "*" {
+		if lines > 1 || (value != "*" && !matchesStrong(value, tag)) {
 			return verdictFailed
 		}
 	}
@@ -1010,8 +1011,8 @@ BREAKS = [
     ),
     (
         "two if-none-match lines are read as a wildcard, so a repeated field line is a 304",
-        '''		if lines == 1 && value == "*" {''',
-        '''		if lines >= 1 && value == "*" {''',
+        '''		if lines == 1 && (value == "*" || matchesWeak(value, tag)) {''',
+        '''		if lines >= 1 && (value == "*" || matchesWeak(value, tag)) {''',
         ["TestEvaluateIgnoresRepeatedFieldLines"],
     ),
     (
@@ -1268,26 +1269,26 @@ BREAKS = [
     # --- static.go: the two conditional responses ----------------------------
     (
         "the 304 declares a content-length, which 15.4.5 argues against carrying",
-        '''	return w.WriteBodylessHeader(withValidator(h.fields(now, status304, "", noContentLength), mod))''',
-        '''	return w.WriteBodylessHeader(withValidator(h.fields(now, status304, "", 0), mod))''',
+        '''	return w.WriteBodylessHeader(withValidator(h.fields(now, status304, "", noContentLength), tag, mod))''',
+        '''	return w.WriteBodylessHeader(withValidator(h.fields(now, status304, "", 0), tag, mod))''',
         ["TestServeNotModifiedIsTheWholeFieldSet", "TestServeConditionalOnAnEmptyFile"],
     ),
     (
         "the 304 leaves the stream open, so a peer waits for content 15.4.5 forbids sending",
-        '''	return w.WriteBodylessHeader(withValidator(h.fields(now, status304, "", noContentLength), mod))''',
-        '''	return w.WriteHeader(withValidator(h.fields(now, status304, "", noContentLength), mod))''',
+        '''	return w.WriteBodylessHeader(withValidator(h.fields(now, status304, "", noContentLength), tag, mod))''',
+        '''	return w.WriteHeader(withValidator(h.fields(now, status304, "", noContentLength), tag, mod))''',
         ["TestServeNotModifiedCarriesNothing", "TestServeNotModifiedWithoutAValidator"],
     ),
     (
         "the two verdicts are answered with each other's response",
         """	case verdictNotModified:
-		return h.notModified(w, now, mod)
+		return h.notModified(w, now, tag, mod)
 	case verdictFailed:
 		return h.answer(w, r, status412, textPlain, body412)""",
         """	case verdictNotModified:
 		return h.answer(w, r, status412, textPlain, body412)
 	case verdictFailed:
-		return h.notModified(w, now, mod)""",
+		return h.notModified(w, now, tag, mod)""",
         [
             "TestServeNotModifiedCarriesNothing",
             "TestServePreconditionFailedIsAnOrdinaryError",
@@ -1295,9 +1296,9 @@ BREAKS = [
     ),
     (
         "the preconditions are evaluated and the answer is thrown away",
-        """	switch evaluate(r, mod, now) {
+        """	switch evaluate(r, tag, mod, now) {
 	case verdictNotModified:
-		return h.notModified(w, now, mod)
+		return h.notModified(w, now, tag, mod)
 	case verdictFailed:
 		return h.answer(w, r, status412, textPlain, body412)
 	}
@@ -1307,8 +1308,8 @@ BREAKS = [
     ),
     (
         "a 200 carries no validator, so there is nothing for a peer to send back",
-        """	return h.file(w, r, f, info.Size(), kind, now, mod)""",
-        """	return h.file(w, r, f, info.Size(), kind, now, time.Time{})""",
+        """	return h.file(w, r, f, info.Size(), kind, tag, now, mod)""",
+        """	return h.file(w, r, f, info.Size(), kind, "", now, time.Time{})""",
         ["TestServeValidatorIsTheFileOnDisk", "TestServeConditionalRoundTrip"],
     ),
     # --- span, and the two field values it prints ---------------------------
@@ -1379,25 +1380,25 @@ BREAKS = [
     # --- evaluateRange ------------------------------------------------------
     (
         "two range field lines are one range field",
-        r"""	if lines != 1 || r.Method != methodGet || size == 0 || ifRangeIsFalse(r) {""",
-        r"""	if lines < 1 || r.Method != methodGet || size == 0 || ifRangeIsFalse(r) {""",
+        r"""	if lines != 1 || r.Method != methodGet || size == 0 || ifRangeIsFalse(r, tag) {""",
+        r"""	if lines < 1 || r.Method != methodGet || size == 0 || ifRangeIsFalse(r, tag) {""",
         ["TestRangeRepeatedFieldLinesAreIgnored"],
     ),
     (
         "range handling is defined for every method, not only for GET",
-        r"""	if lines != 1 || r.Method != methodGet || size == 0 || ifRangeIsFalse(r) {""",
-        r"""	if lines != 1 || size == 0 || ifRangeIsFalse(r) {""",
+        r"""	if lines != 1 || r.Method != methodGet || size == 0 || ifRangeIsFalse(r, tag) {""",
+        r"""	if lines != 1 || size == 0 || ifRangeIsFalse(r, tag) {""",
         ["TestRangeIgnoredOnHead", "TestAcceptRangesOnlyWhereThereIsARepresentation"],
     ),
     (
         "a representation with no content is ranged into anyway",
-        r"""	if lines != 1 || r.Method != methodGet || size == 0 || ifRangeIsFalse(r) {""",
-        r"""	if lines != 1 || r.Method != methodGet || ifRangeIsFalse(r) {""",
+        r"""	if lines != 1 || r.Method != methodGet || size == 0 || ifRangeIsFalse(r, tag) {""",
+        r"""	if lines != 1 || r.Method != methodGet || ifRangeIsFalse(r, tag) {""",
         ["TestRangeIgnoredOnEmptyFile"],
     ),
     (
         "an if-range field cancels nothing",
-        r"""	if lines != 1 || r.Method != methodGet || size == 0 || ifRangeIsFalse(r) {""",
+        r"""	if lines != 1 || r.Method != methodGet || size == 0 || ifRangeIsFalse(r, tag) {""",
         r"""	if lines != 1 || r.Method != methodGet || size == 0 {""",
         ["TestIfRangeCancelsTheRange", "TestIfRangeRepeatedIsStillFalse"],
     ),
@@ -1490,19 +1491,21 @@ BREAKS = [
     # --- ifRangeIsFalse -----------------------------------------------------
     (
         "one if-range line is not an if-range field",
-        r"""	_, lines := lookup(r.Fields, fieldIfRange)
-	return lines > 0""",
-        r"""	_, lines := lookup(r.Fields, fieldIfRange)
-	return lines > 1""",
-        ["TestIfRangeCancelsTheRange"],
+        r"""	if lines == 0 {
+		return false
+	}""",
+        r"""	if lines <= 1 {
+		return false
+	}""",
+        ["TestIfRangeCancelsTheRange", "TestResumeAfterAnInterruptedDownload"],
     ),
     (
-        "the if-range value is parsed, and an entity-tag form is taken to match",
-        r"""	_, lines := lookup(r.Fields, fieldIfRange)
-	return lines > 0""",
-        r"""	value, lines := lookup(r.Fields, fieldIfRange)
-	return lines > 0 && !strings.HasPrefix(value, "\"")""",
-        ["TestIfRangeCancelsTheRange"],
+        "the if-range entity tag is checked for its form and not against the representation's",
+        r"""	return !ok || weak || rest != "" || tag == "" || opaque != tag""",
+        r"""	_ = opaque
+	return !ok || weak || rest != ""
+""",
+        ["TestIfRangeCancelsTheRange", "TestResumeAfterAnInterruptedDownload"],
     ),
 
     # --- parseRangeSet ------------------------------------------------------
@@ -1877,34 +1880,34 @@ BREAKS = [
     ),
     (
         "a single part's content-length is the whole representation's",
-        r"""		fields := withRanges(withValidator(h.fields(now, status206, kind, s.length()), mod))""",
-        r"""		fields := withRanges(withValidator(h.fields(now, status206, kind, size), mod))""",
+        r"""		fields := withRanges(withValidator(h.fields(now, status206, kind, s.length()), tag, mod))""",
+        r"""		fields := withRanges(withValidator(h.fields(now, status206, kind, size), tag, mod))""",
         ["TestRangeSinglePart", "TestRangeSingleSpecShapes"],
     ),
     (
         "a single-part 206 carries no validator, though a 200 would have",
-        r"""		fields := withRanges(withValidator(h.fields(now, status206, kind, s.length()), mod))""",
+        r"""		fields := withRanges(withValidator(h.fields(now, status206, kind, s.length()), tag, mod))""",
         r"""		fields := withRanges(h.fields(now, status206, kind, s.length()))""",
         ["TestRangeSinglePart", "TestRangeSurvivesAPreconditionThatPasses"],
     ),
     (
         "a multipart 206 carries a top-level content-range as well as per-part ones",
-        r"""	fields := withRanges(withValidator(h.fields(now, status206, multipartByteranges+edge, p.length), mod))
+        r"""	fields := withRanges(withValidator(h.fields(now, status206, multipartByteranges+edge, p.length), tag, mod))
 	return h.send(w, f, fields, p)""",
-        r"""	fields := withRanges(withValidator(h.fields(now, status206, multipartByteranges+edge, p.length), mod))
+        r"""	fields := withRanges(withValidator(h.fields(now, status206, multipartByteranges+edge, p.length), tag, mod))
 	fields = append(fields, h2.Field{Name: "content-range", Value: spans[0].contentRange(size)})
 	return h.send(w, f, fields, p)""",
         ["TestRangeMultipartHasNoTopLevelContentRange", "TestRangeMultipart"],
     ),
     (
         "a multipart 206's content-length is the representation rather than the body",
-        r"""	fields := withRanges(withValidator(h.fields(now, status206, multipartByteranges+edge, p.length), mod))""",
-        r"""	fields := withRanges(withValidator(h.fields(now, status206, multipartByteranges+edge, size), mod))""",
+        r"""	fields := withRanges(withValidator(h.fields(now, status206, multipartByteranges+edge, p.length), tag, mod))""",
+        r"""	fields := withRanges(withValidator(h.fields(now, status206, multipartByteranges+edge, size), tag, mod))""",
         ["TestRangeMultipart", "TestRangeMultipartContentLengthIsTheContent"],
     ),
     (
         "a multipart 206 carries no validator",
-        r"""	fields := withRanges(withValidator(h.fields(now, status206, multipartByteranges+edge, p.length), mod))""",
+        r"""	fields := withRanges(withValidator(h.fields(now, status206, multipartByteranges+edge, p.length), tag, mod))""",
         r"""	fields := withRanges(h.fields(now, status206, multipartByteranges+edge, p.length))""",
         ["TestRangeMultipart", "TestRangeSpansAreNeitherReorderedNorMerged"],
     ),
@@ -2023,22 +2026,22 @@ BREAKS = [
     ),
     (
         "the range field is evaluated before the preconditions rather than after",
-        r"""	switch evaluate(r, mod, now) {
+        r"""	switch evaluate(r, tag, mod, now) {
 	case verdictNotModified:
-		return h.notModified(w, now, mod)
+		return h.notModified(w, now, tag, mod)
 	case verdictFailed:
 		return h.answer(w, r, status412, textPlain, body412)
 	}""",
-        r"""	switch spans0, verdict0 := evaluateRange(r, info.Size()); verdict0 {
+        r"""	switch spans0, verdict0 := evaluateRange(r, tag, info.Size()); verdict0 {
 	case rangeNotSatisfiable:
 		return h.answer(w, r, status416, textPlain, body416,
 			h2.Field{Name: "content-range", Value: unsatisfiedRange(info.Size())})
 	case rangePartial:
-		return h.partial(w, f, spans0, info.Size(), mediaType(name), now, mod)
+		return h.partial(w, f, spans0, info.Size(), mediaType(name), tag, now, mod)
 	}
-	switch evaluate(r, mod, now) {
+	switch evaluate(r, tag, mod, now) {
 	case verdictNotModified:
-		return h.notModified(w, now, mod)
+		return h.notModified(w, now, tag, mod)
 	case verdictFailed:
 		return h.answer(w, r, status412, textPlain, body412)
 	}""",
@@ -2059,8 +2062,8 @@ BREAKS = [
     ),
     (
         "a 200 does not advertise ranges, so a peer has no reason to ask for one",
-        r"""	fields := withRanges(withValidator(h.fields(now, status200, kind, size), mod))""",
-        r"""	fields := withValidator(h.fields(now, status200, kind, size), mod)""",
+        r"""	fields := withRanges(withValidator(h.fields(now, status200, kind, size), tag, mod))""",
+        r"""	fields := withValidator(h.fields(now, status200, kind, size), tag, mod)""",
         ["TestAcceptRangesOnlyWhereThereIsARepresentation", "TestRangeInvalidIsIgnored"],
     ),
     (
@@ -2068,6 +2071,399 @@ BREAKS = [
         r"""	fields := append(h.fields(h.now().UTC(), status, kind, int64(len(body))), extra...)""",
         r"""	fields := withRanges(append(h.fields(h.now().UTC(), status, kind, int64(len(body))), extra...))""",
         ["TestAcceptRangesOnlyWhereThereIsARepresentation", "TestRangeNotSatisfiable"],
+    ),
+
+    # --- static.go: the etag field ------------------------------------------
+
+    (
+        "a representation with no tag is given an empty etag field",
+        r"""	if tag != "" {
+		fields = append(fields, h2.Field{Name: "etag", Value: tag})
+	}""",
+        r"""	fields = append(fields, h2.Field{Name: "etag", Value: tag})""",
+        ["TestWithValidatorLeavesTheFieldOutWhenThereIsNone"],
+    ),
+    (
+        "every tag this server sends is weak, so no peer can act on one",
+        r"""		fields = append(fields, h2.Field{Name: "etag", Value: tag})""",
+        r"""		fields = append(fields, h2.Field{Name: "etag", Value: weakPrefix + tag})""",
+        ["TestEtagIsSyntacticallyAnEntityTag", "TestResumeAfterAnInterruptedDownload",
+         "TestLostUpdateIsRefused"],
+    ),
+
+    # --- etag.go: the constants ---------------------------------------------
+
+    (
+        "the weakness indicator is lower case, which 8.8.3 spells with a case-sensitive string",
+        r"""const weakPrefix = "W/"
+""",
+        r"""const weakPrefix = "w/"
+""",
+        ["TestSplitEntityTag", "TestMatchesIsTheTwoComparisonFunctions"],
+    ),
+    (
+        "the cache is given no room, so every request rehashes the file it just hashed",
+        r"""const maxTagCacheEntries = 1024""",
+        r"""const maxTagCacheEntries = 0""",
+        ["TestTagCacheHashesOncePerVersion", "TestEtagIsNotCachedBeforeItsTimestampHasSettled"],
+    ),
+    (
+        "there is no settle window, so a file written this instant is filed under its timestamp",
+        r"""const tagSettleWindow = 2 * time.Second""",
+        r"""const tagSettleWindow = 0""",
+        ["TestEtagIsNotCachedBeforeItsTimestampHasSettled",
+         "TestTagSettleWindowCoversTheCoarsestFilesystem"],
+    ),
+    (
+        "the window is a nanosecond, which no filesystem's clock can resolve",
+        r"""const tagSettleWindow = 2 * time.Second""",
+        r"""const tagSettleWindow = time.Nanosecond""",
+        ["TestTagSettleWindowCoversTheCoarsestFilesystem"],
+    ),
+
+    # --- etag.go: the version -----------------------------------------------
+
+    (
+        "a file's version is its timestamp alone, so a rewrite at another length keeps its tag",
+        r"""	return tagVersion{size: info.Size(), sec: mod.Unix(), nsec: mod.Nanosecond()}""",
+        r"""	return tagVersion{sec: mod.Unix(), nsec: mod.Nanosecond()}""",
+        ["TestVersionOfIsTheWholeOfWhatTheFilesystemKnows",
+         "TestTagCacheNoticesALengthChangeUnderARestoredTimestamp"],
+    ),
+    (
+        "the version is truncated to the second, discarding what a modern filesystem does keep",
+        r"""	return tagVersion{size: info.Size(), sec: mod.Unix(), nsec: mod.Nanosecond()}""",
+        r"""	return tagVersion{size: info.Size(), sec: mod.Unix()}""",
+        ["TestVersionOfIsTheWholeOfWhatTheFilesystemKnows"],
+    ),
+
+    # --- etag.go: the single flight -----------------------------------------
+
+    (
+        "the in-flight call is keyed by name alone, so a request joins another version's read",
+        r"""	key := tagCallKey{name: name, version: v}""",
+        r"""	key := tagCallKey{name: name}""",
+        ["TestTagCacheJoinsOnlyTheSameVersion"],
+    ),
+    (
+        "a cached entry is used whatever version it was filed for",
+        r"""	if e, ok := c.entries[name]; ok && e.version == v {""",
+        r"""	if e, ok := c.entries[name]; ok {""",
+        ["TestTagCacheHashesOncePerVersion",
+         "TestTagCacheNoticesALengthChangeUnderARestoredTimestamp"],
+    ),
+    (
+        "an empty tag is filed, so one unreadable moment is a file with no validator",
+        r"""		if call.err == nil && call.tag != "" {""",
+        r"""		if call.err == nil {""",
+        ["TestTagCacheDoesNotKeepAFailure"],
+    ),
+    (
+        "nothing is ever filed, so the cache is a lock in front of a hash",
+        r"""		if call.err == nil && call.tag != "" {
+			c.store(name, tagEntry{version: v, tag: call.tag})
+		}""",
+        "",
+        ["TestTagCacheHashesOncePerVersion", "TestEtagIsNotCachedBeforeItsTimestampHasSettled"],
+    ),
+    (
+        "the finished call is left in the map, so every later request joins a read that is over",
+        r"""		delete(c.calls, key)""",
+        "",
+        ["TestTagCacheDoesNotKeepAFailure", "TestTagCacheForgetsAFinishedCall"],
+    ),
+    (
+        "the bookkeeping is written out after the hash instead of deferred, so a panic strands it",
+        r"""	defer func() {
+		c.mu.Lock()
+		delete(c.calls, key)
+		if call.err == nil && call.tag != "" {
+			c.store(name, tagEntry{version: v, tag: call.tag})
+		}
+		c.mu.Unlock()
+		close(call.done)
+	}()
+
+	call.tag, call.err = hash()
+	return call.tag, call.err""",
+        r"""	call.tag, call.err = hash()
+
+	c.mu.Lock()
+	delete(c.calls, key)
+	if call.err == nil && call.tag != "" {
+		c.store(name, tagEntry{version: v, tag: call.tag})
+	}
+	c.mu.Unlock()
+	close(call.done)
+
+	return call.tag, call.err""",
+        ["TestTagCacheSurvivesAPanicInTheHash"],
+    ),
+
+    # --- etag.go: the bound -------------------------------------------------
+
+    (
+        "a cache with no room evicts until it is empty and then stores one entry anyway",
+        r"""	if c.limit <= 0 {
+		return
+	}
+	if _, replacing := c.entries[name]; !replacing {
+		for len(c.entries) >= c.limit {""",
+        r"""	if _, replacing := c.entries[name]; !replacing {
+		for len(c.entries) >= c.limit && len(c.entries) > 0 {""",
+        ["TestTagCacheWithNoRoomForAnythingStillAnswers"],
+    ),
+    (
+        "eviction stops one entry late, so every limit is honoured as one more than it says",
+        r"""		for len(c.entries) >= c.limit {""",
+        r"""		for len(c.entries) > c.limit {""",
+        ["TestTagCacheHoldsItsBoundExactly", "TestTagCacheStaysInsideItsBound"],
+    ),
+    (
+        "a new name is the case that does not evict, and a replacement is the one that does",
+        r"""	if _, replacing := c.entries[name]; !replacing {""",
+        r"""	if _, replacing := c.entries[name]; replacing {""",
+        ["TestTagCacheStaysInsideItsBound", "TestTagCacheHoldsItsBoundExactly"],
+    ),
+    (
+        "eviction empties the map rather than taking one entry off it",
+        r"""			for k := range c.entries {
+				delete(c.entries, k)
+				break
+			}""",
+        r"""			for k := range c.entries {
+				delete(c.entries, k)
+			}""",
+        ["TestTagCacheHoldsItsBoundExactly"],
+    ),
+
+    # --- etag.go: what is hashed --------------------------------------------
+
+    (
+        "a read that failed is hashed as far as it got, and the digest of a fragment is a tag",
+        r"""	if _, err := io.CopyBuffer(sum, r, buf); err != nil {
+		return "", err
+	}""",
+        r"""	io.CopyBuffer(sum, r, buf)""",
+        ["TestHashContentReportsAReadFailure", "TestEtagIsAbsentWhenTheContentCannotBeRead"],
+    ),
+    (
+        "the tag is sent unquoted, which is not an entity-tag and matches nothing a peer sends",
+        r"""	return `"` + base64.RawURLEncoding.EncodeToString(sum.Sum(nil)) + `"`, nil""",
+        r"""	return base64.RawURLEncoding.EncodeToString(sum.Sum(nil)), nil""",
+        ["TestEtagIsSyntacticallyAnEntityTag", "TestEtagIsTheHashOfTheContentAndNotOfAnythingElse"],
+    ),
+    (
+        "the digest is padded and in the alphabet with a solidus in it",
+        r"""	return `"` + base64.RawURLEncoding.EncodeToString(sum.Sum(nil)) + `"`, nil""",
+        r"""	return `"` + base64.StdEncoding.EncodeToString(sum.Sum(nil)) + `"`, nil""",
+        ["TestEtagIsSyntacticallyAnEntityTag", "TestEtagIsTheHashOfTheContentAndNotOfAnythingElse"],
+    ),
+    (
+        "the digest is the truncated one, so the tag is not the whole of what was read",
+        r"""	sum := sha256.New()""",
+        r"""	sum := sha256.New224()""",
+        ["TestEtagIsSyntacticallyAnEntityTag", "TestEtagIsTheHashOfTheContentAndNotOfAnythingElse"],
+    ),
+    (
+        "only the first buffer's worth is hashed, so the tag depends on the buffer and not the file",
+        r"""	if _, err := io.CopyBuffer(sum, r, buf); err != nil {""",
+        r"""	if _, err := io.CopyBuffer(sum, io.LimitReader(r, int64(len(buf))), buf); err != nil {""",
+        ["TestHashContentIsIndependentOfTheBufferSize"],
+    ),
+    (
+        "the section hashed starts one octet in",
+        r"""		return hashContent(io.NewSectionReader(f, 0, v.size), *buf)""",
+        r"""		return hashContent(io.NewSectionReader(f, 1, v.size), *buf)""",
+        ["TestEtagIsTheHashOfTheContentAndNotOfAnythingElse", "TestEtagIsStableAcrossRequests"],
+    ),
+    (
+        "the file is read through its own offset, so hashing it consumes the content to be sent",
+        r"""		return hashContent(io.NewSectionReader(f, 0, v.size), *buf)""",
+        r"""		return hashContent(f, *buf)""",
+        ["TestEtagSurvivesTheFileBeingReadTwice", "TestConditionalGetRoundTrip"],
+    ),
+
+    # --- etag.go: when the cache is asked -----------------------------------
+
+    (
+        "the settle window is read the wrong way round, so only a settled file is rehashed",
+        r"""	if now.Sub(info.ModTime()) < tagSettleWindow {""",
+        r"""	if now.Sub(info.ModTime()) > tagSettleWindow {""",
+        ["TestEtagIsNotCachedBeforeItsTimestampHasSettled", "TestEtagOfAnUnsettledFileIsRecomputed"],
+    ),
+    (
+        "the cache answers for a file of any age, including one written this instant",
+        r"""	if now.Sub(info.ModTime()) < tagSettleWindow {
+		tag, err = hash()
+	} else {
+		tag, err = h.tags.get(name, v, hash)
+	}""",
+        r"""	tag, err = h.tags.get(name, v, hash)""",
+        ["TestEtagIsNotCachedBeforeItsTimestampHasSettled", "TestEtagOfAnUnsettledFileIsRecomputed"],
+    ),
+    (
+        "the cache is never asked, so every request for every file reads it again",
+        r"""	if now.Sub(info.ModTime()) < tagSettleWindow {
+		tag, err = hash()
+	} else {
+		tag, err = h.tags.get(name, v, hash)
+	}""",
+        r"""	tag, err = hash()""",
+        ["TestEtagIsNotCachedBeforeItsTimestampHasSettled"],
+    ),
+
+    # --- etag.go: taking one entity-tag off a list --------------------------
+
+    (
+        "the weakness indicator is consumed and not reported, so every tag is read as strong",
+        r"""	if after, found := strings.CutPrefix(s, weakPrefix); found {
+		weak, s = true, after
+	}""",
+        r"""	if after, found := strings.CutPrefix(s, weakPrefix); found {
+		s = after
+	}""",
+        ["TestSplitEntityTag", "TestMatchesIsTheTwoComparisonFunctions", "TestLostUpdateIsRefused"],
+    ),
+    (
+        "the indicator is a set of characters to strip rather than a prefix, so W/W/ is accepted",
+        r"""	if after, found := strings.CutPrefix(s, weakPrefix); found {
+		weak, s = true, after
+	}""",
+        r"""	weak = strings.HasPrefix(s, weakPrefix)
+	s = strings.TrimLeft(s, weakPrefix)""",
+        ["TestSplitEntityTag"],
+    ),
+    (
+        "the opening quotation mark is not required, only some quotation mark somewhere",
+        r"""	if !strings.HasPrefix(s, `"`) {
+		return "", false, "", false
+	}""",
+        r"""	if s == "" {
+		return "", false, "", false
+	}""",
+        ["TestSplitEntityTag"],
+    ),
+    (
+        "the tag ends at the last quotation mark in the value rather than the next one",
+        r"""	end := strings.IndexByte(s[1:], '"')""",
+        r"""	end := strings.LastIndexByte(s[1:], '"')""",
+        ["TestSplitEntityTag", "TestMatchesIsTheTwoComparisonFunctions"],
+    ),
+    (
+        "the quotation marks are stripped, so the opaque-tag is compared against a quoted one",
+        r"""	return s[:end+2], weak, s[end+2:], true""",
+        r"""	return s[1:end+1], weak, s[end+2:], true""",
+        ["TestSplitEntityTagKeepsTheQuotationMarks", "TestSplitEntityTag",
+         "TestMatchesIsTheTwoComparisonFunctions"],
+    ),
+    (
+        "what is left over begins at the closing quotation mark instead of after it",
+        r"""	return s[:end+2], weak, s[end+2:], true""",
+        r"""	return s[:end+2], weak, s[end+1:], true""",
+        ["TestSplitEntityTag"],
+    ),
+
+    # --- etag.go: the two comparison functions ------------------------------
+
+    (
+        "the strong comparison is the weak one, so a W/ in a request acts on the representation",
+        r"""func matchesStrong(value, tag string) bool { return matches(value, tag, false) }""",
+        r"""func matchesStrong(value, tag string) bool { return matches(value, tag, true) }""",
+        ["TestMatchesIsTheTwoComparisonFunctions", "TestLostUpdateIsRefused"],
+    ),
+    (
+        "the weak comparison matches nothing, so no cached copy is ever still good",
+        r"""func matchesWeak(value, tag string) bool { return matches(value, tag, true) }""",
+        r"""func matchesWeak(value, tag string) bool { return false }""",
+        ["TestMatchesIsTheTwoComparisonFunctions"],
+    ),
+    (
+        "a representation with no tag matches every entity tag a peer names",
+        r"""	if tag == "" {
+		return false
+	}""",
+        r"""	if tag == "" {
+		return true
+	}""",
+        ["TestMatchesAgainstNoTagIsAlwaysFalse", "TestEvaluateWithoutAValidator"],
+    ),
+    (
+        "the scan stops at the tag it found, so what follows it is never read",
+        r"""		if (weakOK || !weak) && opaque == tag {
+			found = true
+		}""",
+        r"""		if (weakOK || !weak) && opaque == tag {
+			return true
+		}""",
+        ["TestMatchesIsTheTwoComparisonFunctions", "TestMatchesFindsATagAnywhereInALongList",
+         "TestLostUpdateIsRefused"],
+    ),
+    (
+        "weakness is not consulted, so both functions are the weak one",
+        r"""		if (weakOK || !weak) && opaque == tag {""",
+        r"""		_ = weak
+		if opaque == tag {""",
+        ["TestMatchesIsTheTwoComparisonFunctions", "TestLostUpdateIsRefused"],
+    ),
+    (
+        "the strong comparison matches only weak tags, which is the table read upside down",
+        r"""		if (weakOK || !weak) && opaque == tag {""",
+        r"""		if (weakOK || weak) && opaque == tag {""",
+        ["TestMatchesIsTheTwoComparisonFunctions", "TestLostUpdateIsRefused"],
+    ),
+    (
+        "an empty list element ends the scan instead of being skipped",
+        r"""		if rest == "" {
+			return found
+		}
+		if rest[0] == ',' {
+			rest = rest[1:]
+			continue
+		}""",
+        r"""		if rest == "" {
+			return found
+		}""",
+        ["TestMatchesIsTheTwoComparisonFunctions"],
+    ),
+    (
+        "an element's leading whitespace is not removed, so the RFC's own list does not parse",
+        r"""	for {
+		rest = strings.TrimLeft(rest, " \t")""",
+        r"""	for {""",
+        ["TestMatchesIsTheTwoComparisonFunctions"],
+    ),
+    (
+        "the whitespace after a tag is not removed, so a space before the comma ends the list",
+        r"""		rest = strings.TrimLeft(after, " \t")""",
+        r"""		rest = after""",
+        ["TestMatchesIsTheTwoComparisonFunctions"],
+    ),
+    (
+        "what follows a tag is not checked, so two quoted strings side by side are a list",
+        r"""		rest = strings.TrimLeft(after, " \t")
+		if rest == "" {
+			return found
+		}
+		if rest[0] != ',' {
+			return false
+		}
+		rest = rest[1:]""",
+        r"""		rest = strings.TrimLeft(after, " \t")""",
+        ["TestMatchesIsTheTwoComparisonFunctions"],
+    ),
+    (
+        "an element that does not parse ends the scan with whatever was found before it",
+        r"""		opaque, weak, after, ok := splitEntityTag(rest)
+		if !ok {
+			return false
+		}""",
+        r"""		opaque, weak, after, ok := splitEntityTag(rest)
+		if !ok {
+			return found
+		}""",
+        ["TestMatchesIsTheTwoComparisonFunctions", "TestMatchesFindsATagAnywhereInALongList",
+         "TestLostUpdateIsRefused"],
     ),
 ]
 
