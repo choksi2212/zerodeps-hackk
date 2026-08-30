@@ -2484,6 +2484,13 @@ func TestReportConsumedCreditsOnlyTheConnectionForAFinishedStream(t *testing.T) 
 	if got := h.w.credit(1); got != 0 {
 		t.Errorf("stream 1 was credited %d octets, want none once its content is complete", got)
 	}
+
+	// Counted as well as summed. A WINDOW_UPDATE with an increment of zero adds up to
+	// the same nothing and is §6.9.1's PROTOCOL_ERROR on the wire, so "no credit" and
+	// "no frame" are two assertions and only one of them is about arithmetic.
+	if got := h.w.updates(); len(got) != 1 {
+		t.Errorf("%d WINDOW_UPDATEs went out, want only the connection's: %v", len(got), got)
+	}
 }
 
 // TestReportConsumedIgnoresNothing is the empty read.
@@ -2500,6 +2507,16 @@ func TestReportConsumedIgnoresNothing(t *testing.T) {
 
 	if got := h.w.updates(); len(got) != 0 {
 		t.Errorf("reporting no content sent %d WINDOW_UPDATEs, want none: %v", len(got), got)
+	}
+
+	// And what was ignored is not carried into what comes next. A negative report that
+	// reached the counter would sit there as a debt against the credit a real read earns,
+	// so the frame due at the threshold would wait for the shortfall to be made up
+	// first — a stall as large as the nonsense that caused it, arriving nowhere near it.
+	h.tab.ReportConsumed(1, limits.ReplenishThreshold, true)
+	if got, want := h.w.credit(0), uint32(limits.ReplenishThreshold); got != want {
+		t.Errorf("the connection was credited %d octets once a threshold's worth was read, want %d",
+			got, want)
 	}
 }
 
@@ -2667,4 +2684,74 @@ func TestReportConsumedSurvivesAWriterThatHasStopped(t *testing.T) {
 		t.Errorf("the connection window is %d after credit that could not be sent, want %d",
 			got, want)
 	}
+}
+
+// TestEarningMoreThanOneWindowUpdateCanCarryHoldsTheRestBack.
+//
+// A WINDOW_UPDATE may credit at most 2^31-1 octets (§6.9.1) and the sum a handler's reads
+// accrue into has no bound of its own, so the two have to be reconciled somewhere. The
+// threshold means a body cannot reach that sum by being read — it flushes four orders of
+// magnitude earlier — which makes this the arithmetic being right at a point where nothing
+// can currently make it wrong, and that is the only state in which it is cheap. What it
+// costs to leave out is a uint32 conversion of a sum nobody is watching: 2^32+1 octets
+// consumed becomes a credit of one octet, and the peer that was owed four gigabytes stops.
+//
+// The remainder is held back rather than dropped, which is the second half. Credit that
+// did not fit in this frame is still credit the peer is owed.
+func TestEarningMoreThanOneWindowUpdateCanCarryHoldsTheRestBack(t *testing.T) {
+	c := &recvCredit{}
+
+	if got, want := c.earn(flow.MaxWindowSize+1000), uint32(flow.MaxWindowSize); got != want {
+		t.Errorf("earning %d octets advertised %d of them, want the maximum a frame carries (%d)",
+			int64(flow.MaxWindowSize)+1000, got, want)
+	}
+	if c.pending != 1000 {
+		t.Errorf("%d octets are held back for the next frame, want 1000", c.pending)
+	}
+	if got, want := c.earn(limits.ReplenishThreshold),
+		uint32(1000+limits.ReplenishThreshold); got != want {
+		t.Errorf("the held-back octets came back as %d, want %d", got, want)
+	}
+}
+
+// TestCreditThatWouldOverflowTheConnectionWindowEndsTheConnection.
+//
+// Not reachable from a peer, and that is the point. Credit returned can only be credit
+// that was spent, so a window cannot be restored above where it started — unless the
+// report was wrong, which is a fault on this side of the connection. §6.9.1's maximum is
+// checked rather than assumed anyway, because a window whose value cannot be trusted is
+// two ends disagreeing about how much may be in flight for as long as the connection
+// lives, and there is no later moment at which that becomes visible. Ending the
+// connection is the only answer that does not desynchronise it silently.
+func TestCreditThatWouldOverflowTheConnectionWindowEndsTheConnection(t *testing.T) {
+	h := newHarness(t, Config{})
+	h.open(1, false)
+
+	h.tab.ReportConsumed(1, flow.MaxWindowSize, true)
+
+	err := h.send(frame.PriorityFrame{StreamID: 1, Weight: 16})
+	assertConnError(t, err, h2.FlowControlError,
+		"credit that takes the connection window above the maximum")
+}
+
+// TestCreditThatWouldOverflowAStreamWindowResetsThatStream is the same fault at the other
+// scope, which §6.9 gives a different answer: the arithmetic is one stream's, so the
+// connection survives it.
+//
+// Arranging it takes a second stream, because a stream window can only overflow on an
+// increment the connection window has room for — and both start at the same size, so the
+// room has to come from somewhere. Stream 3 spends connection credit that stream 1 does
+// not, which is the ordinary state of a multiplexed connection and here is what leaves the
+// connection window lower than stream 1's.
+func TestCreditThatWouldOverflowAStreamWindowResetsThatStream(t *testing.T) {
+	h := newHarness(t, Config{})
+	h.open(1, false)
+	h.open(3, false)
+	h.mustSend(filler(3, limits.MaxFrameSize, false))
+
+	h.tab.ReportConsumed(1, flow.MaxWindowSize-flow.InitialWindowSize+1, true)
+
+	err := h.send(frame.PriorityFrame{StreamID: 1, Weight: 16})
+	assertStreamError(t, err, 1, h2.FlowControlError,
+		"credit that takes one stream's window above the maximum")
 }

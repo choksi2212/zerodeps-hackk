@@ -647,7 +647,9 @@ func TestReadingAnUnendedBodyReportsThatMoreIsComing(t *testing.T) {
 // A Read smaller than the payload in front of it leaves the rest for the next call, and
 // the credit has to follow the octets rather than the frame: reporting the payload would
 // return window for content the handler has not looked at, which is the one direction
-// flow control must not err in.
+// flow control must not err in. The other way round is the same rule and the worse fault —
+// reporting the buffer rather than what went into it returns credit for octets the peer
+// has not sent, which is a window this server cannot honour.
 func TestAShortReadReportsOnlyWhatItTook(t *testing.T) {
 	c := &creditLog{}
 	b := newBody(1, c)
@@ -656,10 +658,13 @@ func TestAShortReadReportsOnlyWhatItTook(t *testing.T) {
 	if n, err := b.Read(make([]byte, 2)); n != 2 || err != nil {
 		t.Fatalf("a 2-octet read of a 6-octet payload gave (%d, %v), want (2, nil)", n, err)
 	}
+	if n, err := b.Read(make([]byte, 64)); n != 4 || err != nil {
+		t.Fatalf("a 64-octet read of the 4 octets left gave (%d, %v), want (4, nil)", n, err)
+	}
 
 	got := c.reports()
-	if len(got) != 1 || got[0].n != 2 {
-		t.Fatalf("a 2-octet read reported %v, want one report of 2 octets", got)
+	if len(got) != 2 || got[0].n != 2 || got[1].n != 4 {
+		t.Fatalf("the two reads reported %v, want 2 octets and then 4", got)
 	}
 }
 

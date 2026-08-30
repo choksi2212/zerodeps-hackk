@@ -297,6 +297,13 @@ BREAKS = [
         """	s += fmt.Sprintf("dependencies: %d\\n", len(bi.Settings))""",
         ["TestBuildReportZeroDependencies"],
     ),
+    (
+        "serve: the stream table is built with no way to send a frame of its own",
+        """			Sender:   sender,
+			Writer:   w,""",
+        """			Sender:   sender,""",
+        ["TestServeReplenishesTheReceiveWindow"],
+    ),
 ]
 
 breakage.main(SRC, PKG, BREAKS)

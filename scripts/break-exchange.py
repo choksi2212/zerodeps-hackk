@@ -77,9 +77,9 @@ BREAKS = [
         ["TestAZeroLengthReadDoesNotBlock"],
     ),
     (
-        "Read hands over the front of a body whose stream is already gone before reporting why",
+        "take hands over the front of a body whose stream is already gone before reporting why",
         """		if b.err != nil {
-			return 0, b.err
+			return 0, false, b.err
 		}
 		if len(b.chunks) > 0 {
 			break
@@ -88,7 +88,7 @@ BREAKS = [
 			break
 		}
 		if b.err != nil {
-			return 0, b.err
+			return 0, false, b.err
 		}""",
         ["TestAFailedBodyReportsItsErrorAheadOfWhatArrived"],
     ),
@@ -104,19 +104,19 @@ BREAKS = [
 
     # --- body.go: the offset and the queue ---------------------------------
     (
-        "Read does not advance into the chunk it read, so the same payload is handed over forever",
-        """	n := copy(p, b.chunks[0][b.off:])
+        "take does not advance into the chunk it read, so the same payload is handed over forever",
+        """	n = copy(p, b.chunks[0][b.off:])
 	b.off += n""",
-        """	n := copy(p, b.chunks[0][b.off:])""",
+        """	n = copy(p, b.chunks[0][b.off:])""",
         [
             "TestOneReadNeverCrossesAChunk",
             "TestAReadChunkIsDroppedRatherThanKept",
         ],
     ),
     (
-        "Read ignores how far it had got into the front chunk and re-reads it from the start",
-        """	n := copy(p, b.chunks[0][b.off:])""",
-        """	n := copy(p, b.chunks[0])""",
+        "take ignores how far it had got into the front chunk and re-reads it from the start",
+        """	n = copy(p, b.chunks[0][b.off:])""",
+        """	n = copy(p, b.chunks[0])""",
         ["TestAPartiallyReadChunkResumesWhereItStopped"],
     ),
     (
@@ -207,10 +207,10 @@ BREAKS = [
     ),
     (
         "newBody returns a body with no condition variable to wait on",
-        """	b := &Body{}
+        """	b := &Body{id: id, credit: credit}
 	b.wake = sync.NewCond(&b.mu)
 	return b""",
-        """	b := &Body{}
+        """	b := &Body{id: id, credit: credit}
 	return b""",
         ["TestABodyReadsBackWhatArrived"],
     ),
@@ -292,17 +292,17 @@ BREAKS = [
 	}""",
         """	req, err := request.Parse(s.ID(), fields, endStream)
 	if err != nil {
-		r.start(s.ID(), &Request{Request: req, Body: newBody()})
+		r.start(s.ID(), &Request{Request: req, Body: newBody(s.ID(), r.streams)})
 		return err
 	}""",
         ["TestAMalformedHeaderSectionIsRefusedBeforeAnyHandlerRuns"],
     ),
     (
         "Headers treats a request that arrived complete as one still arriving",
-        """	body := newBody()
+        """	body := newBody(s.ID(), r.streams)
 	if endStream {
 		body.end(nil)""",
-        """	body := newBody()
+        """	body := newBody(s.ID(), r.streams)
 	if false {
 		body.end(nil)""",
         [
@@ -663,6 +663,78 @@ BREAKS = [
         """	return h2.ConnErrorf(h2.InternalError,""",
         """	return h2.ConnErrorf(h2.ProtocolError,""",
         ["TestABodyFrameForARequestThatIsNotArrivingIsAConnectionError"],
+    ),
+    # --- reporting consumed content (§6.9) ----------------------------------
+    #
+    # What a Read reports is what returns the peer's flow-control window, so every break
+    # here is an upload that stops partway with no error on either end: the peer waiting
+    # to be told there is room, the handler waiting for content. None of them can be seen
+    # on a body smaller than one window, which is every request a browser makes.
+    (
+        "a body is built with nowhere to report the content a handler reads",
+        """	if credit == nil {
+		panic("exchange: newBody requires somewhere to report consumed content")
+	}""",
+        """	// a body with nowhere to report to is accepted""",
+        ["TestNewBodyRefusesToBeBuiltWithNowhereToReportTo"],
+    ),
+    (
+        "Read: a read that took nothing is reported, which is §6.9.1's zero increment",
+        """	if n > 0 {
+		b.credit.ReportConsumed(b.id, n, more)
+	}""",
+        """	b.credit.ReportConsumed(b.id, n, more)""",
+        ["TestReadsThatConsumeNothingReportNothing"],
+    ),
+    (
+        "Read: the content is reported against the connection rather than the stream",
+        """		b.credit.ReportConsumed(b.id, n, more)""",
+        """		b.credit.ReportConsumed(0, n, more)""",
+        [
+            "TestReadingABodyReportsEveryOctetItConsumed",
+            "TestContentAHandlerReadsIsReportedToTheTable",
+        ],
+    ),
+    (
+        "Read: the payload in front of the handler is reported rather than what it took",
+        """	n, more, err := b.take(p)
+	if n > 0 {
+		b.credit.ReportConsumed(b.id, n, more)
+	}""",
+        """	n, more, err := b.take(p)
+	if n > 0 {
+		b.credit.ReportConsumed(b.id, len(p), more)
+	}""",
+        ["TestAShortReadReportsOnlyWhatItTook"],
+    ),
+    (
+        "the content is reported with the body's lock still held",
+        """	return n, !b.ended || len(b.chunks) > 0, nil""",
+        """	more = !b.ended || len(b.chunks) > 0
+	b.credit.ReportConsumed(b.id, n, more)
+	return n, more, nil""",
+        [
+            "TestContentIsReportedWithTheLockReleased",
+            "TestReadingABodyReportsEveryOctetItConsumed",
+        ],
+    ),
+    (
+        "take: a body the peer has not ended reports no more content once its buffer empties",
+        """	return n, !b.ended || len(b.chunks) > 0, nil""",
+        """	return n, !b.ended, nil""",
+        ["TestOnlyTheLastReadOfABodyReportsThatThereIsNoMore"],
+    ),
+    (
+        "take: the last read of a finished body reports that more content is coming",
+        """	return n, !b.ended || len(b.chunks) > 0, nil""",
+        """	return n, true, nil""",
+        ["TestOnlyTheLastReadOfABodyReportsThatThereIsNoMore"],
+    ),
+    (
+        "Headers: the body reports its content against the connection rather than its stream",
+        """	body := newBody(s.ID(), r.streams)""",
+        """	body := newBody(0, r.streams)""",
+        ["TestContentAHandlerReadsIsReportedToTheTable"],
     ),
 ]
 

@@ -401,12 +401,8 @@ BREAKS = [
     ),
     (
         "HandleFrame drains after the dispatch, so every frame is judged against a stale table",
-        """	t.drainSent()
-
-	switch v := f.(type) {""",
-        """	defer t.drainSent()
-
-	switch v := f.(type) {""",
+        """	t.drainSent()""",
+        """	defer t.drainSent()""",
         [
             "TestReportSendEndFreesTheConcurrencySlotBeforeTheNextRequestIsJudged",
             "TestReportSendEndOnAStreamThePeerHasNotFinishedLeavesItHalfClosedLocal",
@@ -1521,6 +1517,199 @@ BREAKS = [
 		"%s on closed stream %d (RFC 9113 §5.1)", kind, id)""",
         """	return h2.StreamErrorf(id, h2.StreamClosed, "stream closed")""",
         ["TestEveryErrorNamesTheRuleAndTheStream"],
+    ),
+    # --- returning the receive window (§6.9) --------------------------------
+    #
+    # This section is about a mechanism whose failures are all silences. Every break
+    # below leaves a server that answers every request a browser makes, passes h2spec
+    # end to end, and stalls the first upload larger than 64 KiB — or, worse, refuses a
+    # peer that spent exactly the credit it was offered, at a moment decided by which
+    # goroutine ran first. There is no error message anywhere in that, on either end,
+    # which is why the credit path is tested by frame counts and window arithmetic
+    # rather than by return values.
+    (
+        "a report of no content is accrued like any other",
+        """	if n <= 0 {
+		return
+	}""",
+        """	// every report is accrued, whatever it says""",
+        ["TestReportConsumedIgnoresNothing"],
+    ),
+    (
+        "credit is returned to a stream whose content is already complete",
+        """	var stream uint32
+	if more {
+		c := t.streamCredit[id]
+		if c == nil {
+			c = &recvCredit{}
+			t.streamCredit[id] = c
+		}
+		stream = c.earn(int64(n))
+	}""",
+        """	c := t.streamCredit[id]
+	if c == nil {
+		c = &recvCredit{}
+		t.streamCredit[id] = c
+	}
+	stream := c.earn(int64(n))""",
+        ["TestReportConsumedCreditsOnlyTheConnectionForAFinishedStream"],
+    ),
+    (
+        "the credit earned for a stream is not kept between one read and the next",
+        """		if c == nil {
+			c = &recvCredit{}
+			t.streamCredit[id] = c
+		}""",
+        """		if c == nil {
+			c = &recvCredit{}
+		}""",
+        ["TestReportConsumedHoldsCreditBackUntilTheThreshold"],
+    ),
+    (
+        "the stream is credited before the connection",
+        """	if conn > 0 {
+		t.enqueueWindowUpdate(0, conn)
+	}
+	if stream > 0 {
+		t.enqueueWindowUpdate(id, stream)
+	}""",
+        """	if stream > 0 {
+		t.enqueueWindowUpdate(id, stream)
+	}
+	if conn > 0 {
+		t.enqueueWindowUpdate(0, conn)
+	}""",
+        ["TestReportConsumedCreditsTheConnectionBeforeTheStream"],
+    ),
+    (
+        "the connection is credited an increment of zero when it has earned nothing",
+        """	if conn > 0 {
+		t.enqueueWindowUpdate(0, conn)
+	}""",
+        """	t.enqueueWindowUpdate(0, conn)""",
+        ["TestReportConsumedHoldsCreditBackUntilTheThreshold"],
+    ),
+    (
+        "a stream is credited an increment of zero when it has earned nothing",
+        """	if stream > 0 {
+		t.enqueueWindowUpdate(id, stream)
+	}""",
+        """	t.enqueueWindowUpdate(id, stream)""",
+        ["TestReportConsumedCreditsOnlyTheConnectionForAFinishedStream"],
+    ),
+    (
+        "the connection's credit is sent naming the stream that earned it",
+        """		t.enqueueWindowUpdate(0, conn)""",
+        """		t.enqueueWindowUpdate(id, conn)""",
+        ["TestReportConsumedCreditsTheConnectionBeforeTheStream"],
+    ),
+    (
+        "a stream's credit is sent as the connection's",
+        """		t.enqueueWindowUpdate(id, stream)""",
+        """		t.enqueueWindowUpdate(0, stream)""",
+        [
+            "TestReportConsumedCreditsTheConnectionBeforeTheStream",
+            "TestReportConsumedHoldsCreditBackUntilTheThreshold",
+        ],
+    ),
+    (
+        "earn: the threshold is dropped, so every read puts a frame on the wire",
+        """	if c.pending < limits.ReplenishThreshold {
+		return 0
+	}""",
+        """	if c.pending <= 0 {
+		return 0
+	}""",
+        ["TestReportConsumedHoldsCreditBackUntilTheThreshold"],
+    ),
+    (
+        "earn: credit above what one WINDOW_UPDATE may carry is not capped",
+        """	due := c.pending
+	if due > flow.MaxWindowSize {
+		due = flow.MaxWindowSize
+	}""",
+        """	due := c.pending""",
+        ["TestEarningMoreThanOneWindowUpdateCanCarryHoldsTheRestBack"],
+    ),
+    (
+        "earn: advertised credit is left pending, so every later frame advertises it again",
+        """	c.pending -= due""",
+        """	// the advertised octets stay pending""",
+        ["TestCreditBookkeepingDoesNotGrowWithTheStreamsThatUsedIt"],
+    ),
+    (
+        "the credit a handler earned never reaches the windows at all",
+        """	if err := t.drainCredit(); err != nil {
+		return err
+	}""",
+        """	// the credit earned since the last frame stays where it is""",
+        [
+            "TestReportedCreditReachesTheWindowsBeforeTheNextFrameIsJudged",
+            "TestCreditIsAppliedByAnyFrame",
+            "TestCreditForAStreamThatHasGoneIsStillCreditedToTheConnection",
+            "TestCreditBookkeepingDoesNotGrowWithTheStreamsThatUsedIt",
+            "TestReportConsumedSurvivesAWriterThatHasStopped",
+            "TestCreditThatWouldOverflowTheConnectionWindowEndsTheConnection",
+            "TestCreditThatWouldOverflowAStreamWindowResetsThatStream",
+        ],
+    ),
+    (
+        "the credit is applied after the frame that spends it has been judged",
+        """	if err := t.drainCredit(); err != nil {
+		return err
+	}
+
+	switch v := f.(type) {""",
+        """	defer func() { _ = t.drainCredit() }()
+
+	switch v := f.(type) {""",
+        ["TestReportedCreditReachesTheWindowsBeforeTheNextFrameIsJudged"],
+    ),
+    (
+        "drainCredit: the connection's advertised credit is applied again by every later frame",
+        """	conn := t.connCredit.granted
+	t.connCredit.granted = 0""",
+        """	conn := t.connCredit.granted""",
+        ["TestCreditBookkeepingDoesNotGrowWithTheStreamsThatUsedIt"],
+    ),
+    (
+        "drainCredit: a stream's advertised credit is applied again by every later frame",
+        """			streams[id] = c.granted
+			c.granted = 0""",
+        """			streams[id] = c.granted""",
+        ["TestCreditBookkeepingDoesNotGrowWithTheStreamsThatUsedIt"],
+    ),
+    (
+        "drainCredit: the bookkeeping of a stream that has closed is never dropped",
+        """		if _, live := t.streams[id]; !live && c.pending == 0 && c.granted == 0 {
+			delete(t.streamCredit, id)
+		}""",
+        """		// the entry is left behind""",
+        ["TestCreditBookkeepingDoesNotGrowWithTheStreamsThatUsedIt"],
+    ),
+    (
+        "drainCredit: an overflow of the connection window is not reported",
+        """		if err := t.connRecv.Increase(uint32(conn)); err != nil {
+			return err
+		}""",
+        """		_ = t.connRecv.Increase(uint32(conn))""",
+        ["TestCreditThatWouldOverflowTheConnectionWindowEndsTheConnection"],
+    ),
+    (
+        "drainCredit: an overflow of a stream's window is not reported",
+        """			if err := s.recv.Increase(uint32(n)); err != nil {
+				return err
+			}""",
+        """			_ = s.recv.Increase(uint32(n))""",
+        ["TestCreditThatWouldOverflowAStreamWindowResetsThatStream"],
+    ),
+    (
+        "the table is built with no way to send a frame of its own",
+        """	if cfg.Writer == nil {
+		panic("stream: New requires a frame writer")
+	}""",
+        """	// a table with nowhere to send a WINDOW_UPDATE is accepted""",
+        ["TestNewPanicsWithoutAWriter"],
     ),
 ]
 
