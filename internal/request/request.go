@@ -62,6 +62,7 @@ import (
 	"strings"
 
 	"zerodeps/zdh/internal/h2"
+	"zerodeps/zdh/internal/priority"
 )
 
 // The pseudo-header fields §8.3.1 defines for a request.
@@ -84,6 +85,13 @@ const (
 // rules, so they share the checks, and a message that named the wrong one would send
 // a reader looking for a field the request did not contain.
 const fieldHost = "the Host header field"
+
+// fieldPriority is the Priority header field (§5 of RFC 9218), lowercase because
+// §8.2.1 of RFC 9113 requires every field name on the wire to be, and named as a
+// constant because the switch that collects it and the test that sends it must agree
+// on the spelling of a field whose name is not a pseudo-header field and so is not
+// checked against anything.
+const fieldPriority = "priority"
 
 // The two methods whose §8.3.1 requirements differ from every other method's:
 // CONNECT omits three of the four pseudo-header fields (§8.5), and OPTIONS is the
@@ -148,6 +156,25 @@ type Request struct {
 	// declared none. Never negative otherwise: a value that is not a decimal is
 	// malformed rather than parsed.
 	ContentLength int64
+
+	// Priority is the client's view of how this response should be prioritized,
+	// from the Priority header field (§5 of RFC 9218). The zero value is every
+	// parameter absent, which §4 of RFC 9218 resolves to every default — so a
+	// request that sent no signal needs no special case here or in the scheduler.
+	//
+	// Lifted out of the field list like ContentLength is, and for the same reason:
+	// it is control data that something other than a handler acts on. Unlike
+	// content-length the field line is also left in Fields, because §5 of RFC 9218
+	// makes it an end-to-end signal — "It is an end-to-end signal that indicates the
+	// endpoint's view of how HTTP responses should be prioritized." — and a server
+	// that stripped it would be answering for the next hop as well as itself.
+	//
+	// A Priority field that does not parse leaves this at its zero value and does
+	// not make the request malformed. §7 of RFC 9218 makes treating that as a
+	// connection error a MAY, and internal/priority declines it: a priority signal is
+	// advice, and refusing a request over malformed advice is worse service than
+	// serving it at the default urgency.
+	Priority priority.Params
 }
 
 // Parse validates the header section of a request on stream id and returns it.
@@ -178,6 +205,22 @@ func Parse(id uint32, fields []h2.Field, endStream bool) (*Request, error) {
 		clens int
 		host  string
 		hosts int
+
+		// The Priority header field is the third, and it is neither a value nor a
+		// count but a concatenation. §4.2 of RFC 9651: "When generating input_bytes,
+		// parsers MUST combine all field lines in the same section (header or
+		// trailer) that case-insensitively match the field name into one
+		// comma-separated field-value, as per Section 5.2 of [HTTP]; this assures
+		// that the entire field value is processed correctly." Case-insensitively is
+		// exactly here, because §8.2.1 of RFC 9113 has already required every field
+		// name to be lowercase and checkField has already enforced it.
+		//
+		// A Builder rather than string concatenation: a peer may send as many field
+		// lines as the header list size allows, and appending to a string once per
+		// line is quadratic in the total. The zero Builder allocates nothing, so a
+		// request without the field pays nothing for this.
+		prio  strings.Builder
+		prios int
 	)
 
 	for _, f := range fields {
@@ -218,6 +261,20 @@ func Parse(id uint32, fields []h2.Field, endStream bool) (*Request, error) {
 			clen, clens = f.Value, clens+1
 		case "host":
 			host, hosts = f.Value, hosts+1
+		case fieldPriority:
+			// The separator goes in once per line after the first, counted rather
+			// than inferred from the Builder's length: a first line with an empty
+			// value has a length of zero and still took a line, and §4.2 of RFC 9651
+			// says to combine the lines rather than the non-empty ones. So a peer
+			// that sends an empty Priority field and then a real one produces
+			// ", u=1", which is not a Dictionary — which is the answer a conforming
+			// parser gives, and the whole reason that paragraph warns about splitting
+			// a field across lines.
+			if prios > 0 {
+				prio.WriteString(", ")
+			}
+			prio.WriteString(f.Value)
+			prios++
 		}
 		r.Fields = append(r.Fields, f)
 	}
@@ -231,7 +288,31 @@ func Parse(id uint32, fields []h2.Field, endStream bool) (*Request, error) {
 	if err := r.setContentLength(id, clen, clens, endStream); err != nil {
 		return nil, err
 	}
+	r.setPriority(prios, prio.String())
 	return r, nil
+}
+
+// setPriority reads the combined Priority field value, or leaves the zero Params if
+// there was no such field line.
+//
+// The error is deliberately dropped, and this is the one place in this package where
+// that is the right thing to do. Every other rule here is a rule about whether a
+// message is well formed; this is not. §7 of RFC 9218 makes failing to parse a
+// priority field value a MAY-treat-as-connection-error, internal/priority declines
+// that MAY, and the zero Params it returns alongside the error is the defaults — which
+// is what §4 of RFC 9218 says to schedule a request with when it carries no priority
+// parameters at all. A request whose advice was unreadable is served exactly like a
+// request that offered none.
+//
+// prios rather than a non-empty string is the test for whether the field was there,
+// because an empty Priority field line is a legal Dictionary of no members and means
+// the same thing as no field line at all — but only after this has decided not to
+// distinguish them, which is what makes it worth saying.
+func (r *Request) setPriority(prios int, field string) {
+	if prios == 0 {
+		return
+	}
+	r.Priority, _ = priority.Parse(field)
 }
 
 // ValidateTrailers holds a trailer section on stream id to the rules of §8.1.
