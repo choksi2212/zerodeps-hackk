@@ -551,8 +551,9 @@ func TestNewStartsBothConnectionWindowsAtTheProtocolInitialSize(t *testing.T) {
 	if got := h.tab.RecvWindow().StreamID(); got != 0 {
 		t.Errorf("connection receive window belongs to stream %d, want 0", got)
 	}
-	// And the same for the size the next stream's send window will be opened at,
-	// which is the other half of §6.9.2's "both ends must assume".
+	// And the same for the size the next stream's send window will be opened at, which
+	// is the other half of what §6.9.2 fixes: "new streams are created with an initial
+	// flow-control window size of 65,535 octets".
 	if got := h.tab.Sender().InitialSize(); got != flow.InitialWindowSize {
 		t.Errorf("the initial stream send window is %d, want %d", got, flow.InitialWindowSize)
 	}
