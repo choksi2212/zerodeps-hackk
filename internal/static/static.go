@@ -8,12 +8,16 @@
 // # What it answers
 //
 // GET and HEAD, from a single directory tree. A target names a file, which is sent with a
-// content-length and a content-type; a target naming a directory is answered with that
-// directory's index.html, and one naming a directory without a trailing slash is
+// content-length, a content-type and a last-modified; a target naming a directory is answered
+// with that directory's index.html, and one naming a directory without a trailing slash is
 // redirected to the same target with one, so that the relative links inside the index
 // resolve against the directory rather than against its parent. Anything else — a missing
 // file, a directory with no index, a device, a socket, a name that could not be a file —
 // is a 404. Any other method is a 405 with an allow field.
+//
+// A request carrying preconditions is evaluated against that last-modified, in the order
+// §13.2.2 of RFC 9110 sets, and is answered with a 304 or a 412 where they fail. All of that
+// is in conditional.go, including the three date formats a peer may send one in.
 //
 // # What it does not do
 //
@@ -29,12 +33,16 @@
 //     normal GET request without impacting interoperability" — and §14.2 of RFC 9110 says
 //     what that looks like from here: "A server MAY ignore the Range header field." A
 //     browser seeking in a video re-fetches it from the start.
-//   - No conditional requests, and so no last-modified and no ETag. §13.2.2's precondition
-//     rules are engaged by a request that carries a precondition, and a response with no
-//     validator in it is one no cache can build a precondition from — so the rule is
-//     satisfied by having nothing to evaluate, and the cost is that every request
-//     transfers the whole file. A validator and the four precondition fields are the next
-//     increment, not a missing piece of this one.
+//   - No entity tags, and so no strong validator. §8.8.1 of RFC 9110 defines one as metadata
+//     that "changes value whenever a change occurs to the representation data that would be
+//     observable in the content of a 200 (OK) response to GET", and a size with a modification
+//     time cannot honour that — a file rewritten twice inside one second to the same length is
+//     a different representation with the same validator. The alternative offered by §8.8.1 of
+//     RFC 9110 — "A collision-resistant hash function applied to the representation data is
+//     also sufficient if the data is available prior to the response header fields being sent"
+//     — is a second full read of every file on every request, spent on a field no cache needs
+//     in order to revalidate a response that already carries a date. So last-modified is the
+//     only validator here, it is the weak one, and conditional.go uses it as one.
 //   - No content codings. Nothing is compressed on the way out and no .gz beside a file
 //     is served in its place, so §8.4's content-encoding field is never sent and every
 //     response carries its representation data as the file holds it.
@@ -109,15 +117,24 @@ const (
 // them without being asked. Deliberately not the target that produced it: reflecting a
 // peer's own bytes into a response body is a habit worth not having, and there is nothing
 // here it would explain.
+//
+// The 304 has no sentence, and could not have one: §15.4.5 of RFC 9110 ends "it cannot contain
+// content or trailers", so notModified sends a header section and nothing else. The 412 does
+// have one, because a 412 is a failure a person may well be reading in a terminal — a
+// conditional request that failed against a file whose modification time is not what they
+// expected.
 const (
 	status200 = "200"
 	status301 = "301"
+	status304 = "304"
 	status404 = "404"
 	status405 = "405"
+	status412 = "412"
 	status414 = "414"
 
 	body404 = "404 not found\n"
 	body405 = "405 method not allowed\n"
+	body412 = "412 precondition failed\n"
 	body414 = "414 URI too long\n"
 )
 
@@ -290,7 +307,25 @@ func (h *Handler) serve(w *response.Writer, r *exchange.Request) error {
 		return h.answer(w, r, status404, textPlain, body404)
 	}
 
-	return h.file(w, r, f, info.Size(), mediaType(name))
+	// One instant for the whole response, taken here rather than in fields, because the clamp
+	// in modTime and the date field have to be the same number for the field set to be
+	// self-consistent: §8.8.2.1 of RFC 9110 measures the validator against "the server's time
+	// of message origination", and a response has one of those.
+	//
+	// This is also the one point in serve where a representation exists — an open handle on a
+	// regular file — which is where §13.2.1 of RFC 9110 requires the preconditions to be
+	// evaluated and no earlier. Everything above returns a status that section puts ahead of
+	// them.
+	now := h.now().UTC()
+	mod := modTime(info, now)
+
+	switch evaluate(r, mod, now) {
+	case verdictNotModified:
+		return h.notModified(w, now, mod)
+	case verdictFailed:
+		return h.answer(w, r, status412, textPlain, body412)
+	}
+	return h.file(w, r, f, info.Size(), mediaType(name), now, mod)
 }
 
 // open opens a name inside the served directory and stats the handle.
@@ -314,6 +349,9 @@ func (h *Handler) open(name string) (*os.File, fs.FileInfo, error) {
 
 // file sends f's first size octets as a 200.
 //
+// now is the response's origination date and mod its last-modified, both from serve; the zero
+// time means the file has no modification date and the field is left out. See modTime.
+//
 // size comes from the same handle the content does, so the content-length and the content
 // agree unless the file changes underneath the response — a build writing into the served
 // directory while a browser reads from it. A file that grew is sent as it was, which is
@@ -321,8 +359,8 @@ func (h *Handler) open(name string) (*os.File, fs.FileInfo, error) {
 // from here. §8.6 of RFC 9110 makes the short body malformed and a peer will say so, which
 // is the truth about what happened. RST_STREAM would say it in the protocol instead, and
 // internal/exchange explains at finish why this server does not have one to send.
-func (h *Handler) file(w *response.Writer, r *exchange.Request, f *os.File, size int64, kind string) error {
-	fields := h.fields(status200, kind, size)
+func (h *Handler) file(w *response.Writer, r *exchange.Request, f *os.File, size int64, kind string, now, mod time.Time) error {
+	fields := withValidator(h.fields(now, status200, kind, size), mod)
 
 	// §9.3.2 of RFC 9110: "The server SHOULD send the same header fields in response to a
 	// HEAD request as it would have sent if the request method had been GET." Including the
@@ -361,9 +399,35 @@ func (h *Handler) file(w *response.Writer, r *exchange.Request, f *os.File, size
 	return nil
 }
 
+// notModified answers with a 304: a response about a representation rather than one carrying
+// it.
+//
+// The field set is the whole of the decision, and §15.4.5 of RFC 9110 fixes half of it: "The
+// server generating a 304 response MUST generate any of the following header fields that would
+// have been sent in a 200 (OK) response to the same request". Of the four it then lists,
+// Content-Location, ETag and Vary are fields this server never sends and Date is one it always
+// sends, so the MUST is satisfied by the field set fields already builds. Last-Modified is not
+// on that list and is sent anyway, for the reason noContentLength gives: it is the metadata a
+// cache updates its stored entry from, and it is this server's only validator. content-length
+// and content-type are left out by that same argument read the other way.
+//
+// Bodyless, and that is not a choice either — §15.4.5 of RFC 9110: "A 304 response is terminated
+// by the end of the header section; it cannot contain content or trailers." So the header
+// section carries END_STREAM, which is what WriteBodylessHeader means. A zero-length DATA frame
+// would be legal framing for an empty body and would still be a frame this response is not
+// allowed to have sent.
+func (h *Handler) notModified(w *response.Writer, now, mod time.Time) error {
+	return w.WriteBodylessHeader(withValidator(h.fields(now, status304, "", noContentLength), mod))
+}
+
 // answer sends a complete response whose content is body, which may be empty.
+//
+// Its own clock reading rather than serve's, and it can be: no response built here carries a
+// validator. The 404, the 405, the 414 and the redirect are among the statuses §13.2.1 of RFC
+// 9110 puts ahead of the preconditions, and the 412 is a refusal to describe the representation
+// at all — so in none of them is there a second value the date has to agree with.
 func (h *Handler) answer(w *response.Writer, r *exchange.Request, status, kind, body string, extra ...h2.Field) error {
-	fields := append(h.fields(status, kind, int64(len(body))), extra...)
+	fields := append(h.fields(h.now().UTC(), status, kind, int64(len(body))), extra...)
 
 	// A HEAD gets the fields and no content, for the reason §9.3.2 of RFC 9110 gives above:
 	// "The HEAD method is identical to GET except that the server MUST NOT send content in
@@ -383,17 +447,19 @@ func (h *Handler) answer(w *response.Writer, r *exchange.Request, status, kind, 
 
 // fields is the header section every response here begins with.
 //
-// The pseudo-header first, because §8.3 requires it before any field line. The rest is in
-// no particular order and is written in the order it is easiest to read.
-func (h *Handler) fields(status, kind string, length int64) []h2.Field {
-	// Room for the four this builds, the optional content-type, and one extra field
-	// without a second allocation — every caller passes at most one.
+// now is the response's origination date, taken by the caller so that one response has one of
+// them; length is noContentLength for the response that must not declare one. The
+// pseudo-header comes first, because §8.3 requires it before any field line. The rest is in no
+// particular order and is written in the order it is easiest to read.
+func (h *Handler) fields(now time.Time, status, kind string, length int64) []h2.Field {
+	// Room for the five this can build, plus one more without a second allocation — every
+	// caller adds at most one, either an extra field line or the validator.
 	fields := make([]h2.Field, 0, 6)
 
-	fields = append(fields,
-		h2.Field{Name: ":status", Value: status},
-		h2.Field{Name: "content-length", Value: strconv.FormatInt(length, 10)},
-	)
+	fields = append(fields, h2.Field{Name: ":status", Value: status})
+	if length != noContentLength {
+		fields = append(fields, h2.Field{Name: "content-length", Value: strconv.FormatInt(length, 10)})
+	}
 	if kind != "" {
 		fields = append(fields, h2.Field{Name: "content-type", Value: kind})
 	}
@@ -406,14 +472,37 @@ func (h *Handler) fields(status, kind string, length int64) []h2.Field {
 	// 500 internal/exchange sends for a handler that wrote nothing is the one response
 	// from this program without it, and it is in the paragraph's MAY.
 	//
-	// UTC, not the host's zone. IMF-fixdate is GMT by definition and the layout ends in a
-	// literal "GMT", so formatting a local time would produce a field that lies by
-	// whatever the offset is.
+	// UTC is the caller's job, since the caller supplies the instant, and every caller does it
+	// for the same reason: IMF-fixdate is GMT by definition and the layout ends in a literal
+	// "GMT", so formatting a local time would produce a field that lies by whatever the offset
+	// is.
 	fields = append(fields,
-		h2.Field{Name: "date", Value: h.now().UTC().Format(imfFixdate)},
+		h2.Field{Name: "date", Value: now.Format(imfFixdate)},
 		h2.Field{Name: "server", Value: serverName},
 	)
 	return fields
+}
+
+// withValidator appends the last-modified field to fields, if there is a validator to send.
+//
+// The field is wanted wherever it can be had, and §8.8.2.1 of RFC 9110 says why: "An origin
+// server SHOULD send Last-Modified for any selected representation for which a last
+// modification date can be reasonably and consistently determined, since its use in conditional
+// requests and evaluating cache freshness ([CACHING]) can substantially reduce unnecessary
+// transfers and significantly improve service availability and scalability." A file's
+// modification time is exactly such a date. modTime is where it is determined and where it is
+// clamped, and the zero time it returns is the filesystem saying there is none — the one case
+// this leaves the field out rather than sending a date it invented.
+//
+// Appended after the date and the server fields, which is where answer already puts its extra
+// field line. The order of distinct field lines carries no meaning; grouping the representation
+// metadata with the fields that fields builds would mean threading the validator through it, and
+// then every caller would pass a value all but two of them have nothing to say about.
+func withValidator(fields []h2.Field, mod time.Time) []h2.Field {
+	if mod.IsZero() {
+		return fields
+	}
+	return append(fields, h2.Field{Name: "last-modified", Value: mod.Format(imfFixdate)})
 }
 
 // withSlash is a target with one appended to its path.
