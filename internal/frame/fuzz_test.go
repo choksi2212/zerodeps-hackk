@@ -268,7 +268,7 @@ func expectedOpenBlock(open uint32, f Frame) uint32 {
 // advertised maximum about a thousand times out of a thousand and one, so most
 // executions are spent proving the size check works. Deriving the length from the
 // payload instead gives up testing that check, which the tables cover by name, and
-// buys the interior of all ten parsers.
+// buys the interior of every parser.
 func FuzzFramePayload(f *testing.F) {
 	seeds := oneOfEachFrameType()
 	seeds = append(seeds,

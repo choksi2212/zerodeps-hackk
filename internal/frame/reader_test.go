@@ -227,27 +227,18 @@ func TestReadPrefaceQuotesPeerBytes(t *testing.T) {
 }
 
 // --- the parser table -------------------------------------------------------
-
-// TestParsersTableIsTotal is the mechanical check the table exists to make
-// possible: every assigned frame type has a parser, and the table has no
-// unassigned tail. A switch statement could only be checked by reading it.
-func TestParsersTableIsTotal(t *testing.T) {
-	if got, want := len(parsers), int(maxDefinedType)+1; got != want {
-		t.Fatalf("parsers has %d entries, want %d (one per assigned type)", got, want)
-	}
-	for typ := FrameType(0); typ <= maxDefinedType; typ++ {
-		if parsers[typ] == nil {
-			t.Errorf("no parser for %s (0x%02x)", typ, uint8(typ))
-		}
-	}
-}
+//
+// The mechanical check the table exists to make possible — every type this
+// package implements has a parser, every parser has a name, and the two tables
+// have no unassigned tail — is TestFrameTypeTablesAgree, in types_test.go, where
+// the list of implemented types it is checked against lives.
 
 // --- framing ----------------------------------------------------------------
 
-// TestReadFrameEveryType reads one valid frame of each assigned type from a
+// TestReadFrameEveryType reads one valid frame of each implemented type from a
 // single stream, in an order that satisfies the header-block continuity rule, and
-// asserts that all ten were seen. The coverage assertion is what makes it a
-// completeness test rather than ten spot checks.
+// asserts that every one of them was seen. The coverage assertion is what makes it
+// a completeness test rather than a handful of spot checks.
 func TestReadFrameEveryType(t *testing.T) {
 	frames := oneOfEachFrameType()
 	rd := readerOver(frameBytes(frames...), ReaderConfig{})
@@ -260,7 +251,7 @@ func TestReadFrameEveryType(t *testing.T) {
 		}
 		seen[f.Type()] = true
 	}
-	for typ := FrameType(0); typ <= maxDefinedType; typ++ {
+	for typ := range frameTypeSet() {
 		if !seen[typ] {
 			t.Errorf("%s was never read; this test no longer covers every frame type", typ)
 		}

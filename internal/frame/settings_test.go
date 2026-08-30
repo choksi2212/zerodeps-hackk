@@ -52,6 +52,7 @@ func TestParseSettingsValid(t *testing.T) {
 				{SettingInitialWindowSize, 65535},
 				{SettingMaxFrameSize, 16384},
 				{SettingMaxHeaderListSize, 8192},
+				{SettingNoRFC7540Priorities, 1},
 			},
 			want: SettingsFrame{Settings: []Setting{
 				{SettingHeaderTableSize, 4096},
@@ -60,6 +61,20 @@ func TestParseSettingsValid(t *testing.T) {
 				{SettingInitialWindowSize, 65535},
 				{SettingMaxFrameSize, 16384},
 				{SettingMaxHeaderListSize, 8192},
+				{SettingNoRFC7540Priorities, 1},
+			}},
+		},
+		{
+			// Both legal values of the RFC 9218 parameter. 0 is its initial value
+			// and says the sender is using RFC 9113's deprecated scheme; 1 says it
+			// is not. Neither is an error, and the identifier sits in a range RFC
+			// 9113 knows nothing about — an implementation that bounded the
+			// identifier rather than tabulating it would reject both.
+			name:  "SETTINGS_NO_RFC7540_PRIORITIES at both legal values",
+			pairs: []Setting{{SettingNoRFC7540Priorities, 0}, {SettingNoRFC7540Priorities, 1}},
+			want: SettingsFrame{Settings: []Setting{
+				{SettingNoRFC7540Priorities, 0},
+				{SettingNoRFC7540Priorities, 1},
 			}},
 		},
 		{
@@ -198,10 +213,10 @@ func TestParseSettingsStreamBeatsEverything(t *testing.T) {
 	wantConnErr(t, err, h2.ProtocolError)
 }
 
-// TestParseSettingsValueRanges is matrix rows 17, 18 and 19. Three identifiers
-// have a legal range and the codes are not uniform: an out-of-range
-// INITIAL_WINDOW_SIZE is a FLOW_CONTROL_ERROR, not the PROTOCOL_ERROR that would
-// be the natural guess.
+// TestParseSettingsValueRanges is matrix rows 17, 18 and 19, plus the range rule
+// RFC 9218 §2.1 adds. Four identifiers have a legal range and the codes are not
+// uniform: an out-of-range INITIAL_WINDOW_SIZE is a FLOW_CONTROL_ERROR, not the
+// PROTOCOL_ERROR that would be the natural guess.
 func TestParseSettingsValueRanges(t *testing.T) {
 	tests := []struct {
 		name string
@@ -211,6 +226,24 @@ func TestParseSettingsValueRanges(t *testing.T) {
 		{"ENABLE_PUSH 2", Setting{SettingEnablePush, 2}, h2.ProtocolError},
 		{"ENABLE_PUSH 3", Setting{SettingEnablePush, 3}, h2.ProtocolError},
 		{"ENABLE_PUSH max", Setting{SettingEnablePush, 0xffffffff}, h2.ProtocolError},
+		{
+			// §2.1 of RFC 9218 gives this parameter the same shape of rule as
+			// ENABLE_PUSH — a boolean carried in 32 bits, where anything but 0 or 1
+			// is a connection error — and the same error code.
+			"NO_RFC7540_PRIORITIES 2",
+			Setting{SettingNoRFC7540Priorities, 2},
+			h2.ProtocolError,
+		},
+		{
+			"NO_RFC7540_PRIORITIES 3",
+			Setting{SettingNoRFC7540Priorities, 3},
+			h2.ProtocolError,
+		},
+		{
+			"NO_RFC7540_PRIORITIES max",
+			Setting{SettingNoRFC7540Priorities, 0xffffffff},
+			h2.ProtocolError,
+		},
 		{
 			"INITIAL_WINDOW_SIZE one above the maximum window",
 			Setting{SettingInitialWindowSize, MaxWindowSize + 1},

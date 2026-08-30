@@ -14,25 +14,34 @@ import (
 // try to serve it.
 const ClientPreface = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
 
-// parsers maps a frame type to its payload parser.
+// parsers maps a frame type to its payload parser, and is what FrameType.known
+// consults: a type with an entry here is one this package implements, and a type
+// without one is discarded on receipt.
 //
-// A table rather than a switch, for two reasons. Indexed by FrameType it is
-// total over the assigned range by construction, and a test can walk it and fail
-// if any assigned type is missing — a switch can only be checked by reading it.
-// And a switch would need a default branch that cannot be reached, which is
+// A table rather than a switch, for two reasons. Indexed by FrameType it is total
+// over the types this package implements by construction, and a test can walk it
+// and fail if any of them is missing — TestFrameTypeTablesAgree does, against a
+// hand-written list of the types, where a switch could only be checked by reading
+// it. And a switch would need a default branch that cannot be reached, which is
 // either a panic in a server handling hostile input or an error return that no
 // test can cover.
+//
+// The table is sparse: PRIORITY_UPDATE is 0x10 and CONTINUATION is 0x9, so the
+// six entries between them are nil. That is the point of asking the table rather
+// than a range — a nil entry answers "unknown" for exactly the types that have no
+// parser to call.
 var parsers = [...]func(Header, []byte) (Frame, error){
-	TypeData:         parseData,
-	TypeHeaders:      parseHeaders,
-	TypePriority:     parsePriority,
-	TypeRSTStream:    parseRSTStream,
-	TypeSettings:     parseSettings,
-	TypePushPromise:  parsePushPromise,
-	TypePing:         parsePing,
-	TypeGoAway:       parseGoAway,
-	TypeWindowUpdate: parseWindowUpdate,
-	TypeContinuation: parseContinuation,
+	TypeData:           parseData,
+	TypeHeaders:        parseHeaders,
+	TypePriority:       parsePriority,
+	TypeRSTStream:      parseRSTStream,
+	TypeSettings:       parseSettings,
+	TypePushPromise:    parsePushPromise,
+	TypePing:           parsePing,
+	TypeGoAway:         parseGoAway,
+	TypeWindowUpdate:   parseWindowUpdate,
+	TypeContinuation:   parseContinuation,
+	TypePriorityUpdate: parsePriorityUpdate,
 }
 
 // ReaderConfig bounds what a Reader will accept. Every field is a defence

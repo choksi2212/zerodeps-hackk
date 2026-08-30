@@ -7,7 +7,7 @@ import (
 
 // stubFrame exists only to exercise HeaderOf. Frame has an unexported method,
 // so the interface can be satisfied inside this package and nowhere else; that
-// is what makes a type switch over the ten real frame types exhaustive.
+// is what makes a type switch over the real frame types exhaustive.
 type stubFrame struct {
 	typ      FrameType
 	flags    Flags

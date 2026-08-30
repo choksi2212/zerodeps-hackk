@@ -978,6 +978,156 @@ func TestServeDoesNotAcknowledgeAnAcknowledgement(t *testing.T) {
 	}
 }
 
+// --- SETTINGS_NO_RFC7540_PRIORITIES (RFC 9218 §2.1) --------------------------
+
+// settingsTwice scripts a connection whose first SETTINGS frame carries first and
+// whose second carries second, which is the shape every §2.1 no-change case takes.
+//
+// A nil first is a SETTINGS frame with no parameters in it, not a missing frame: the
+// peer still has to send its preface SETTINGS, and "absent" in these tests means
+// absent from that frame rather than absent from the connection.
+func settingsTwice(t *testing.T, first, second []frame.Setting) []byte {
+	t.Helper()
+	return append(clientHello(t, first...),
+		encodeFrames(t, frame.SettingsFrame{Settings: second})...)
+}
+
+// TestServeAcceptsNoRFC7540Priorities is the ordinary case: a client saying which
+// priority scheme it is using. There is nothing for this server to apply — it
+// ignores RFC 9113's priority signals from every peer, which §2.1 of RFC 9218
+// permits — so the whole observable effect is that the connection survives and the
+// parameter is acknowledged like any other.
+func TestServeAcceptsNoRFC7540Priorities(t *testing.T) {
+	for _, value := range []uint32{0, 1} {
+		ts := newTestSocket(&testTarget{}).
+			script(clientHello(t, frame.Setting{
+				ID:    frame.SettingNoRFC7540Priorities,
+				Value: value,
+			})).
+			atEOF()
+
+		if err := serve(t, ts, rejectingHandler(t), testTimeouts()); err != nil {
+			t.Fatalf("Serve returned %v for SETTINGS_NO_RFC7540_PRIORITIES = %d, want nil "+
+				"(RFC 9218 §2.1)", err, value)
+		}
+		got := peerSaw(t, ts)
+		if s, ok := got[len(got)-1].(frame.SettingsFrame); !ok || !s.Ack {
+			t.Fatalf("the peer received %s, want an acknowledgement last", describe(got))
+		}
+	}
+}
+
+// TestServeRefusesAChangedNoRFC7540Priorities is the MAY this server takes.
+//
+// §2.1 of RFC 9218 forbids the sender to change the value after the first SETTINGS
+// frame and lets the receiver treat a change as a connection error of type
+// PROTOCOL_ERROR. The alternative to refusing is to believe one of the peer's two
+// statements about itself and discard the other, with nothing in the document saying
+// which.
+func TestServeRefusesAChangedNoRFC7540Priorities(t *testing.T) {
+	const id = frame.SettingNoRFC7540Priorities
+	tests := []struct {
+		name          string
+		first, second []frame.Setting
+	}{
+		{"1 then 0", []frame.Setting{{ID: id, Value: 1}}, []frame.Setting{{ID: id, Value: 0}}},
+		{"0 then 1", []frame.Setting{{ID: id, Value: 0}}, []frame.Setting{{ID: id, Value: 1}}},
+		{
+			// Absent from the first frame means 0, because that is the parameter's
+			// initial value — so arriving afterwards with a 1 is a change, and it
+			// breaks the other half of the same sentence too: a peer that uses the
+			// parameter has to send it in the first SETTINGS frame.
+			name:   "absent then 1",
+			second: []frame.Setting{{ID: id, Value: 1}},
+		},
+		{
+			// The change is what matters, not the pair's position in the frame. A
+			// server that only looked at the first parameter of a later SETTINGS
+			// would miss this one.
+			name:  "1 then 0 behind another parameter",
+			first: []frame.Setting{{ID: id, Value: 1}},
+			second: []frame.Setting{
+				{ID: frame.SettingMaxConcurrentStreams, Value: 3},
+				{ID: id, Value: 0},
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ts := newTestSocket(&testTarget{}).
+				script(settingsTwice(t, tt.first, tt.second)).
+				atEOF()
+
+			err := serve(t, ts, rejectingHandler(t), testTimeouts())
+			if ce := connErrorOf(t, err); ce.Code != h2.ProtocolError {
+				t.Errorf("Serve returned %s, want PROTOCOL_ERROR (RFC 9218 §2.1)", ce.Code)
+			}
+			if !strings.Contains(err.Error(), "SETTINGS_NO_RFC7540_PRIORITIES") {
+				t.Errorf("the error does not name the parameter that changed: %v", err)
+			}
+			if ga := goAwayIn(t, peerSaw(t, ts)); ga.ErrCode != h2.ProtocolError {
+				t.Errorf("the GOAWAY carries %s, want PROTOCOL_ERROR", ga.ErrCode)
+			}
+		})
+	}
+}
+
+// TestServeAcceptsAnUnchangedNoRFC7540Priorities is the other side of that rule, and
+// it is the half a change detector gets wrong: §2.1 forbids the value to change, not
+// the parameter to be sent again. A server that refused every repetition would break
+// a client that simply restates its whole parameter set.
+func TestServeAcceptsAnUnchangedNoRFC7540Priorities(t *testing.T) {
+	const id = frame.SettingNoRFC7540Priorities
+	tests := []struct {
+		name          string
+		first, second []frame.Setting
+	}{
+		{"1 then 1", []frame.Setting{{ID: id, Value: 1}}, []frame.Setting{{ID: id, Value: 1}}},
+		{"0 then 0", []frame.Setting{{ID: id, Value: 0}}, []frame.Setting{{ID: id, Value: 0}}},
+		{
+			// Sent late with the value it already had. That breaks §2.1's
+			// send-it-in-the-first-frame requirement without changing anything, and
+			// the only enforcement §2.1 offers a receiver is for a change — so this
+			// is accepted, deliberately, rather than refused on a rule the document
+			// gives us no code for.
+			name:   "absent then 0",
+			second: []frame.Setting{{ID: id, Value: 0}},
+		},
+		{
+			// Duplicates inside one frame are legal and last-wins, and the frame is
+			// the unit the no-change rule counts: 0 then 1 within the first SETTINGS
+			// leaves the value at 1, so the later 1 is not a change. A server that
+			// compared pair by pair would call this connection a violation on its
+			// second parameter.
+			name:   "0 and then 1 in the first frame, then 1",
+			first:  []frame.Setting{{ID: id, Value: 0}, {ID: id, Value: 1}},
+			second: []frame.Setting{{ID: id, Value: 1}},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ts := newTestSocket(&testTarget{}).
+				script(settingsTwice(t, tt.first, tt.second)).
+				atEOF()
+
+			if err := serve(t, ts, rejectingHandler(t), testTimeouts()); err != nil {
+				t.Fatalf("Serve returned %v, want nil: the value did not change (RFC 9218 §2.1)", err)
+			}
+			acks := 0
+			got := peerSaw(t, ts)
+			for _, f := range got {
+				if s, ok := f.(frame.SettingsFrame); ok && s.Ack {
+					acks++
+				}
+			}
+			if acks != 2 {
+				t.Errorf("the server sent %d acknowledgements, want one for each of the client's "+
+					"two SETTINGS frames; the peer received %s", acks, describe(got))
+			}
+		})
+	}
+}
+
 // --- PING (validation matrix row 24) -----------------------------------------
 
 // TestServeAnswersAPing is matrix row 24. The eight octets come back unchanged with
@@ -1185,6 +1335,76 @@ func TestServeRefusesAPushPromiseFromAClient(t *testing.T) {
 	}
 	if ga := goAwayIn(t, peerSaw(t, ts)); ga.ErrCode != h2.ProtocolError {
 		t.Errorf("the GOAWAY carries %s, want PROTOCOL_ERROR", ga.ErrCode)
+	}
+}
+
+// --- PRIORITY_UPDATE (RFC 9218 §7.1) -----------------------------------------
+
+// TestServeKeepsAPriorityUpdateFromTheHandler is the routing decision. The frame
+// arrives on the connection, and the stream it names may not exist yet — §7 of RFC
+// 9218 makes that legal — so it is answered here and never handed to the stream
+// layer.
+//
+// The WINDOW_UPDATE after it is what makes the test mean something: without a frame
+// the handler is supposed to see, a connection that swallowed everything would look
+// exactly like a pass.
+func TestServeKeepsAPriorityUpdateFromTheHandler(t *testing.T) {
+	ts := newTestSocket(&testTarget{}).
+		script(append(clientHello(t), encodeFrames(t,
+			frame.PriorityUpdateFrame{PrioritizedStreamID: 1, Field: "u=0, i"},
+			// A stream this connection has never seen, and a field value that is
+			// not a structured field. Neither is a reason to refuse the frame:
+			// §7 permits the stream to be unopened, and makes acting on an
+			// unparseable field value a MAY rather than a requirement.
+			frame.PriorityUpdateFrame{PrioritizedStreamID: 4095, Field: ")("},
+			frame.WindowUpdateFrame{StreamID: 1, Increment: 4096},
+		)...)).
+		atEOF()
+
+	h := &recordingHandler{}
+	if err := serve(t, ts, h, testTimeouts()); err != nil {
+		t.Fatalf("Serve: %v", err)
+	}
+	got := h.seen()
+	if len(got) != 1 {
+		t.Fatalf("the handler saw %s, want only the stream-1 WINDOW_UPDATE", describe(got))
+	}
+	if want := (frame.WindowUpdateFrame{StreamID: 1, Increment: 4096}); got[0] != want {
+		t.Errorf("the handler saw %#v, want %#v", got[0], want)
+	}
+	noGoAwayIn(t, peerSaw(t, ts))
+}
+
+// TestServeRefusesAPriorityUpdateForAPushStream is the role rule of §7.1, and this
+// server can decide it from the identifier alone.
+//
+// An even stream identifier belongs to a server-initiated stream (§5.1.1), which is
+// to say a push stream; this server pushes nothing, so every even stream on the
+// connection is idle and always will be. §7.1 makes prioritizing a push stream in
+// that state a connection error of type PROTOCOL_ERROR, and no stream table has to
+// be consulted to know that it is one — the same shape of argument as §8.4's for
+// PUSH_PROMISE.
+func TestServeRefusesAPriorityUpdateForAPushStream(t *testing.T) {
+	for _, id := range []uint32{2, 4, 100, 1<<31 - 2} {
+		ts := newTestSocket(&testTarget{}).
+			script(append(clientHello(t), encodeFrames(t,
+				frame.PriorityUpdateFrame{PrioritizedStreamID: id, Field: "u=3"},
+			)...)).
+			atEOF()
+
+		err := serve(t, ts, rejectingHandler(t), testTimeouts())
+		if ce := connErrorOf(t, err); ce.Code != h2.ProtocolError {
+			t.Errorf("prioritized stream %d: Serve returned %s, want PROTOCOL_ERROR "+
+				"(RFC 9218 §7.1)", id, ce.Code)
+		}
+		if !strings.Contains(err.Error(), "push") {
+			t.Errorf("prioritized stream %d: the error does not say what an even identifier "+
+				"means: %v", id, err)
+		}
+		if ga := goAwayIn(t, peerSaw(t, ts)); ga.ErrCode != h2.ProtocolError {
+			t.Errorf("prioritized stream %d: the GOAWAY carries %s, want PROTOCOL_ERROR",
+				id, ga.ErrCode)
+		}
 	}
 }
 

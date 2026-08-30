@@ -234,6 +234,26 @@ type conn struct {
 	// §3.4 requires before anything else.
 	gotSettings bool
 
+	// settingsApplied records that a SETTINGS frame has been applied in full, which
+	// is what makes the next one "after the first SETTINGS frame" for RFC 9218
+	// §2.1's purposes. gotSettings cannot answer that question: it is set before the
+	// first frame's parameters are applied, so it is already true while they are
+	// being applied, and a parameter would be compared against itself.
+	settingsApplied bool
+
+	// peerNoRFC7540Priorities is the peer's SETTINGS_NO_RFC7540_PRIORITIES (RFC 9218
+	// §2.1): true once the client has said it is not sending RFC 9113's deprecated
+	// priority signals. The parameter's initial value is 0, so false is both this
+	// field's zero value and the value the RFC gives a connection where it never
+	// arrives — the absence needs no special case.
+	//
+	// Nothing is scheduled on it, and nothing will be. This server ignores RFC 9113
+	// priority signals from every peer, which §2.1 permits because it says so in its
+	// own SETTINGS, so the value changes no behaviour here. It is remembered because
+	// §2.1 forbids the peer to change it, and a rule about a value changing needs the
+	// value it changed from.
+	peerNoRFC7540Priorities bool
+
 	// lastStreamID is the highest stream identifier this connection has
 	// dispatched, which is what a GOAWAY has to carry: §6.8 makes it the promise
 	// that everything above it was untouched and can be retried on a new
@@ -724,6 +744,9 @@ func (c *conn) dispatch(f frame.Frame) error {
 			"PUSH_PROMISE received on stream %d: a client cannot push (RFC 9113 §8.4)",
 			f.Stream())
 
+	case frame.PriorityUpdateFrame:
+		return c.handlePriorityUpdate(f)
+
 	case frame.WindowUpdateFrame:
 		if f.StreamID == 0 {
 			return c.handleConnectionWindowUpdate(f)
@@ -758,21 +781,29 @@ func (c *conn) handleSettings(f frame.SettingsFrame) error {
 			return err
 		}
 	}
+	// The first SETTINGS frame is now behind us, which is the state RFC 9218 §2.1's
+	// no-change rule is written against. Set after the loop rather than before it, so
+	// that duplicate pairs inside one frame stay legal and last-wins: §6.5 makes the
+	// order within a frame significant and says nothing against repetition, and the
+	// rule §2.1 adds is about the second frame, not the second pair.
+	c.settingsApplied = true
 	return c.w.Enqueue(frame.SettingsFrame{Ack: true})
 }
 
 // applySetting puts one of the peer's parameters into force.
 //
-// Every identifier §11.3 defines is named, including the ones there is nothing to
-// do about, so that "ignored" is a decision on the record rather than a gap.
-// TestApplySettingNamesEverySettingID fails if an identifier is added to the
-// frame package and not accounted for here. An unknown identifier is ignored, as
-// §6.5.2 requires — the extension mechanism depends on it.
+// Every identifier §11.3 defines is named, and so is the one RFC 9218 §2.1 adds,
+// including the ones there is nothing to do about — so that "ignored" is a decision
+// on the record rather than a gap. TestApplySettingNamesEverySettingID fails if an
+// identifier is added to the frame package and not accounted for here. An unknown
+// identifier is ignored, as §6.5.2 requires — the extension mechanism depends on
+// it.
 //
-// Only one parameter can fail to apply, and the error is never about the value
-// itself: the frame layer has already range-checked every setting §6.5.2 gives
-// bounds for. It is about what applying a legal value does to state this
-// connection already holds. See SettingInitialWindowSize.
+// Two parameters can fail to apply, and neither failure is about the value being
+// out of range: the frame layer has already range-checked every setting §6.5.2 and
+// RFC 9218 §2.1 give bounds for. One is about what applying a legal value does to
+// state this connection already holds — see SettingInitialWindowSize — and the other
+// about a legal value contradicting one the peer sent earlier.
 func (c *conn) applySetting(s frame.Setting) error {
 	switch s.ID {
 	case frame.SettingMaxFrameSize:
@@ -785,6 +816,34 @@ func (c *conn) applySetting(s frame.Setting) error {
 		// do, and this server initiates none: it does not push, and says so in
 		// its own SETTINGS. A client that sets ENABLE_PUSH to 1 gets no pushes
 		// anyway, which is permitted — the setting is a ceiling, not a request.
+
+	case frame.SettingNoRFC7540Priorities:
+		// The peer saying which priority scheme it is using. There is nothing to
+		// apply: this server ignores RFC 9113's priority signals from every peer,
+		// and §2.1 of RFC 9218 permits that because the server says so in its own
+		// SETTINGS. The value is kept only so that the one rule attached to it can
+		// be checked, which is the rule below.
+		//
+		// §2.1 of RFC 9218: "Senders MUST NOT change the
+		// SETTINGS_NO_RFC7540_PRIORITIES value after the first SETTINGS frame.
+		// Receivers that detect a change MAY treat it as a connection error of type
+		// PROTOCOL_ERROR."
+		//
+		// The MAY is taken. The alternative to refusing a change is to believe one
+		// of two statements the peer has made about itself and discard the other,
+		// and nothing in the document says which — while a peer that contradicts
+		// itself here is either broken or measuring what this server tolerates.
+		// Neither is worth a connection.
+		//
+		// The comparison is total because the value is 0 or 1: frame.parseSettings
+		// has already refused anything else as a connection error (§2.1).
+		v := s.Value == 1
+		if c.settingsApplied && v != c.peerNoRFC7540Priorities {
+			return h2.ConnErrorf(h2.ProtocolError,
+				"SETTINGS_NO_RFC7540_PRIORITIES changed to %d after the first SETTINGS frame "+
+					"(RFC 9218 §2.1)", s.Value)
+		}
+		c.peerNoRFC7540Priorities = v
 
 	case frame.SettingHeaderTableSize:
 		// The size of the dynamic table the peer keeps for decoding, and therefore a
@@ -855,6 +914,45 @@ func (c *conn) handlePing(f frame.PingFrame) error {
 // table growing a special case for stream zero. See StreamHandler.
 func (c *conn) handleConnectionWindowUpdate(f frame.WindowUpdateFrame) error {
 	return c.handler.ConnWindowUpdate(f.Increment)
+}
+
+// handlePriorityUpdate takes a client's extensible-priority signal (RFC 9218 §7.1).
+//
+// Absorbed at this level for the same reason a stream-0 WINDOW_UPDATE is: the frame
+// arrives on the connection, so there is no stream to hand it to. It is a stronger
+// reason here, because §7 makes it legal for the stream the frame names not to exist
+// yet — so the stream table is not where this frame's rules live even in principle.
+//
+// One of the two rules §7.1 gives a server is enforced, and it is enforced by what
+// this server is rather than by any state it keeps. The other is satisfied for the
+// same kind of reason: §7.1 requires the number of streams that have been prioritized
+// but remain idle, plus the number of active streams, not to exceed
+// SETTINGS_MAX_CONCURRENT_STREAMS — and this connection remembers no priorities, so
+// that number is the active streams alone, which internal/stream already bounds by
+// the value we advertised. A rule cannot be broken by a count that cannot rise.
+func (c *conn) handlePriorityUpdate(f frame.PriorityUpdateFrame) error {
+	if f.PrioritizedStreamID%2 == 0 {
+		// An even identifier belongs to a server-initiated stream (§5.1.1), which is
+		// to say a push stream — and this server never pushes, so every even stream
+		// on this connection is in the idle state and always will be. That makes the
+		// role rule decidable from the identifier alone, exactly as §8.4's is for
+		// PUSH_PROMISE above: no stream table is consulted, because the answer does
+		// not depend on one.
+		//
+		// §7.1 of RFC 9218: "Servers that receive a PRIORITY_UPDATE for a push
+		// stream in the 'idle' state MUST respond with a connection error of type
+		// PROTOCOL_ERROR."
+		return h2.ConnErrorf(h2.ProtocolError,
+			"PRIORITY_UPDATE prioritizes stream %d, an even identifier and so a push "+
+				"stream (RFC 9113 §5.1.1); this server pushes nothing, so that stream is "+
+				"idle and cannot be prioritized (RFC 9218 §7.1)",
+			f.PrioritizedStreamID)
+	}
+	// The signal itself is not acted on. Responses go out in the order the streams
+	// produce them, so there is no ordering here for a priority to change — and the
+	// rule above is a connection error whether or not anything is scheduled on the
+	// frame, which is why it is checked rather than the frame discarded unread.
+	return nil
 }
 
 // handleStreamFrame hands a frame to the stream layer.

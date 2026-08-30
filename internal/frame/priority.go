@@ -4,10 +4,11 @@ import "zerodeps/zdh/internal/h2"
 
 // PriorityFrame is a PRIORITY frame (RFC 9113 §6.3).
 //
-// Prioritization is deprecated. RFC 9113 §5.3 withdrew the dependency-tree
-// scheme that RFC 7540 defined, and RFC 9218 replaces it with a different
-// mechanism this server does not implement. So PRIORITY frames are parsed,
-// validated, and then deliberately ignored: the contents affect nothing.
+// The scheme it belongs to is deprecated. RFC 9113 §5.3 withdrew the dependency
+// tree that RFC 7540 defined, and RFC 9218 puts extensible priorities in its
+// place — a scheme whose signal is PriorityUpdateFrame, in this package, and not
+// this frame. So PRIORITY frames are parsed, validated, and then deliberately
+// ignored: the contents affect nothing.
 //
 // That is the specified behaviour rather than an omission, and it is matrix
 // row 10. A receiver still has to accept a well-formed PRIORITY frame, still has
