@@ -6,6 +6,14 @@ import (
 	"zerodeps/zdh/internal/frame"
 )
 
+// hpackDefaultTableSize is the dynamic table size a connection starts with, from §4.2
+// of RFC 7541 — and therefore the size in force when a peer sends no
+// SETTINGS_HEADER_TABLE_SIZE at all, which is what browsers do.
+//
+// Not in bounds.go, because it is not this server's policy: it is a number the
+// protocol fixes, and the assertions below are what relate our policy to it.
+const hpackDefaultTableSize = 4096
+
 // TestFrameBoundsMatchTheFrameLayer is what makes the frame layer's comments true.
 //
 // internal/frame documents these bounds as living here and carries its own copies
@@ -136,6 +144,12 @@ func TestBoundsArePlausible(t *testing.T) {
 			tooHigh: "each stream is a goroutine and a set of buffers one peer can hold",
 		},
 		{
+			name: "MaxEncoderTableSize", got: MaxEncoderTableSize,
+			floor: hpackDefaultTableSize, ceiling: 1 << 24,
+			tooLow:  "below HPACK's own default the bound would clamp a table nobody asked to enlarge",
+			tooHigh: "the table is memory a peer allocates with one SETTINGS entry",
+		},
+		{
 			name: "MaxConns", got: MaxConns,
 			floor: 16, ceiling: 8192,
 			tooLow:  "a browser opens one connection per origin and a load balancer opens several",
@@ -195,5 +209,25 @@ func TestMaxConcurrentStreamsFitsItsSettingsField(t *testing.T) {
 	if MaxConcurrentStreams < 0 || uint64(MaxConcurrentStreams) > 1<<32-1 {
 		t.Errorf("MaxConcurrentStreams = %d does not fit the 32-bit SETTINGS field "+
 			"(RFC 9113 §6.5.1)", MaxConcurrentStreams)
+	}
+}
+
+// TestEncoderTableBoundSurvivesNarrowingToInt is the last sentence of
+// MaxEncoderTableSize's comment, written down as an assertion.
+//
+// SETTINGS_HEADER_TABLE_SIZE arrives as a uint32 and the codec's
+// SetMaxDynamicTableSize takes an int, so the conversion happens somewhere, and
+// bounding the value before converting it is what makes it safe. That only holds
+// while the bound itself fits an int on the narrowest platform Go compiles for — an
+// int is 32 bits on 386 and on arm — and a bound above that would reach the codec as
+// a negative table size on a platform nobody ran these tests on.
+func TestEncoderTableBoundSurvivesNarrowingToInt(t *testing.T) {
+	// The largest value a 32-bit int holds.
+	const narrowestInt = 1<<31 - 1
+
+	if MaxEncoderTableSize > narrowestInt {
+		t.Errorf("MaxEncoderTableSize = %d does not fit a 32-bit int; bounding a peer's "+
+			"SETTINGS_HEADER_TABLE_SIZE against it would still hand the codec a negative "+
+			"size on a 32-bit platform", MaxEncoderTableSize)
 	}
 }

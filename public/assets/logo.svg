@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" role="img" aria-label="zdh">
+  <title>zdh</title>
+  <rect width="64" height="64" rx="12" fill="#171b24" stroke="#262c39" stroke-width="2"/>
+  <!-- Three streams interleaved on one connection: the whole point of HTTP/2,
+       and the only thing worth putting in the icon. -->
+  <g stroke-linecap="round" stroke-width="4" fill="none">
+    <path d="M12 20h40" stroke="#7cc7ff"/>
+    <path d="M12 32h24" stroke="#6ee7a8"/>
+    <path d="M44 32h8" stroke="#6ee7a8"/>
+    <path d="M12 44h14" stroke="#ffd479"/>
+    <path d="M34 44h18" stroke="#ffd479"/>
+  </g>
+</svg>

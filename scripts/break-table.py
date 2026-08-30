@@ -40,15 +40,92 @@ rather than what they remove.
   whether to wait for a body from that answer waits for a body that will never
   come, and the stream sits there until the idle timeout.
 
+The two setters that carry the peer's HPACK settings to the response encoder add a
+fifth of the same kind, and it is the reason TestSetHeaderTableSizeLeavesTheDecodingCodecAlone
+exists. HPACK runs as two tables with two histories, and this file holds both ends: the
+codec it decodes the peer's requests with, and the encoder its responses are compressed
+against. Both have a SetMaxDynamicTableSize taking the same argument, so sending the
+peer's SETTINGS_HEADER_TABLE_SIZE to the wrong one compiles, passes every test about
+requests, passes every test about responses, and resizes the decoding table the peer
+sized by *our* SETTINGS instead. The symptom arrives later and somewhere else, as an
+index resolving to a field line nobody sent. Only a test that asserts the codec was not
+touched at all can see it, which is a thing no test would think to assert without a
+break to justify it.
+
+The direction of limits.MaxEncoderTableSize is the other one worth reading. It is a
+minimum, never a clamp into a range, and the two breaks that turn it into a maximum or
+skip a zero are there because both are the sort of thing that reads as a tidy-up. A
+peer offering more encoding context than this server wants is offering, and declining
+is free; a peer offering less, or none, is stating what its own decoder will keep, and
+there is nothing there to decline.
+
+Close is about no frame at all, and its three breaks are the three ways a teardown
+goes wrong: saying nothing, saying something else, and tidying up on the way out. All
+three are invisible to a suite that only sends frames, because what they damage is a
+goroutine that is not in this package and is asleep. Saying nothing leaks a request, a
+response and a stack per parked writer, for the life of the process, on the ordinary
+event of a peer hanging up mid-download. Saying something else — a stand-in error in
+place of the connection's own — reaches the writer, so nothing leaks, and the operator
+reading its log is told the stream was gone when in fact the peer went away. Retiring
+the streams on the way out looks like housekeeping and is a race: retire takes a
+stream's send window with it, so whether a woken writer sees the connection's reason or
+flow.ErrStreamGone comes down to which reached it first.
+
+ReportSendEnd and the drain are the other place a fact arrives from outside the reader
+goroutine, and their five breaks are worth reading together because three of them are
+about *when* rather than what. Applying the close where it is reported is the break the
+whole arrangement exists to prevent, and the only reason it is caught at all is that one
+test asserts the stream is still open between the report and the next frame -- every
+assertion about the end state passes, because the end state is right. What it costs is
+not a wrong answer but a data race on the stream map, the states and the concurrency
+count, which under -race is a caught test and in production is a wedged connection.
+Draining after the dispatch instead of before it produces a server that is correct until
+it is busy: §5.1.2's limit is checked where a HEADERS frame opens a stream, so a
+connection at its limit refuses a request the peer was entitled to send, and refuses the
+next one too, each paying for the response that finished just before it arrived. Never
+draining at all is the same fault without the recovery. The remaining two are the two
+lines inside the drain that look like they could be shorter: taking the list without
+emptying it grows one identifier per response for the life of the connection and is
+visible in no state assertion anywhere, and dropping the nil check is a nil dereference
+in the reader goroutine of a healthy connection on the ordinary event of a peer
+abandoning a download.
+
+There is one guard on that route with no break here, named rather than left out:
+TestReportSendEndIsSafeWhileTheReaderIsHandlingFrames is a -race test, and this harness
+runs the suite without it. The break that would prove it -- ReportSendEnd appending
+without the mutex -- fires nothing under a plain go test, so it is not written down as
+one. Its subject is covered from the other direction: the break that applies the close
+on the reporting goroutine reaches the map from two goroutines at once, and that test is
+where the race detector says so.
+
 Every guard in the file has a break here, both scopes of every error that has a
 choice of scope, and every message has one that strips its section reference.
-All 114 are caught, and two of them are worth knowing about for how they are caught
-rather than that they are: removing the CONTINUATION-with-no-block guard and dropping
-the streams map from the constructor both produce a nil dereference rather than a
-failed assertion. Both still report as an ordinary failure of the named test, because
-the panic happens on the goroutine running that test and go test attributes it there
--- so neither needs the harness's crash outcome, which is for a break that takes the
-package down somewhere no test's name is attached to.
+All 133 are caught, and four of them are worth knowing about for how they are caught
+rather than that they are: removing the CONTINUATION-with-no-block guard, dropping
+the streams map from the constructor, letting New skip making a Sender, and taking the
+nil check out of the drain all produce a nil dereference rather than a failed assertion.
+All four still report as an ordinary failure of the named test, because the panic
+happens on the goroutine running that test and go test attributes it there -- so none of
+them needs the harness's crash outcome, which is for a break that takes the package down
+somewhere no test's name is attached to.
+
+Thirteen of the breaks were refused outright by preflight the first time this campaign
+was run after the send half of flow control moved out of this file and behind
+internal/flow's Sender, which is the outcome that arrangement was chosen for. Ten were
+re-anchored to the delegation that replaced the arithmetic and still name the same
+tests. Three had lost their subject entirely rather than moved it -- the connection
+send window's construction, the default a new stream's send window is opened at, and
+whether the peer's SETTINGS_INITIAL_WINDOW_SIZE is remembered across an empty table --
+and all three are now break-sender.py's, because that is where the code they were
+about now lives. Three took their place, and they are the breaks the seam makes
+possible: a table that ignores the Sender it was handed and makes its own, a table
+that makes none at all, and a stream that leaves the table without its send window
+going with it. A fourth, on data's stream-window debit, had to be rewritten rather
+than re-anchored: it used to swap the receive window for the send window, and a Stream
+no longer has a send window to swap in, so it now debits the connection's window twice
+instead. That the typo has become a compile error rather than a caught mistake is the
+whole return on the refactor, and it is worth more than the break that used to catch
+it.
 
 The campaign found four missing tests rather than four weak guards, which is the
 other outcome these files exist to produce. All four are now in table_test.go, and
@@ -128,6 +205,15 @@ BREAKS = [
         ["TestNewPanicsWithoutRequests"],
     ),
     (
+        "New accepts a nil Encoder, so the peer's first SETTINGS panics in the reader goroutine",
+        """	if cfg.Encoder == nil {
+		panic("stream: New requires a response encoder")
+	}
+""",
+        "",
+        ["TestNewPanicsWithoutAnEncoder"],
+    ),
+    (
         "New leaves the concurrency limit at zero, so every stream is refused",
         """	if cfg.MaxConcurrent == 0 {
 		cfg.MaxConcurrent = limits.MaxConcurrentStreams
@@ -154,30 +240,48 @@ BREAKS = [
     ),
     (
         "New makes the connection's receive window a stream window, so a connection fault resets stream 1",
-        """		connRecv:      flow.NewConnWindow(),""",
-        """		connRecv:      flow.NewStreamWindow(1, flow.InitialWindowSize),""",
+        """		connRecv: flow.NewConnWindow(),""",
+        """		connRecv: flow.NewStreamWindow(1, flow.InitialWindowSize),""",
         [
             "TestNewStartsBothConnectionWindowsAtTheProtocolInitialSize",
             "TestDataPastTheConnectionWindowEndsTheConnection",
         ],
     ),
     (
-        "New makes the connection's send window a stream window, so its overflow is one stream's fault",
-        """		connSend:      flow.NewConnWindow(),""",
-        """		connSend:      flow.NewStreamWindow(1, flow.InitialWindowSize),""",
-        ["TestConnWindowUpdateOverflowEndsTheConnection"],
+        "New ignores the Sender it was handed and makes its own, which nothing will ever close",
+        """		sender:   cfg.Sender,""",
+        """		sender:   flow.NewSender(),""",
+        ["TestTheSenderIsTakenFromConfigWhenOneIsGiven"],
     ),
     (
-        "New starts new streams' send windows at zero rather than the protocol's initial size",
-        """		peerInitialWindow: flow.InitialWindowSize,""",
-        """		peerInitialWindow: 0,""",
-        ["TestNewSizesNewStreamWindowsFromTheProtocolInitialSize"],
+        "New makes no Sender when Config has none, so the first response body dereferences nil",
+        """	if cfg.Sender == nil {
+		cfg.Sender = flow.NewSender()
+	}
+""",
+        "",
+        [
+            "TestTheTableMakesItsOwnSenderWhenConfigHasNone",
+            "TestNewStartsBothConnectionWindowsAtTheProtocolInitialSize",
+        ],
     ),
     (
         "New sizes the reset bucket from something other than the advisory's policy",
         """		resets: limits.NewResetBucket(cfg.Now()),""",
         """		resets: limits.NewBucket(1<<30, 1<<30, cfg.Now()),""",
         ["TestARstStreamFloodEndsTheConnection"],
+    ),
+
+    # --- the accessors the layers on either side reach through ---------------
+    (
+        "Sender answers with a new Sender every time, so every response body gets its own credit",
+        """func (t *Table) Sender() *flow.Sender { return t.sender }""",
+        """func (t *Table) Sender() *flow.Sender { return flow.NewSender() }""",
+        [
+            "TestTheSenderIsTakenFromConfigWhenOneIsGiven",
+            "TestTheTableOnlyHoldsStreamsThatCountAsConcurrent",
+            "TestClosingAStreamTakesAwayItsSendWindow",
+        ],
     ),
 
     # --- StateOf: the three-way distinction ----------------------------------
@@ -250,6 +354,61 @@ BREAKS = [
         ],
     ),
 
+    # --- ReportSendEnd and the drain: the response side crossing back ---------
+    (
+        "ReportSendEnd applies the close where it stands, on the goroutine that reported it",
+        """	t.mu.Lock()
+	t.sent = append(t.sent, id)
+	t.mu.Unlock()""",
+        """	if s := t.streams[id]; s != nil {
+		t.SendEnd(s)
+	}""",
+        ["TestReportSendEndIsNotAppliedUntilTheNextFrame"],
+    ),
+    (
+        "the drain reads the reported list and leaves it there",
+        """	t.mu.Lock()
+	sent := t.sent
+	t.sent = nil
+	t.mu.Unlock()""",
+        """	t.mu.Lock()
+	sent := t.sent
+	t.mu.Unlock()""",
+        ["TestTheDrainEmptiesTheListItApplies"],
+    ),
+    (
+        "the drain dereferences an identifier the peer has already reset away",
+        """		if s := t.streams[id]; s != nil {
+			t.SendEnd(s)
+		}""",
+        """		t.SendEnd(t.streams[id])""",
+        ["TestReportSendEndForAStreamThePeerHasResetIsIgnored"],
+    ),
+    (
+        "HandleFrame never drains, so a finished response never closes its stream",
+        """	// Before the dispatch rather than after it, and the reason is §5.1.2's
+	// concurrency limit: see drainSent.
+	t.drainSent()
+
+""",
+        "",
+        [
+            "TestReportSendEndIsNotAppliedUntilTheNextFrame",
+            "TestReportSendEndFreesTheConcurrencySlotBeforeTheNextRequestIsJudged",
+            "TestReportSendEndOnAStreamThePeerHasNotFinishedLeavesItHalfClosedLocal",
+            "TestReportSendEndIsSafeWhileTheReaderIsHandlingFrames",
+        ],
+    ),
+    (
+        "HandleFrame drains after the dispatch, so every frame is judged against a stale table",
+        """	t.drainSent()""",
+        """	defer t.drainSent()""",
+        [
+            "TestReportSendEndFreesTheConcurrencySlotBeforeTheNextRequestIsJudged",
+            "TestReportSendEndOnAStreamThePeerHasNotFinishedLeavesItHalfClosedLocal",
+        ],
+    ),
+
     # --- HandleFrame: the dispatch -------------------------------------------
     (
         "HandleFrame has no CONTINUATION arm, so every split header block ends the connection",
@@ -294,58 +453,172 @@ BREAKS = [
     # --- the connection-level frames the server forwards ---------------------
     (
         "ConnWindowUpdate credits our own receive window with the peer's grant",
-        """	return t.connSend.Increase(increment)""",
+        """	return t.sender.CreditConn(increment)""",
         """	return t.connRecv.Increase(increment)""",
         ["TestConnWindowUpdateCreditsTheConnectionSendWindow"],
     ),
     (
         "ConnWindowUpdate swallows an increment past the maximum window",
-        """	return t.connSend.Increase(increment)
+        """	return t.sender.CreditConn(increment)
 }""",
-        """	t.connSend.Increase(increment)
+        """	t.sender.CreditConn(increment)
 	return nil
 }""",
         ["TestConnWindowUpdateOverflowEndsTheConnection"],
     ),
     (
-        "SetInitialWindowSize does not reach the streams that are already open (RFC 9113 6.9.2)",
-        """	for _, s := range t.streams {""",
-        """	for _, s := range map[uint32]*Stream(nil) {""",
+        "SetInitialWindowSize drops the peer's setting (RFC 9113 6.9.2)",
+        """	return t.sender.SetInitialSize(n)""",
+        """	return nil""",
         [
             "TestSetInitialWindowSizeAppliesADeltaToOpenStreams",
             "TestSetInitialWindowSizeAppliesToEveryOpenStream",
             "TestSetInitialWindowSizeOverflowEndsTheConnection",
-        ],
-    ),
-    (
-        "SetInitialWindowSize does not remember the value, so streams opened later use the old one",
-        """	t.peerInitialWindow = n
-""",
-        "",
-        [
             "TestSetInitialWindowSizeSizesStreamsOpenedAfterwards",
             "TestSetInitialWindowSizeWithNoStreamsOpenIsRemembered",
         ],
     ),
     (
         "SetInitialWindowSize applies the peer's setting to our own grant instead of the peer's",
-        """		if err := s.send.SetInitialSize(n); err != nil {""",
-        """		if err := s.recv.SetInitialSize(n); err != nil {""",
+        """func (t *Table) SetInitialWindowSize(n uint32) error {
+	return t.sender.SetInitialSize(n)""",
+        """func (t *Table) SetInitialWindowSize(n uint32) error {
+	for _, s := range t.streams {
+		if err := s.recv.SetInitialSize(n); err != nil {
+			return err
+		}
+	}
+	return nil""",
         [
             "TestSetInitialWindowSizeAppliesADeltaToOpenStreams",
             "TestSetInitialWindowSizeAppliesToEveryOpenStream",
+            "TestSetInitialWindowSizeSizesStreamsOpenedAfterwards",
         ],
     ),
     (
         "SetInitialWindowSize applies the setting to the connection window too (RFC 9113 6.9.2)",
         """func (t *Table) SetInitialWindowSize(n uint32) error {
-	for _, s := range t.streams {""",
+	return t.sender.SetInitialSize(n)""",
         """func (t *Table) SetInitialWindowSize(n uint32) error {
-	if err := t.connSend.SetInitialSize(n); err != nil {
+	if err := t.connRecv.SetInitialSize(n); err != nil {
 		return err
 	}
-	for _, s := range t.streams {""",
+	return t.sender.SetInitialSize(n)""",
         ["TestSetInitialWindowSizeLeavesTheConnectionWindowAlone"],
+    ),
+
+    # --- the peer's two header settings --------------------------------------
+    (
+        "SetHeaderTableSize drops the peer's setting, leaving the encoder on its default",
+        """	t.enc.SetMaxDynamicTableSize(int(min(n, limits.MaxEncoderTableSize)))""",
+        """	_ = n""",
+        [
+            "TestSetHeaderTableSizeReachesTheEncoder",
+            "TestSetHeaderTableSizeIsAMinimumAndNotAClamp",
+            "TestTheTwoHeaderSettingsAreNotCrossed",
+        ],
+    ),
+    (
+        "SetHeaderTableSize honours a peer's four gigabytes (RFC 9113 6.5.2 sets no ceiling)",
+        """	t.enc.SetMaxDynamicTableSize(int(min(n, limits.MaxEncoderTableSize)))""",
+        """	t.enc.SetMaxDynamicTableSize(int(n))""",
+        ["TestSetHeaderTableSizeIsAMinimumAndNotAClamp"],
+    ),
+    (
+        "the encoder table bound is a maximum instead of a minimum, so a small table is enlarged",
+        """	t.enc.SetMaxDynamicTableSize(int(min(n, limits.MaxEncoderTableSize)))""",
+        """	t.enc.SetMaxDynamicTableSize(int(max(n, limits.MaxEncoderTableSize)))""",
+        ["TestSetHeaderTableSizeIsAMinimumAndNotAClamp"],
+    ),
+    (
+        "a peer that keeps no dynamic table is skipped rather than obeyed",
+        """	t.enc.SetMaxDynamicTableSize(int(min(n, limits.MaxEncoderTableSize)))""",
+        """	if n != 0 {
+		t.enc.SetMaxDynamicTableSize(int(min(n, limits.MaxEncoderTableSize)))
+	}""",
+        ["TestSetHeaderTableSizeIsAMinimumAndNotAClamp"],
+    ),
+    (
+        "the peer's table size resizes the table we decode with instead of the one we encode with",
+        """	t.enc.SetMaxDynamicTableSize(int(min(n, limits.MaxEncoderTableSize)))""",
+        """	t.codec.SetMaxDynamicTableSize(int(min(n, limits.MaxEncoderTableSize)))""",
+        [
+            "TestSetHeaderTableSizeReachesTheEncoder",
+            "TestSetHeaderTableSizeLeavesTheDecodingCodecAlone",
+        ],
+    ),
+    (
+        "SetMaxHeaderListSize drops the peer's setting, so responses ignore the limit it asked for",
+        """	t.enc.SetMaxHeaderListSize(n)""",
+        """	_ = n""",
+        [
+            "TestSetMaxHeaderListSizeReachesTheEncoderWhole",
+            "TestTheTwoHeaderSettingsAreNotCrossed",
+        ],
+    ),
+    (
+        "the encoder table bound is copied onto the header list size, which has nothing to do with it",
+        """	t.enc.SetMaxHeaderListSize(n)""",
+        """	t.enc.SetMaxHeaderListSize(min(n, limits.MaxEncoderTableSize))""",
+        ["TestSetMaxHeaderListSizeReachesTheEncoderWhole"],
+    ),
+    (
+        "a peer that will read no header list at all is skipped rather than obeyed",
+        """	t.enc.SetMaxHeaderListSize(n)""",
+        """	if n != 0 {
+		t.enc.SetMaxHeaderListSize(n)
+	}""",
+        ["TestSetMaxHeaderListSizeReachesTheEncoderWhole"],
+    ),
+    (
+        "the peer's table size is applied as its header list size, which is the crossing that compiles",
+        """func (t *Table) SetHeaderTableSize(n uint32) {
+	t.enc.SetMaxDynamicTableSize(int(min(n, limits.MaxEncoderTableSize)))
+}""",
+        """func (t *Table) SetHeaderTableSize(n uint32) {
+	t.enc.SetMaxHeaderListSize(n)
+}""",
+        [
+            "TestSetHeaderTableSizeReachesTheEncoder",
+            "TestTheTwoHeaderSettingsAreNotCrossed",
+        ],
+    ),
+
+    # --- Close: the connection's ending reaching flow control ----------------
+    (
+        "Close tells flow control nothing, so every parked writer waits for the life of the process",
+        """func (t *Table) Close(err error) {
+	t.sender.Close(err)
+}""",
+        """func (t *Table) Close(err error) {
+}""",
+        [
+            "TestCloseWakesEveryGoroutineParkedForSendCredit",
+            "TestClosePanicsWithoutAReason",
+        ],
+    ),
+    (
+        "Close hands flow control a stand-in reason instead of the one the connection ended for",
+        """	t.sender.Close(err)""",
+        """	t.sender.Close(flow.ErrStreamGone)""",
+        [
+            "TestCloseWakesEveryGoroutineParkedForSendCredit",
+            "TestClosePanicsWithoutAReason",
+        ],
+    ),
+    (
+        "Close retires the streams as it wakes their writers, taking away the windows they wake on",
+        """func (t *Table) Close(err error) {
+	t.sender.Close(err)
+}""",
+        """func (t *Table) Close(err error) {
+	for _, s := range t.streams {
+		s.state = StateClosed
+		t.retire(s)
+	}
+	t.sender.Close(err)
+}""",
+        ["TestCloseLeavesTheStreamsWhereTheyAre"],
     ),
 
     # --- headers: which of the two kinds of block this is --------------------
@@ -718,16 +991,18 @@ BREAKS = [
     (
         "completeBlock sizes our own grant from the peer's setting (RFC 9113 6.9.2)",
         """		recv: flow.NewStreamWindow(b.id, flow.InitialWindowSize),""",
-        """		recv: flow.NewStreamWindow(b.id, t.peerInitialWindow),""",
+        """		recv: flow.NewStreamWindow(b.id, t.sender.InitialSize()),""",
         ["TestSetInitialWindowSizeSizesStreamsOpenedAfterwards"],
     ),
     (
-        "completeBlock ignores the peer's SETTINGS_INITIAL_WINDOW_SIZE for a new stream",
-        """		send: flow.NewStreamWindow(b.id, t.peerInitialWindow),""",
-        """		send: flow.NewStreamWindow(b.id, flow.InitialWindowSize),""",
+        "completeBlock opens the stream without a send window, so its response can never be written",
+        """	t.sender.Open(b.id)
+""",
+        "",
         [
+            "TestTheTableOnlyHoldsStreamsThatCountAsConcurrent",
+            "TestNewSizesNewStreamWindowsFromTheProtocolInitialSize",
             "TestSetInitialWindowSizeSizesStreamsOpenedAfterwards",
-            "TestSetInitialWindowSizeWithNoStreamsOpenIsRemembered",
         ],
     ),
     (
@@ -853,9 +1128,9 @@ BREAKS = [
         ],
     ),
     (
-        "data debits the stream's send window with the peer's DATA",
+        "data debits the connection window twice instead of the stream's",
         """	if err := s.recv.Consume(n); err != nil {""",
-        """	if err := s.send.Consume(n); err != nil {""",
+        """	if err := t.connRecv.Consume(n); err != nil {""",
         [
             "TestPaddedDataIsFlowControlledByItsWholeLength",
             "TestDataRefusedByAStreamWindowIsStillCountedAgainstTheConnectionWindow",
@@ -1032,23 +1307,23 @@ BREAKS = [
         "windowUpdate refuses the credit 6.9 exempts by name, for a stream that is over",
         """		return nil
 	}
-	return s.send.Increase(f.Increment)""",
+	return t.sender.CreditStream(f.StreamID, f.Increment)""",
         """		return t.absent("WINDOW_UPDATE", f.StreamID)
 	}
-	return s.send.Increase(f.Increment)""",
+	return t.sender.CreditStream(f.StreamID, f.Increment)""",
         ["TestWindowUpdateOnAClosedStreamIsIgnored"],
     ),
     (
         "windowUpdate credits the window we grant the peer instead of the one it granted us",
-        """	return s.send.Increase(f.Increment)""",
-        """	return s.recv.Increase(f.Increment)""",
+        """	return t.sender.CreditStream(f.StreamID, f.Increment)""",
+        """	return t.streams[f.StreamID].recv.Increase(f.Increment)""",
         ["TestWindowUpdateCreditsTheStreamsSendWindow"],
     ),
     (
         "windowUpdate swallows an increment that takes a stream window past the maximum",
-        """	return s.send.Increase(f.Increment)
+        """	return t.sender.CreditStream(f.StreamID, f.Increment)
 }""",
-        """	s.send.Increase(f.Increment)
+        """	t.sender.CreditStream(f.StreamID, f.Increment)
 	return nil
 }""",
         ["TestWindowUpdateOverflowingAStreamWindowIsAStreamError"],
@@ -1099,6 +1374,17 @@ BREAKS = [
         [
             "TestTheTableOnlyHoldsStreamsThatCountAsConcurrent",
             "TestARefusedStreamDoesNotCountAgainstTheLimit",
+        ],
+    ),
+    (
+        "retire keeps the closed stream's send window, so its writer waits for the life of the process",
+        """		t.sender.Retire(s.id)
+""",
+        "",
+        [
+            "TestTheTableOnlyHoldsStreamsThatCountAsConcurrent",
+            "TestClosingAStreamTakesAwayItsSendWindow",
+            "TestResettingAStreamWakesTheGoroutineWritingItsResponse",
         ],
     ),
 
@@ -1231,6 +1517,199 @@ BREAKS = [
 		"%s on closed stream %d (RFC 9113 §5.1)", kind, id)""",
         """	return h2.StreamErrorf(id, h2.StreamClosed, "stream closed")""",
         ["TestEveryErrorNamesTheRuleAndTheStream"],
+    ),
+    # --- returning the receive window (§6.9) --------------------------------
+    #
+    # This section is about a mechanism whose failures are all silences. Every break
+    # below leaves a server that answers every request a browser makes, passes h2spec
+    # end to end, and stalls the first upload larger than 64 KiB — or, worse, refuses a
+    # peer that spent exactly the credit it was offered, at a moment decided by which
+    # goroutine ran first. There is no error message anywhere in that, on either end,
+    # which is why the credit path is tested by frame counts and window arithmetic
+    # rather than by return values.
+    (
+        "a report of no content is accrued like any other",
+        """	if n <= 0 {
+		return
+	}""",
+        """	// every report is accrued, whatever it says""",
+        ["TestReportConsumedIgnoresNothing"],
+    ),
+    (
+        "credit is returned to a stream whose content is already complete",
+        """	var stream uint32
+	if more {
+		c := t.streamCredit[id]
+		if c == nil {
+			c = &recvCredit{}
+			t.streamCredit[id] = c
+		}
+		stream = c.earn(int64(n))
+	}""",
+        """	c := t.streamCredit[id]
+	if c == nil {
+		c = &recvCredit{}
+		t.streamCredit[id] = c
+	}
+	stream := c.earn(int64(n))""",
+        ["TestReportConsumedCreditsOnlyTheConnectionForAFinishedStream"],
+    ),
+    (
+        "the credit earned for a stream is not kept between one read and the next",
+        """		if c == nil {
+			c = &recvCredit{}
+			t.streamCredit[id] = c
+		}""",
+        """		if c == nil {
+			c = &recvCredit{}
+		}""",
+        ["TestReportConsumedHoldsCreditBackUntilTheThreshold"],
+    ),
+    (
+        "the stream is credited before the connection",
+        """	if conn > 0 {
+		t.enqueueWindowUpdate(0, conn)
+	}
+	if stream > 0 {
+		t.enqueueWindowUpdate(id, stream)
+	}""",
+        """	if stream > 0 {
+		t.enqueueWindowUpdate(id, stream)
+	}
+	if conn > 0 {
+		t.enqueueWindowUpdate(0, conn)
+	}""",
+        ["TestReportConsumedCreditsTheConnectionBeforeTheStream"],
+    ),
+    (
+        "the connection is credited an increment of zero when it has earned nothing",
+        """	if conn > 0 {
+		t.enqueueWindowUpdate(0, conn)
+	}""",
+        """	t.enqueueWindowUpdate(0, conn)""",
+        ["TestReportConsumedHoldsCreditBackUntilTheThreshold"],
+    ),
+    (
+        "a stream is credited an increment of zero when it has earned nothing",
+        """	if stream > 0 {
+		t.enqueueWindowUpdate(id, stream)
+	}""",
+        """	t.enqueueWindowUpdate(id, stream)""",
+        ["TestReportConsumedCreditsOnlyTheConnectionForAFinishedStream"],
+    ),
+    (
+        "the connection's credit is sent naming the stream that earned it",
+        """		t.enqueueWindowUpdate(0, conn)""",
+        """		t.enqueueWindowUpdate(id, conn)""",
+        ["TestReportConsumedCreditsTheConnectionBeforeTheStream"],
+    ),
+    (
+        "a stream's credit is sent as the connection's",
+        """		t.enqueueWindowUpdate(id, stream)""",
+        """		t.enqueueWindowUpdate(0, stream)""",
+        [
+            "TestReportConsumedCreditsTheConnectionBeforeTheStream",
+            "TestReportConsumedHoldsCreditBackUntilTheThreshold",
+        ],
+    ),
+    (
+        "earn: the threshold is dropped, so every read puts a frame on the wire",
+        """	if c.pending < limits.ReplenishThreshold {
+		return 0
+	}""",
+        """	if c.pending <= 0 {
+		return 0
+	}""",
+        ["TestReportConsumedHoldsCreditBackUntilTheThreshold"],
+    ),
+    (
+        "earn: credit above what one WINDOW_UPDATE may carry is not capped",
+        """	due := c.pending
+	if due > flow.MaxWindowSize {
+		due = flow.MaxWindowSize
+	}""",
+        """	due := c.pending""",
+        ["TestEarningMoreThanOneWindowUpdateCanCarryHoldsTheRestBack"],
+    ),
+    (
+        "earn: advertised credit is left pending, so every later frame advertises it again",
+        """	c.pending -= due""",
+        """	// the advertised octets stay pending""",
+        ["TestCreditBookkeepingDoesNotGrowWithTheStreamsThatUsedIt"],
+    ),
+    (
+        "the credit a handler earned never reaches the windows at all",
+        """	if err := t.drainCredit(); err != nil {
+		return err
+	}""",
+        """	// the credit earned since the last frame stays where it is""",
+        [
+            "TestReportedCreditReachesTheWindowsBeforeTheNextFrameIsJudged",
+            "TestCreditIsAppliedByAnyFrame",
+            "TestCreditForAStreamThatHasGoneIsStillCreditedToTheConnection",
+            "TestCreditBookkeepingDoesNotGrowWithTheStreamsThatUsedIt",
+            "TestReportConsumedSurvivesAWriterThatHasStopped",
+            "TestCreditThatWouldOverflowTheConnectionWindowEndsTheConnection",
+            "TestCreditThatWouldOverflowAStreamWindowResetsThatStream",
+        ],
+    ),
+    (
+        "the credit is applied after the frame that spends it has been judged",
+        """	if err := t.drainCredit(); err != nil {
+		return err
+	}
+
+	switch v := f.(type) {""",
+        """	defer func() { _ = t.drainCredit() }()
+
+	switch v := f.(type) {""",
+        ["TestReportedCreditReachesTheWindowsBeforeTheNextFrameIsJudged"],
+    ),
+    (
+        "drainCredit: the connection's advertised credit is applied again by every later frame",
+        """	conn := t.connCredit.granted
+	t.connCredit.granted = 0""",
+        """	conn := t.connCredit.granted""",
+        ["TestCreditBookkeepingDoesNotGrowWithTheStreamsThatUsedIt"],
+    ),
+    (
+        "drainCredit: a stream's advertised credit is applied again by every later frame",
+        """			streams[id] = c.granted
+			c.granted = 0""",
+        """			streams[id] = c.granted""",
+        ["TestCreditBookkeepingDoesNotGrowWithTheStreamsThatUsedIt"],
+    ),
+    (
+        "drainCredit: the bookkeeping of a stream that has closed is never dropped",
+        """		if _, live := t.streams[id]; !live && c.pending == 0 && c.granted == 0 {
+			delete(t.streamCredit, id)
+		}""",
+        """		// the entry is left behind""",
+        ["TestCreditBookkeepingDoesNotGrowWithTheStreamsThatUsedIt"],
+    ),
+    (
+        "drainCredit: an overflow of the connection window is not reported",
+        """		if err := t.connRecv.Increase(uint32(conn)); err != nil {
+			return err
+		}""",
+        """		_ = t.connRecv.Increase(uint32(conn))""",
+        ["TestCreditThatWouldOverflowTheConnectionWindowEndsTheConnection"],
+    ),
+    (
+        "drainCredit: an overflow of a stream's window is not reported",
+        """			if err := s.recv.Increase(uint32(n)); err != nil {
+				return err
+			}""",
+        """			_ = s.recv.Increase(uint32(n))""",
+        ["TestCreditThatWouldOverflowAStreamWindowResetsThatStream"],
+    ),
+    (
+        "the table is built with no way to send a frame of its own",
+        """	if cfg.Writer == nil {
+		panic("stream: New requires a frame writer")
+	}""",
+        """	// a table with nowhere to send a WINDOW_UPDATE is accepted""",
+        ["TestNewPanicsWithoutAWriter"],
     ),
 ]
 

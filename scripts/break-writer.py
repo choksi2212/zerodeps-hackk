@@ -162,6 +162,15 @@ BREAKS = [
         ["TestFrameWriterSetMaxFrameSizeRaisesTheLimit"],
     ),
     (
+        "MaxFrameSize: the protocol default rather than the peer's, so responses split too small",
+        """	return w.fw.MaxFrameSize()""",
+        """	return frame.DefaultMaxFrameSize""",
+        [
+            "TestFrameWriterReportsTheCapAResponseMustSplitAt",
+            "TestTheWritePathAHandlerIsGivenReportsThePeersFrameSizeCap",
+        ],
+    ),
+    (
         "Shutdown and Close: no sync.Once, so a second call closes a closed channel",
         """func (w *frameWriter) Shutdown() {
 	w.gracefulOnce.Do(func() { close(w.graceful) })

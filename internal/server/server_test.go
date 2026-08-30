@@ -315,12 +315,12 @@ func (r *logRecorder) text() string {
 
 // testServer returns a server logging into a recorder. A nil factory gets
 // rejectingHandler, which fails the test if any frame reaches the stream layer.
-func testServer(t *testing.T, cfg Config, newHandler func(FrameEnqueuer) StreamHandler) (*Server, *logRecorder) {
+func testServer(t *testing.T, cfg Config, newHandler func(ConnWriter) StreamHandler) (*Server, *logRecorder) {
 	t.Helper()
 	rec := &logRecorder{}
 	cfg.ErrorLog = log.New(rec, "", 0)
 	if newHandler == nil {
-		newHandler = func(FrameEnqueuer) StreamHandler { return rejectingHandler(t) }
+		newHandler = func(ConnWriter) StreamHandler { return rejectingHandler(t) }
 	}
 	return New(newHandler, cfg), rec
 }
@@ -357,6 +357,34 @@ func awaitPeers(t *testing.T, l *testListener, n int) {
 	t.Helper()
 	poll(t, gateWait, func() bool { return l.peerCount() >= n }, func() string {
 		return fmt.Sprintf("the listener handed out %d connections, want at least %d", l.peerCount(), n)
+	})
+}
+
+// connCount is how many connections the server has registered. Test-only, and it
+// counts the set Shutdown walks rather than a tally of its own, which is the only
+// version of this that cannot disagree with the thing under test.
+func (s *Server) connCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.conns)
+}
+
+// awaitTrackedConns waits until the server has registered n connections.
+//
+// A third event, and the distance between it and awaitPeers is where a test went
+// flaky. The listener records a connection inside Accept; the server registers it a
+// moment later, in track, and serveConn's own comment says what happens in between —
+// a connection accepted after the server stopped "is in nobody's set" and "nothing
+// waits for it". A Shutdown landing in that window therefore finds an empty set,
+// waits for nothing and reports a clean stop, which is correct behaviour and the
+// wrong precondition for a test about a connection that cannot stop cleanly.
+//
+// Every other test here crosses the window by exchanging a frame with its peer, which
+// takes a peer that reads. A stalled connection has none, so it waits for the set.
+func awaitTrackedConns(t *testing.T, s *Server, n int) {
+	t.Helper()
+	poll(t, gateWait, func() bool { return s.connCount() >= n }, func() string {
+		return fmt.Sprintf("the server has registered %d connections, want at least %d", s.connCount(), n)
 	})
 }
 
@@ -530,7 +558,7 @@ func TestServerBoundsConcurrentConnections(t *testing.T) {
 // config empty, because both are security-relevant and both fail silently: an
 // unbounded connection count and a set of zero deadlines that expire immediately.
 func TestServerFillsUnsetConfig(t *testing.T) {
-	s := New(func(FrameEnqueuer) StreamHandler { return rejectingHandler(t) }, Config{})
+	s := New(func(ConnWriter) StreamHandler { return rejectingHandler(t) }, Config{})
 
 	if got := cap(s.slots); got != limits.MaxConns {
 		t.Errorf("an empty Config gives room for %d connections, want limits.MaxConns = %d",
@@ -569,7 +597,7 @@ func TestServerNewRequiresAHandlerFactory(t *testing.T) {
 // of answering.
 type taggedHandler struct {
 	StreamHandler
-	w FrameEnqueuer
+	w ConnWriter
 }
 
 // TestServerBuildsAHandlerPerConnection is the claim on Server.newHandler, and it is
@@ -589,7 +617,7 @@ func TestServerBuildsAHandlerPerConnection(t *testing.T) {
 
 	var mu sync.Mutex
 	var handlers []*taggedHandler
-	newHandler := func(w FrameEnqueuer) StreamHandler {
+	newHandler := func(w ConnWriter) StreamHandler {
 		h := &taggedHandler{StreamHandler: rejectingHandler(t), w: w}
 		mu.Lock()
 		handlers = append(handlers, h)
@@ -973,7 +1001,14 @@ func TestServerShutdownForcesAStalledConnectionPastTheGrace(t *testing.T) {
 	l := newTestListener(nil).stalled()
 	s, _ := testServer(t, Config{Timeouts: to}, nil)
 	done := serverInBackground(s, l)
-	awaitPeers(t, l, 1)
+
+	// The registration and not the accept. Once the server is tracking this
+	// connection it cannot finish inside the grace period: its writer goroutine is
+	// started by newConn, the read loop's first act is to enqueue the server preface,
+	// and the teardown waits for a writer that is stuck on an unbuffered pipe until
+	// its hour-long write deadline expires. Before the registration none of that is
+	// true, and the shutdown has nothing to wait for.
+	awaitTrackedConns(t, s, 1)
 
 	err := s.Shutdown()
 	if !errors.Is(err, ErrShutdownGraceExpired) {
@@ -997,11 +1032,11 @@ func TestServerShutdownForcesAStalledConnectionPastTheGrace(t *testing.T) {
 // that is not blocked on the socket. Both Shutdown and Close have to give up on it and
 // say so, which is what the two tests below check — and it is not a contrived state:
 // any handler that waits on a backend, a lock, or a disk can be in it.
-func wedgedHandler() (newHandler func(FrameEnqueuer) StreamHandler, entered <-chan struct{}, release func()) {
+func wedgedHandler() (newHandler func(ConnWriter) StreamHandler, entered <-chan struct{}, release func()) {
 	in := make(chan struct{})
 	out := make(chan struct{})
 	var once sync.Once
-	factory := func(FrameEnqueuer) StreamHandler {
+	factory := func(ConnWriter) StreamHandler {
 		return handlerFunc(func(frame.Frame) error {
 			once.Do(func() { close(in) })
 			<-out
@@ -1239,7 +1274,7 @@ func TestServerShutdownReachesAConnectionAcceptedInTheRace(t *testing.T) {
 func TestServerRecoversFromAPanickingHandler(t *testing.T) {
 	baseline := goroutineBaseline()
 
-	handler := func(FrameEnqueuer) StreamHandler {
+	handler := func(ConnWriter) StreamHandler {
 		return handlerFunc(func(frame.Frame) error {
 			panic("a bug reached through a peer's frame")
 		})
@@ -1321,7 +1356,7 @@ func TestServerWithNoLogDiscardsEveryLine(t *testing.T) {
 
 	boom := errors.New("accept: too many open files")
 	l := newTestListener(boom, nil)
-	s := New(func(FrameEnqueuer) StreamHandler { return rejectingHandler(t) }, Config{Timeouts: serverTimeouts()})
+	s := New(func(ConnWriter) StreamHandler { return rejectingHandler(t) }, Config{Timeouts: serverTimeouts()})
 	done := serverInBackground(s, l)
 
 	awaitPeers(t, l, 1)

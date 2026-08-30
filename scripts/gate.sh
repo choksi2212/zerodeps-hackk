@@ -2,13 +2,18 @@
 # ---------------------------------------------------------------------------
 # scripts/gate.sh — the build gate for zdh.
 #
-# Nine ordered checks. Nothing is committed while any of them is red.
+# Ten ordered checks. Nothing is committed while any of them is red.
 #
 # Checks 6, 7 and 8 are the ones that matter to this project: they turn the
 # zero-dependency claim into something the build enforces instead of something
 # the README asserts. Check 6 is deliberately hostile to us — Go's standard
 # library already contains an HTTP/2 implementation in net/http, and importing
 # it would quietly defeat the entire entry.
+#
+# Check 9 is the odd one out: it grades the comments rather than the code, by
+# checking every RFC 9113 quotation in the tree against RFC 9113. It needs
+# Python and a copy of the RFC, and skips rather than fails when either is
+# absent, so a checkout without them still gets a green gate.
 #
 # Runs in Git Bash on Windows and in any POSIX shell on Linux. Uses only the
 # Go toolchain and no third-party tool of any kind.
@@ -27,7 +32,7 @@ die() {
 	exit 1
 }
 
-step "1/9  gofmt -l . — every file formatted"
+step "1/10 gofmt -l . — every file formatted"
 unformatted="$(gofmt -l .)"
 if [ -n "$unformatted" ]; then
 	printf '%s\n' "$unformatted"
@@ -35,23 +40,23 @@ if [ -n "$unformatted" ]; then
 fi
 ok "every .go file is gofmt-clean"
 
-step "2/9  go vet ./... — no suspicious constructs"
+step "2/10 go vet ./... — no suspicious constructs"
 go vet ./...
 ok "go vet is silent"
 
-step "3/9  go build ./... — everything compiles"
+step "3/10 go build ./... — everything compiles"
 go build ./...
 ok "all packages build"
 
-step "4/9  go test ./... — tests pass"
+step "4/10 go test ./... — tests pass"
 go test ./...
 ok "tests pass"
 
-step "5/9  go test -race ./... — no data races"
+step "5/10 go test -race ./... — no data races"
 go test -race ./...
 ok "race detector is clean"
 
-step "6/9  net/http must NOT be in the dependency graph"
+step "6/10 net/http must NOT be in the dependency graph"
 deps="$(go list -deps ./...)"
 if printf '%s\n' "$deps" | grep -Eq '^net/http(/|$)'; then
 	printf '%s\n' "$deps" | grep -E '^net/http(/|$)'
@@ -62,7 +67,7 @@ if printf '%s\n' "$deps" | grep -Eq '^net/http(/|$)'; then
 fi
 ok "net/http is absent — this is the whole point of the project"
 
-step "7/9  every dependency must be the standard library or this module"
+step "7/10 every dependency must be the standard library or this module"
 # The authoritative check. Instead of pattern-matching import paths, ask the Go
 # tool itself whether each package is part of the standard library. Anything it
 # does not certify as standard, other than our own packages, is an external
@@ -92,7 +97,7 @@ if printf '%s\n' "$deps" | grep -Eq '^golang\.org/'; then
 fi
 ok "the Go tool certifies every dependency as standard library"
 
-step "8/9  the module manifest is empty and nothing is vendored"
+step "8/10 the module manifest is empty and nothing is vendored"
 if [ -f go.sum ]; then
 	die "go.sum exists. A populated go.sum is the most visible zero-dependency
           failure there is, and its absence is the proof. Delete it and find the
@@ -111,5 +116,43 @@ if grep -Eq '^[[:space:]]*(require|replace|exclude|toolchain)' go.mod; then
 fi
 ok "go.mod is $(grep -c . go.mod) non-blank lines; no go.sum, no vendor/"
 
-step "9/9  result"
+step "9/10 every RFC quotation must be the RFC's own words"
+# The comments here argue from the specification and quote it, and nine of those
+# quotations turned out to be RFC 7540's text under RFC 9113's numbers, or
+# sentences that appear in neither. Four documents are quoted — 9113, 9110, 7541
+# and 3986 — and each is checked against when a copy is beside the checkout. See
+# scripts/quotes.py, which explains what it tolerates, what it declines to grade,
+# and why.
+#
+# Skipped, loudly, when Python or RFC 9113 is missing. This check grades prose, it
+# is the only step that needs anything outside the Go toolchain, and a
+# contributor without the RFC beside their checkout should not be stopped from
+# committing code — so it says it was skipped rather than passing quietly. The
+# three other documents are optional in a smaller way: their absence skips the
+# spans that name them, which the output lists by file and line, and the step
+# still passes.
+#
+# Each candidate is run, not merely found on PATH. On Windows, `python3` is an
+# App Execution Alias that exists whether or not Python is installed: it is on
+# PATH, `command -v` finds it, and running it prints "Python was not found" to
+# stdout and fails. A gate that trusted the lookup would report a misquotation in
+# every comment in the tree, on a machine with a perfectly good `python`.
+py=""
+for candidate in python3 python; do
+	if "$candidate" -c "" >/dev/null 2>&1; then
+		py="$candidate"
+		break
+	fi
+done
+if [ -z "$py" ]; then
+	printf '   skipped: no python on PATH, so the quotations were not checked\n'
+else
+	quotes="$("$py" scripts/quotes.py)" || die "$quotes
+          Fix the comment so it matches the document it names, or drop the
+          quotation marks and paraphrase instead. See scripts/quotes.py for what
+          counts as verbatim."
+	printf '%s\n' "$quotes" | sed 's/^/   /'
+fi
+
+step "10/10 result"
 printf '\n\033[32mGATE GREEN\033[0m  zero dependencies, no net/http, formatted, vetted, tested, race-clean.\n'

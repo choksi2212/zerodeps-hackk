@@ -138,7 +138,7 @@ func (c *fakeTLSConn) handshakes() int {
 // testHandshaker is a server with nothing but the fields handshake reads, which is
 // how these tests avoid standing up an accept loop to negotiate one connection.
 func testHandshaker(to limits.Timeouts) *Server {
-	return New(func(FrameEnqueuer) StreamHandler { return handlerFunc(func(frame.Frame) error { return nil }) },
+	return New(func(ConnWriter) StreamHandler { return handlerFunc(func(frame.Frame) error { return nil }) },
 		Config{Timeouts: to})
 }
 

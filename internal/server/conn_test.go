@@ -189,16 +189,19 @@ func (ts *testSocket) pendingLen() int {
 
 // handlerFunc adapts a function to StreamHandler.
 //
-// The two connection-level hooks answer nil. A double built to observe frame
-// dispatch has nothing to say about flow control, and answering them with a
-// failure instead would make every dispatch test that happens to carry a
-// stream-0 WINDOW_UPDATE fail for a reason it is not about. recordingHandler is
-// the double that watches them.
+// The four connection-level hooks and the teardown do nothing. A double built to
+// observe frame dispatch has nothing to say about flow control or about the HPACK
+// context, and answering the two that can fail with a failure instead would make every
+// dispatch test that happens to carry a stream-0 WINDOW_UPDATE fail for a reason it is
+// not about. recordingHandler is the double that watches them.
 type handlerFunc func(frame.Frame) error
 
 func (h handlerFunc) HandleFrame(f frame.Frame) error   { return h(f) }
 func (h handlerFunc) ConnWindowUpdate(uint32) error     { return nil }
 func (h handlerFunc) SetInitialWindowSize(uint32) error { return nil }
+func (h handlerFunc) SetHeaderTableSize(uint32)         {}
+func (h handlerFunc) SetMaxHeaderListSize(uint32)       {}
+func (h handlerFunc) Close(error)                       {}
 
 // recordingHandler keeps every frame it is given and returns err for each.
 //
@@ -210,16 +213,23 @@ type recordingHandler struct {
 	frames []frame.Frame
 	err    error
 
-	// increments and initialWindows record the two connection-level hooks, which
-	// are the only evidence that a stream-0 WINDOW_UPDATE and a
-	// SETTINGS_INITIAL_WINDOW_SIZE were routed at all: neither produces a frame
-	// on the wire, so a connection that dropped them would look identical to one
-	// that applied them.
-	increments    []uint32
-	initialWindow []uint32
+	// increments, initialWindows, tableSizes and headerListSizes record the four
+	// connection-level hooks, which are the only evidence that a stream-0
+	// WINDOW_UPDATE or one of the three SETTINGS parameters that belong to the
+	// handler was routed at all: none of them produces a frame on the wire, so a
+	// connection that dropped them would look identical to one that applied them.
+	increments      []uint32
+	initialWindow   []uint32
+	tableSizes      []uint32
+	headerListSizes []uint32
 
-	// hookErr is what those two hooks return, kept apart from err so that a test
-	// can fail one without failing frame dispatch.
+	// closedWith is every reason Close was given, in order, and its length is how
+	// this double reports being closed twice or not at all. Nothing else records the
+	// end of a connection: Serve returns whether or not the handler was told.
+	closedWith []error
+
+	// hookErr is what the two hooks that can fail return, kept apart from err so
+	// that a test can fail one without failing frame dispatch.
 	hookErr error
 }
 
@@ -247,6 +257,24 @@ func (h *recordingHandler) SetInitialWindowSize(n uint32) error {
 	return err
 }
 
+func (h *recordingHandler) SetHeaderTableSize(n uint32) {
+	h.mu.Lock()
+	h.tableSizes = append(h.tableSizes, n)
+	h.mu.Unlock()
+}
+
+func (h *recordingHandler) SetMaxHeaderListSize(n uint32) {
+	h.mu.Lock()
+	h.headerListSizes = append(h.headerListSizes, n)
+	h.mu.Unlock()
+}
+
+func (h *recordingHandler) Close(err error) {
+	h.mu.Lock()
+	h.closedWith = append(h.closedWith, err)
+	h.mu.Unlock()
+}
+
 func (h *recordingHandler) seenIncrements() []uint32 {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -259,10 +287,28 @@ func (h *recordingHandler) seenInitialWindows() []uint32 {
 	return append([]uint32(nil), h.initialWindow...)
 }
 
+func (h *recordingHandler) seenTableSizes() []uint32 {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return append([]uint32(nil), h.tableSizes...)
+}
+
+func (h *recordingHandler) seenHeaderListSizes() []uint32 {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return append([]uint32(nil), h.headerListSizes...)
+}
+
 func (h *recordingHandler) seen() []frame.Frame {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	return append([]frame.Frame(nil), h.frames...)
+}
+
+func (h *recordingHandler) closings() []error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return append([]error(nil), h.closedWith...)
 }
 
 // rejectingHandler fails the test if the connection hands it anything.
@@ -289,8 +335,8 @@ func rejectingHandler(t *testing.T) StreamHandler {
 // exactly what a server must not do — see Server.newHandler — and is harmless here
 // because each of these tests builds one connection. A test about the factory being
 // a factory writes its own: TestServerBuildsAHandlerPerConnection.
-func always(h StreamHandler) func(FrameEnqueuer) StreamHandler {
-	return func(FrameEnqueuer) StreamHandler { return h }
+func always(h StreamHandler) func(ConnWriter) StreamHandler {
+	return func(ConnWriter) StreamHandler { return h }
 }
 
 // testTimeouts is the timeouts for a test that is not testing a timeout.
@@ -372,7 +418,7 @@ func serve(t *testing.T, ts *testSocket, h StreamHandler, to limits.Timeouts) er
 
 // serveWith is serve for a test that cares which write half its handler was handed,
 // and so has to build the handler inside the factory rather than before it.
-func serveWith(t *testing.T, ts *testSocket, newHandler func(FrameEnqueuer) StreamHandler, to limits.Timeouts) error {
+func serveWith(t *testing.T, ts *testSocket, newHandler func(ConnWriter) StreamHandler, to limits.Timeouts) error {
 	t.Helper()
 	return awaitServe(t, serveInBackground(newConn(ts, newHandler, to)))
 }
@@ -855,30 +901,27 @@ func TestServeAppliesSettingsBeforeAcknowledging(t *testing.T) {
 	}
 }
 
-// TestServeAcknowledgesTheSettingsItDoesNotActOnYet is the connection's obligation
-// towards parameters whose enforcement lives in another package.
+// TestServeAcknowledgesTheSettingsItHasNothingToDoAbout is the connection's
+// obligation towards parameters it does not act on. §6.5 does not permit a parameter
+// to go unacknowledged, and a peer waiting for an acknowledgement that never comes
+// stalls the connection — ignoring a parameter and refusing it are different things.
 //
-// HEADER_TABLE_SIZE and MAX_HEADER_LIST_SIZE are internal/hpack's, and until it
-// exists the values are recorded nowhere — but §6.5 does not permit a parameter to
-// go unacknowledged, and a peer waiting for an acknowledgement that never comes
-// stalls the connection. Ignoring a parameter and refusing it are different things.
-//
-// INITIAL_WINDOW_SIZE used to belong here and no longer does: it reaches the stream
-// layer through StreamHandler.SetInitialWindowSize, which
-// TestServeAppliesInitialWindowSizeToTheStreamLayer covers. A parameter left in this
-// list after it grew an implementation would make this test claim it is ignored.
-func TestServeAcknowledgesTheSettingsItDoesNotActOnYet(t *testing.T) {
+// Nothing here is deferred. Both parameters bound what a server that initiates
+// streams may do, and this server initiates none, so the list is not "not implemented
+// yet" but "there is nothing to implement". INITIAL_WINDOW_SIZE, HEADER_TABLE_SIZE and
+// MAX_HEADER_LIST_SIZE were all in this list once and each left it as it grew a route
+// to the layer that holds what it governs; a parameter left here after that would make
+// this test claim it is ignored when it is not.
+func TestServeAcknowledgesTheSettingsItHasNothingToDoAbout(t *testing.T) {
 	ts := newTestSocket(&testTarget{}).
 		script(clientHello(t,
-			frame.Setting{ID: frame.SettingHeaderTableSize, Value: 8192},
-			frame.Setting{ID: frame.SettingMaxHeaderListSize, Value: 1 << 14},
 			frame.Setting{ID: frame.SettingEnablePush, Value: 1},
 			frame.Setting{ID: frame.SettingMaxConcurrentStreams, Value: 7},
 		)).
 		atEOF()
 
 	if err := serve(t, ts, rejectingHandler(t), testTimeouts()); err != nil {
-		t.Fatalf("Serve returned %v, want nil: none of these parameters is a reason to refuse the "+
+		t.Fatalf("Serve returned %v, want nil: neither parameter is a reason to refuse the "+
 			"connection", err)
 	}
 	got := peerSaw(t, ts)
@@ -1268,6 +1311,76 @@ func TestServeAppliesInitialWindowSizeToTheStreamLayer(t *testing.T) {
 	}
 }
 
+// TestServeAppliesTheHeaderSettingsToTheEncodingSide is the route the two HPACK
+// parameters had nowhere to go until there was a response encoder to receive them.
+//
+// Neither produces a frame on the wire and neither can fail, so a connection that
+// read them and dropped them would be indistinguishable from one that applied them —
+// until a response referenced a dynamic table entry the peer is not keeping, which
+// surfaces as a decoding failure on some later request and takes the whole connection
+// with it. The hook being called is the whole of the evidence, which is why the
+// handler records it.
+func TestServeAppliesTheHeaderSettingsToTheEncodingSide(t *testing.T) {
+	ts := newTestSocket(&testTarget{}).
+		script(clientHello(t,
+			frame.Setting{ID: frame.SettingHeaderTableSize, Value: 8192},
+			frame.Setting{ID: frame.SettingMaxHeaderListSize, Value: 1 << 14},
+			frame.Setting{ID: frame.SettingMaxFrameSize, Value: 1 << 15},
+		)).
+		atEOF()
+
+	h := &recordingHandler{}
+	c := newConn(ts, always(h), testTimeouts())
+	if err := awaitServe(t, serveInBackground(c)); err != nil {
+		t.Fatalf("Serve: %v", err)
+	}
+	if got := h.seenTableSizes(); len(got) != 1 || got[0] != 8192 {
+		t.Errorf("the encoding side was told table size %v, want [8192]", got)
+	}
+	if got := h.seenHeaderListSizes(); len(got) != 1 || got[0] != 1<<14 {
+		t.Errorf("the encoding side was told header list size %v, want [%d]", got, 1<<14)
+	}
+	// The parameter that followed them was still applied, so neither hook is the end
+	// of the loop.
+	if got := c.w.fw.MaxFrameSize(); got != 1<<15 {
+		t.Errorf("the writer's maximum frame size is %d, want the %d that followed the two "+
+			"header settings in the same frame", got, 1<<15)
+	}
+}
+
+// TestServeForwardsAHeaderSettingOfZero is the value easiest to mistake for no value
+// at all, and the reason neither route may test s.Value before forwarding it.
+//
+// A HEADER_TABLE_SIZE of 0 says the peer keeps no dynamic table for decoding, which is
+// how §4.2 of RFC 7541 has a table emptied; a route that skipped it would leave this
+// server compressing against entries the peer has thrown away, and the failure would
+// land on a later request rather than on this frame. A MAX_HEADER_LIST_SIZE of 0 asks
+// for a connection on which every response is too large to send, which is absurd but
+// is a thing the peer said — and it is emphatically not the same as the parameter
+// being absent, which is the state every connection starts in.
+func TestServeForwardsAHeaderSettingOfZero(t *testing.T) {
+	ts := newTestSocket(&testTarget{}).
+		script(clientHello(t,
+			frame.Setting{ID: frame.SettingHeaderTableSize, Value: 0},
+			frame.Setting{ID: frame.SettingMaxHeaderListSize, Value: 0},
+		)).
+		atEOF()
+
+	h := &recordingHandler{}
+	c := newConn(ts, always(h), testTimeouts())
+	if err := awaitServe(t, serveInBackground(c)); err != nil {
+		t.Fatalf("Serve: %v", err)
+	}
+	if got := h.seenTableSizes(); len(got) != 1 || got[0] != 0 {
+		t.Errorf("the encoding side was told table size %v, want [0]: a peer that keeps no "+
+			"dynamic table has said so and must be obeyed", got)
+	}
+	if got := h.seenHeaderListSizes(); len(got) != 1 || got[0] != 0 {
+		t.Errorf("the encoding side was told header list size %v, want [0]: zero and absent "+
+			"are different states", got)
+	}
+}
+
 // TestServeStopsOnASettingItCannotApply is the failure path §6.5 leaves implicit: an
 // acknowledgement is the peer's licence to assume every parameter in the frame took
 // effect, so a parameter that could not be applied must stop the loop and go
@@ -1364,6 +1477,19 @@ func TestServeStopsOnAConnectionErrorFromTheHandler(t *testing.T) {
 
 	if ce := connErrorOf(t, err); ce.Code != h2.EnhanceYourCalm {
 		t.Errorf("Serve returned %s, want the ENHANCE_YOUR_CALM the handler chose", ce.Code)
+	}
+
+	// And the same error came back to the handler as the connection's ending. This is
+	// the one class of ending where the reason is the handler's own, and it is worth
+	// asserting for the case it rules out: a teardown that reported the ending it could
+	// most easily name — the socket's EOF, or nothing at all — rather than the one that
+	// actually happened. A goroutine parked for credit on this connection wants to know
+	// its stream was refused for flooding, not that the peer went away.
+	if closings := h.closings(); len(closings) != 1 {
+		t.Errorf("the stream layer was closed %d times, want exactly 1", len(closings))
+	} else if ce := connErrorOf(t, closings[0]); ce.Code != h2.EnhanceYourCalm {
+		t.Errorf("the stream layer was told the connection ended with %s, want the "+
+			"ENHANCE_YOUR_CALM it chose itself", ce.Code)
 	}
 
 	ga := goAwayIn(t, peerSaw(t, ts))
@@ -1733,6 +1859,209 @@ func TestServeAlwaysClosesTheSocket(t *testing.T) {
 	}
 }
 
+// TestServeAlwaysTellsTheStreamLayerWhyTheConnectionEnded is the other half of
+// TestServeAlwaysClosesTheSocket, and it is the half that closing the socket does not
+// cover.
+//
+// Every goroutine on a connection is ultimately blocked on the socket except the ones
+// that matter here: a goroutine writing a response body waits for send credit on a
+// condition variable inside flow control, and neither closing the socket nor stopping
+// the writer reaches it. StreamHandler.Close is the only thing that does, so it has to
+// run on every ending rather than on the ones that look like failures.
+//
+// The reason is asserted and not just the call, because four of these endings are ones
+// Serve reports as nil — it is this server leaving, or a peer leaving politely, and
+// neither is a fault. A parked writer is still owed which of them it was: that reason
+// is what its own caller logs, and "connection idle" and "connection reset by peer" are
+// not the same event to whoever reads it.
+func TestServeAlwaysTellsTheStreamLayerWhyTheConnectionEnded(t *testing.T) {
+	broken := errors.New("connection reset by peer")
+
+	for _, tc := range []struct {
+		name string
+		run  func(t *testing.T, h StreamHandler)
+		want error
+	}{
+		{"a peer that closes at once", func(t *testing.T, h StreamHandler) {
+			_ = serve(t, newTestSocket(&testTarget{}).atEOF(), h, testTimeouts())
+		}, errPeerClosed},
+
+		{"a peer that closes after its preface", func(t *testing.T, h StreamHandler) {
+			_ = serve(t, newTestSocket(&testTarget{}).script(clientHello(t)).atEOF(), h, testTimeouts())
+		}, errPeerClosed},
+
+		{"a peer that says goodbye", func(t *testing.T, h StreamHandler) {
+			ts := newTestSocket(&testTarget{}).
+				script(append(clientHello(t), encodeFrames(t, frame.GoAwayFrame{ErrCode: h2.NoError})...)).
+				atEOF()
+			_ = serve(t, ts, h, testTimeouts())
+		}, errPeerGoAway},
+
+		{"the idle timeout", func(t *testing.T, h StreamHandler) {
+			// No atEOF: the peer stays connected and silent, which is what the idle
+			// deadline exists for.
+			_ = serve(t, newTestSocket(&testTarget{}).script(clientHello(t)), h, testTimeouts())
+		}, errIdle},
+
+		{"a transport failure", func(t *testing.T, h StreamHandler) {
+			ts := newTestSocket(&testTarget{}).script(clientHello(t)).failsWith(broken)
+			_ = serve(t, ts, h, testTimeouts())
+		}, broken},
+
+		{"a shutdown", func(t *testing.T, h StreamHandler) {
+			to := testTimeouts()
+			// Out of reach, so that a shutdown which reached nothing would hang here
+			// rather than pass on a deadline expiring on its own merits.
+			to.Preface, to.Idle = longTimeout, longTimeout
+			c := newConn(newTestSocket(&testTarget{}), always(h), to)
+			c.Shutdown()
+			_ = awaitServe(t, serveInBackground(c))
+		}, errShuttingDown},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := &recordingHandler{}
+			tc.run(t, h)
+
+			got := h.closings()
+			if len(got) != 1 {
+				t.Fatalf("the stream layer was closed %d times, want exactly 1: a writer parked for "+
+					"credit is woken by this and by nothing else", len(got))
+			}
+			if got[0] == nil {
+				t.Fatalf("the stream layer was told the connection ended for no reason; flow control " +
+					"panics on a nil there, because a parked writer cannot return one")
+			}
+			if !errors.Is(got[0], tc.want) {
+				t.Errorf("the stream layer was told %v, want %v", got[0], tc.want)
+			}
+		})
+	}
+}
+
+// panickingHandler is a recordingHandler whose frame dispatch panics.
+//
+// The embedded pointer is what makes it useful: the panic goes past Serve, and the
+// recording of what Serve did on the way out is still readable afterwards.
+type panickingHandler struct {
+	*recordingHandler
+	with string
+}
+
+func (h *panickingHandler) HandleFrame(frame.Frame) error { panic(h.with) }
+
+// TestServeWakesTheStreamLayerWhenTheReadLoopPanics is why Serve's teardown is a
+// deferred call over a variable rather than a line after run returns.
+//
+// A panic on the reader goroutine is recovered one frame up, in runConn, so the process
+// survives it and the server keeps accepting. What it must not survive with is a
+// goroutine parked for send credit on the connection that died: the reader that would
+// have applied a WINDOW_UPDATE is gone, the condition variable will never be signalled
+// again, and the goroutine holds a request, a response and a stack until the process
+// ends. One panicking handler per connection is then a memory leak an ordinary peer can
+// drive.
+func TestServeWakesTheStreamLayerWhenTheReadLoopPanics(t *testing.T) {
+	const boom = "the handler could not survive this frame"
+
+	rec := &recordingHandler{}
+	ts := newTestSocket(&testTarget{}).
+		script(append(clientHello(t), encodeFrames(t,
+			frame.RSTStreamFrame{StreamID: 1, ErrCode: h2.Cancel},
+		)...)).
+		atEOF()
+
+	c := newConn(ts, always(&panickingHandler{recordingHandler: rec, with: boom}), testTimeouts())
+
+	// Serve is run inline rather than in the background, because a panic on another
+	// goroutine takes the test binary down with it and reports nothing.
+	func() {
+		defer func() {
+			switch r := recover().(type) {
+			case nil:
+				t.Fatal("Serve returned instead of panicking, so this test is not on the path it is about")
+			case string:
+				if r != boom {
+					t.Fatalf("Serve panicked with %q, want the handler's own %q", r, boom)
+				}
+			default:
+				t.Fatalf("Serve panicked with %v, want the handler's own %q", r, boom)
+			}
+		}()
+		_ = c.Serve()
+	}()
+
+	// Serve's wait for the writer did not run, so this test does what runConn does for
+	// a connection that panicked. Without it the writer goroutine outlives the test.
+	c.w.Close()
+	_ = c.w.Wait()
+
+	got := rec.closings()
+	if len(got) != 1 {
+		t.Fatalf("the stream layer was closed %d times after a panic in the read loop, want exactly 1",
+			len(got))
+	}
+	if !errors.Is(got[0], errReadLoopPanicked) {
+		t.Errorf("the stream layer was told %v, want %v: the panic value itself belongs to the recover "+
+			"in runConn, which logs it with its stack, and flow control needs only a non-nil reason",
+			got[0], errReadLoopPanicked)
+	}
+}
+
+// lateWriterHandler is a handler that tries to put a frame on the wire from its
+// teardown, and records what happened.
+//
+// enqErr is written on the reader goroutine inside Close and read by the test after
+// Serve has returned. No lock: Close is one of Serve's deferred calls, so the channel
+// that carries Serve's return orders the two.
+type lateWriterHandler struct {
+	*recordingHandler
+	w      ConnWriter
+	enqErr error
+}
+
+func (h *lateWriterHandler) Close(err error) {
+	h.recordingHandler.Close(err)
+	h.enqErr = h.w.Enqueue(ping(99))
+}
+
+// TestServeClosesTheStreamLayerAfterTheWriterHasStopped is what makes the GOAWAY the
+// last frame of the connection.
+//
+// Waking the parked writers is the last thing this server does on a connection, and the
+// order is the reason it is last rather than first. A goroutine woken from flow control
+// is a goroutine whose next move may be to write something — a RST_STREAM for the
+// stream it was serving, a final DATA frame it thinks it has credit for. If it were
+// woken while the writer was still running, that frame would go out behind the GOAWAY
+// that §6.8 makes the connection's last, and the peer would be reading frames for
+// streams on a connection it has been told is over.
+//
+// Waking them after the writer has stopped makes that impossible rather than unlikely:
+// there is no ordering between the reader goroutine and a woken writer to get right,
+// because the queue they would use is already closed.
+func TestServeClosesTheStreamLayerAfterTheWriterHasStopped(t *testing.T) {
+	ts := newTestSocket(&testTarget{}).script(clientHello(t)).atEOF()
+
+	var h *lateWriterHandler
+	err := serveWith(t, ts, func(w ConnWriter) StreamHandler {
+		h = &lateWriterHandler{recordingHandler: &recordingHandler{}, w: w}
+		return h
+	}, testTimeouts())
+	if err != nil {
+		t.Fatalf("Serve: %v", err)
+	}
+
+	if h.enqErr == nil {
+		t.Errorf("a frame enqueued from the stream layer's teardown was accepted, so a writer woken " +
+			"there could still put one on the wire after the connection's last frame")
+	}
+	for _, f := range peerSaw(t, ts) {
+		if _, ok := f.(frame.PingFrame); ok {
+			t.Errorf("the peer received the frame the teardown tried to send; it received %s",
+				describe(peerSaw(t, ts)))
+			break
+		}
+	}
+}
+
 // TestServeSaysNothingAfterATransportFailure is the difference between Close and
 // Shutdown on the writer. A socket that has failed cannot carry a GOAWAY, and
 // attempting one produces a second error describing our own reaction, which then
@@ -1941,7 +2270,7 @@ func TestNewConnRejectsAFactoryThatReturnsNoHandler(t *testing.T) {
 				t.Errorf("the panic says %v, want it to name what the factory did", r)
 			}
 		}()
-		newConn(newTestSocket(&testTarget{}), func(FrameEnqueuer) StreamHandler { return nil }, testTimeouts())
+		newConn(newTestSocket(&testTarget{}), func(ConnWriter) StreamHandler { return nil }, testTimeouts())
 	}()
 
 	assertNoGoroutineLeak(t, baseline)
@@ -1961,7 +2290,7 @@ func TestNewConnGivesTheStreamHandlerAWritePath(t *testing.T) {
 		script(append(clientHello(t), encodeFrames(t, frame.RSTStreamFrame{StreamID: 1, ErrCode: h2.Cancel})...)).
 		atEOF()
 
-	newHandler := func(w FrameEnqueuer) StreamHandler {
+	newHandler := func(w ConnWriter) StreamHandler {
 		return handlerFunc(func(frame.Frame) error {
 			return w.Enqueue(frame.DataFrame{StreamID: 1, Data: body, EndStream: true})
 		})
@@ -1981,6 +2310,40 @@ func TestNewConnGivesTheStreamHandlerAWritePath(t *testing.T) {
 	}
 	t.Errorf("the peer received %s, with no DATA frame among it: the handler was given a write "+
 		"path it could not write to", describe(got))
+}
+
+// TestTheWritePathAHandlerIsGivenReportsThePeersFrameSizeCap is the other half of
+// what a handler needs from that write path, and the half that is easy to leave
+// behind. A response's header list has to be split into a HEADERS frame and however
+// many CONTINUATION frames the peer's SETTINGS_MAX_FRAME_SIZE requires (§4.2), and
+// the layer doing the splitting is on the other side of this interface — so the cap
+// has to be readable through it, and it has to be the connection's live value rather
+// than a copy taken when the handler was built. The peer here raises it after the
+// handler already exists, which is the ordinary case: SETTINGS arrives before the
+// first request, and the handler is built before any frame is read.
+func TestTheWritePathAHandlerIsGivenReportsThePeersFrameSizeCap(t *testing.T) {
+	const raised = 1 << 15
+
+	ts := newTestSocket(&testTarget{}).
+		script(clientHello(t, frame.Setting{ID: frame.SettingMaxFrameSize, Value: raised})).
+		atEOF()
+
+	var given ConnWriter
+	newHandler := func(w ConnWriter) StreamHandler {
+		given = w
+		return rejectingHandler(t)
+	}
+	if err := serveWith(t, ts, newHandler, testTimeouts()); err != nil {
+		t.Fatalf("Serve: %v", err)
+	}
+
+	if given == nil {
+		t.Fatal("the factory was never called, so nothing was given a write path")
+	}
+	if got := given.MaxFrameSize(); got != raised {
+		t.Errorf("the handler's write path reports a cap of %d, want the %d the peer advertised: "+
+			"a response would be split at the wrong size", got, uint32(raised))
+	}
 }
 
 // TestNewConnFillsUnsetTimeouts is the check that a caller cannot get a connection

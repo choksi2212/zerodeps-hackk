@@ -31,10 +31,15 @@ there to check that the claim is load-bearing rather than decorative: widening t
 comparison to "anything but open" refuses a frame §5.1 permits, and narrowing it to
 false accepts two frames §5.1 forbids.
 
-The four accessors are one line each and are broken because a body of `return s.recv`
-where `return s.send` was meant is the single most plausible typo in the file, and
-the two windows are indistinguishable at the call site -- both are *flow.Window, both
-have the same methods, and one of them is the peer's to spend.
+The three accessors are one line each and are broken because a one-line body is where
+a reader stops looking. Two of them used to be four: there was a SendWindow beside
+RecvWindow, and the pair were broken against each other, because `return s.recv` where
+`return s.send` was meant was the single most plausible typo in the file -- both are
+*flow.Window, both have the same methods, and one of them was the peer's to spend. The
+send window has since moved behind internal/flow's Sender, which is what makes that
+typo unwritable rather than merely unwritten, and the break that used to catch it is
+gone with it. What is left is RecvWindow answering with a window that is not the
+stream's, which is the same class of mistake and the only one still expressible.
 
 One hole on the first run, and it was in this file rather than in the code or the
 tests. The break that stops recvEnd from closing a stream this server has already
@@ -190,15 +195,9 @@ BREAKS = [
         ["TestHeadersWithEndStreamLeavesTheStreamHalfClosed"],
     ),
     (
-        "SendWindow hands a response body the window we grant the peer",
-        """func (s *Stream) SendWindow() *flow.Window { return s.send }""",
-        """func (s *Stream) SendWindow() *flow.Window { return s.recv }""",
-        ["TestWindowUpdateCreditsTheStreamsSendWindow"],
-    ),
-    (
-        "RecvWindow hands the request-body accounting the peer's grant to us",
+        "RecvWindow answers with a new window every time, so what it reports is never what was spent",
         """func (s *Stream) RecvWindow() *flow.Window { return s.recv }""",
-        """func (s *Stream) RecvWindow() *flow.Window { return s.send }""",
+        """func (s *Stream) RecvWindow() *flow.Window { return flow.NewStreamWindow(s.id, flow.InitialWindowSize) }""",
         [
             "TestPaddedDataIsFlowControlledByItsWholeLength",
             "TestDataRefusedByAStreamWindowIsStillCountedAgainstTheConnectionWindow",

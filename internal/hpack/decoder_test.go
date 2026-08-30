@@ -51,9 +51,28 @@ func TestDecodeSizeUpdateBeforeHeaderFieldIsValid(t *testing.T) {
 	}
 }
 
-// RFC 7541 section 4.2: "This dynamic table size update MAY occur anywhere
-// between two header field representations." Multiple updates before the
-// first field are legal, and only the last one is in effect.
+// TestDecodeMultipleSizeUpdatesBeforeHeaderField is about how many updates a block may
+// begin with, and not about where one may appear — that rule is the decoder's, enforced a
+// few lines above, and TestDecodeSizeUpdateAfterHeaderFieldIsInvalid is its test.
+//
+// §4.2 of RFC 7541 has an encoder signal a change at the beginning of the first header
+// block following it, and signal two changes when the maximum moved more than once in
+// between: the smallest maximum that occurred in the interval, so the decoder evicts what
+// the encoder evicted, and then the size actually in effect. Two is therefore ordinary and
+// nothing in that section or in §6.3 makes a third an error — §6.3's only decoding error
+// for an update is a new maximum above the limit the protocol set, which is checked
+// separately by TestDynamicTableSizeUpdateExceedsCeiling. So a decoder that refused the
+// run would refuse a block the specification permits, and one that did not apply the
+// updates in arrival order would finish holding a maximum the encoder had already replaced.
+//
+// Paraphrased rather than quoted, and now by choice rather than by necessity. The first
+// version of this comment quoted §4.2 as permitting an update anywhere between two header
+// field representations — a sentence that is not in RFC 7541, and that asserts the opposite
+// of both the section and the check three files away in decoder.go. It survived because
+// scripts/quotes.py had no copy of RFC 7541 to compare it against; it has one now, and
+// grades this section along with the rest. The invented sentence is repeated here without
+// its quotation marks deliberately: with them the checker would refuse it, and be right to.
+// See the README.
 func TestDecodeMultipleSizeUpdatesBeforeHeaderField(t *testing.T) {
 	codec := New()
 	block := appendInt(nil, 0x20, 5, 200)

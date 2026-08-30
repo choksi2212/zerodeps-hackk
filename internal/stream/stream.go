@@ -40,11 +40,31 @@
 //
 // # Concurrency
 //
-// A Table is not safe for concurrent use and has no lock. Every method is called
-// from the connection's single reader goroutine, in frame arrival order, which is
-// the only order the HPACK codec can be driven in at all (see h2.HeaderCodec).
-// The per-stream goroutines that will write responses do not touch the table;
-// they are handed their own stream and their own send window.
+// A Table's streams are not safe for concurrent use and are not behind a lock. Every
+// method but two is called from the connection's single reader goroutine, in frame
+// arrival order, which is the only order the HPACK codec can be driven in at all (see
+// h2.HeaderCodec). The per-stream goroutines that write responses do not touch the
+// table; they are handed their own stream, and they spend send-side flow control
+// through the *flow.Sender the table exposes, which is the one part of this package's
+// state that is shared and locked.
+//
+// There are two exceptions, and both are arranged so as not to be ones.
+//
+// Table.ReportSendEnd is a response finishing on its own goroutine, whose state change
+// has to happen on the reader's: the identifier is put on a list behind a mutex and the
+// next frame the reader handles applies it.
+//
+// Table.ReportConsumed is a handler reading request content, which earns the peer's
+// receive-window credit back (§6.9). It works the same way with one difference that
+// cannot be avoided: the WINDOW_UPDATE is sent from the handler's goroutine rather than
+// waiting for the reader, because a peer that has spent its whole window sends no
+// further frame until it is told there is room — so there is no next frame to wait for.
+// The credit is recorded behind the same mutex and reaches the windows themselves in
+// the reader's goroutine, before the next frame is judged against them.
+//
+// The mutex guards those two lists of numbers and nothing else. No stream, window or map
+// entry is reachable from another goroutine even there, and it is never held across
+// anything that can block.
 package stream
 
 import (
@@ -111,10 +131,16 @@ type Stream struct {
 	state State
 
 	// recv is the window we grant this stream: credit the peer spends by sending
-	// DATA. send is the window the peer granted us. They are separate objects
-	// because they move independently and only one of them is ours to spend.
+	// DATA. It is debited from the reader goroutine, in frame arrival order, like
+	// everything else in this package.
+	//
+	// The window in the other direction — the peer's grant to us, which this
+	// stream's response body is spent from — is deliberately not here. It is held
+	// by the connection's *flow.Sender, keyed by identifier, because it is spent by
+	// a different goroutine from the one that receives the credit for it. A pointer
+	// to it on this struct would be a *flow.Window crossing a goroutine boundary,
+	// and flow.Window has no lock.
 	recv *flow.Window
-	send *flow.Window
 }
 
 // ID is the stream identifier.
@@ -122,12 +148,6 @@ func (s *Stream) ID() uint32 { return s.id }
 
 // State is the stream's current state.
 func (s *Stream) State() State { return s.state }
-
-// SendWindow is the flow-control window this stream's response body is spent
-// from. It is the peer's grant to us, so it is sized by the peer's
-// SETTINGS_INITIAL_WINDOW_SIZE and grown by the WINDOW_UPDATE frames this table
-// applies.
-func (s *Stream) SendWindow() *flow.Window { return s.send }
 
 // RecvWindow is the flow-control window this stream's request body is debited
 // from, which is our grant to the peer.

@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>zdh — HTTP/2 on the Go standard library alone</title>
+<link rel="stylesheet" href="/assets/zdh.css">
+<link rel="icon" href="/assets/logo.svg" type="image/svg+xml">
+</head>
+<body>
+
+<header>
+  <img src="/assets/logo.svg" alt="" width="56" height="56">
+  <div>
+    <h1>zdh</h1>
+    <p class="sub">An HTTP/2 server written against the Go standard library alone.
+       Every frame on this connection was encoded by hand.</p>
+  </div>
+</header>
+
+<section class="card">
+  <h2>What you are looking at</h2>
+  <p>This page arrived over HTTP/2 from a server that does not import
+     <code>net/http</code>. The connection preface, the SETTINGS exchange, the
+     HEADERS and DATA frames and the HPACK compression of every field below were
+     all written from scratch against RFC 9113 and RFC 7541.</p>
+  <p>Do not take that on trust. Everything on this page is read out of your own
+     browser's <a href="https://www.w3.org/TR/resource-timing/">Resource
+     Timing</a> entries, which your browser fills in from its own network stack
+     and not from anything the server can claim.</p>
+</section>
+
+<section class="card">
+  <h2>This page's own resources</h2>
+  <p class="sub">Protocol as your browser reports it. <code>h2</code> is HTTP/2.</p>
+  <table id="resources"><thead>
+    <tr><th>resource</th><th>protocol</th><th>type</th><th class="n">bytes</th><th class="n">ms</th></tr>
+  </thead><tbody></tbody></table>
+</section>
+
+<section class="card">
+  <h2>Multiplexing</h2>
+  <p>HTTP/1.1 needs one connection per request in flight; a browser opens six to
+     one host and queues the rest. HTTP/2 interleaves them all on one. The button
+     below asks for <output id="count">64</output> resources at once, on the
+     single connection this page arrived on.</p>
+  <p><button id="run">Request them all at once</button>
+     <button id="more" class="ghost">Ask for 256</button></p>
+  <p class="sub">Or link straight to the result: <code>/?run=64</code> runs it on load.</p>
+  <div id="result" class="result" hidden>
+    <dl>
+      <dt>requests</dt><dd id="r-total">—</dd>
+      <dt>all on protocol</dt><dd id="r-proto">—</dd>
+      <dt>connections opened</dt><dd id="r-conns">—</dd>
+      <dt>wall clock</dt><dd id="r-wall">—</dd>
+      <dt>slowest single request</dt><dd id="r-max">—</dd>
+    </dl>
+    <p class="sub" id="r-note"></p>
+  </div>
+</section>
+
+<section class="card">
+  <h2>What this server refuses</h2>
+  <p class="sub">Each of these is one request. The status is what came back.</p>
+  <table id="refusals"><thead>
+    <tr><th>request</th><th>status</th><th>why</th></tr>
+  </thead><tbody></tbody></table>
+</section>
+
+<footer>
+  <p>zdh — Zero Dependency Hackathon 2026, Track C. Served from a directory by
+     <code>internal/static</code>; framed by <code>internal/frame</code>;
+     compressed by <code>internal/hpack</code>.</p>
+</footer>
+
+<script src="/assets/zdh.js"></script>
+</body>
+</html>

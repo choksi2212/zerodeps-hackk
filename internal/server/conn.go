@@ -28,19 +28,31 @@ type connSocket interface {
 	Close() error
 }
 
-// FrameEnqueuer is the connection's write half as a stream sees it: one method,
-// which hands a frame to the writer goroutine and returns.
+// ConnWriter is the connection's write half as a stream sees it: two methods, one
+// that hands a frame to the writer goroutine and one that reports the largest
+// payload the peer is willing to receive.
 //
 // It is deliberately narrower than *frameWriter, which also flushes, shuts down and
 // waits. Those belong to the connection's own lifecycle — a stream goroutine
 // calling Shutdown mid-request would take every other stream's reply down with it —
-// and Enqueue is in any case the only method on the writer that is safe to call
-// from every stream goroutine at once.
-type FrameEnqueuer interface {
+// and these two are the only methods on the writer that are safe to call from every
+// stream goroutine at once.
+//
+// Both are needed to write one response. §4.2 caps a frame's payload at the peer's
+// SETTINGS_MAX_FRAME_SIZE, so the layer that turns a header list into HEADERS and
+// CONTINUATION frames has to know the cap before it can decide where to split, and
+// the cap is the connection's rather than the stream's — a stream that read it from
+// its own copy would send an oversized frame the first time the peer raised or
+// lowered it mid-connection.
+type ConnWriter interface {
 	// Enqueue hands f to the writer goroutine. It returns when the frame is queued,
 	// not when it reaches the wire, and it fails only once the write half is
 	// finished: see frameWriter.Enqueue.
 	Enqueue(f frame.Frame) error
+
+	// MaxFrameSize is the peer's SETTINGS_MAX_FRAME_SIZE, never below §6.5.2's
+	// 16384. It may change between two calls: see frameWriter.MaxFrameSize.
+	MaxFrameSize() uint32
 }
 
 // StreamHandler receives the frames that belong to a stream rather than to the
@@ -87,6 +99,70 @@ type StreamHandler interface {
 	// against every window that is already open, which cannot be applied by
 	// anything that does not hold them all.
 	SetInitialWindowSize(n uint32) error
+
+	// SetHeaderTableSize applies the peer's SETTINGS_HEADER_TABLE_SIZE (§6.5.2) to
+	// the HPACK context this connection's responses are encoded against.
+	//
+	// Behind this interface because the parameter governs a table, and the table
+	// belongs to the codec that turns a response's field list into a header block —
+	// which is on the far side of this boundary along with everything else about a
+	// response. This file holds no codec, by the same rule that stops it holding a
+	// stream table.
+	//
+	// The direction is what makes it the handler's rather than the frame writer's:
+	// this is the size of the table the *peer* keeps for decoding, so it bounds what
+	// we may encode against, and it has nothing to do with the table we decode the
+	// peer's own requests with.
+	//
+	// No error, unlike the method above. §6.5.2 gives this parameter no bounds, so
+	// there is no legal value the frame layer can hand us that the encoder cannot be
+	// told about, and §4.2 of RFC 7541 lets an encoder use less table than it is
+	// offered — so a value larger than any this server would use is not a failure
+	// either. SetInitialWindowSize has an error because its legal values can still
+	// overflow a window that already has one; this has nothing to overflow.
+	SetHeaderTableSize(n uint32)
+
+	// SetMaxHeaderListSize applies the peer's SETTINGS_MAX_HEADER_LIST_SIZE
+	// (§6.5.2): the largest field list, by that section's accounting, that this
+	// connection's responses may carry from now on.
+	//
+	// Here for the same reason again, and enforced where a response's field list is
+	// assembled, which is the only place the accounting can be done — the number is
+	// about a list of fields and their 32 octets of overhead each, not about the
+	// compressed block this connection puts on the wire.
+	//
+	// No error, and nothing is allocated on the strength of the value, so there is
+	// nothing to range-check either: a peer that sets it to zero has asked for a
+	// connection on which every response is refused, and it is entitled to.
+	SetMaxHeaderListSize(n uint32)
+
+	// Close says the connection is over and why, and is the one method here that is
+	// about no frame at all.
+	//
+	// The reason exists to be handed to goroutines that are parked waiting for
+	// something this connection can no longer produce. The one that matters is send
+	// credit: a goroutine writing a response body waits on a condition variable
+	// inside flow control, not on the socket, so closing the socket does not reach it
+	// and neither does stopping the writer. Without this it waits for the life of the
+	// process, holding a request, a response and a stack — which is a leak an
+	// ordinary peer causes by hanging up mid-download.
+	//
+	// err is never nil, and is whatever ended the connection: one of this file's four
+	// sentinels, an h2.ConnError, a transport error, or the read loop panicking. A
+	// parked writer is owed the actual reason rather than a generic one, because the
+	// reason is what its own caller will log.
+	//
+	// Called exactly once per connection, from the reader goroutine, as the last
+	// thing Serve does — after the writer has stopped, so a writer this call wakes
+	// can no longer put a frame on the wire behind the GOAWAY that has already gone
+	// out. Deferred rather than sequential, so a read loop that panicked wakes them
+	// too; that panic is recovered one frame up and would otherwise leave every
+	// parked writer behind.
+	//
+	// Implementations may be called while other goroutines are still inside them —
+	// that is the entire point — so this is the one method here with no exclusive
+	// access to anything.
+	Close(err error)
 }
 
 // The four ways a connection ends with nobody at fault.
@@ -104,6 +180,16 @@ var (
 	errIdle         = errors.New("connection idle")
 	errShuttingDown = errors.New("server shutting down")
 )
+
+// errReadLoopPanicked is what goroutines parked in flow control are told when the
+// read loop panicked rather than returned.
+//
+// Separate from the four above because it is not an ending with nobody at fault, and
+// separate from the errors they are otherwise given because there is no error to give:
+// a panic is a value, and by the time StreamHandler.Close is reached it belongs to the
+// recover one frame up, in runConn, which logs it with its stack. All this has to do is
+// be non-nil and say which of the connection's endings this was.
+var errReadLoopPanicked = errors.New("connection read loop panicked")
 
 // readDeadlineKind says which of the connection's read deadlines the current read
 // is running under.
@@ -181,7 +267,7 @@ type conn struct {
 // at construction. The alternative is a nil method call on the first HEADERS frame of
 // the first request, which is the same bug reported later, from a goroutine further
 // away, with a peer's traffic mixed into the stack trace.
-func newConn(sock connSocket, newHandler func(FrameEnqueuer) StreamHandler, t limits.Timeouts) *conn {
+func newConn(sock connSocket, newHandler func(ConnWriter) StreamHandler, t limits.Timeouts) *conn {
 	if newHandler == nil {
 		panic("server: newConn requires a stream handler factory")
 	}
@@ -253,7 +339,23 @@ func initialSettings() frame.SettingsFrame {
 func (c *conn) Serve() error {
 	defer c.sock.Close()
 
+	// ended is the reason this connection is over, as the goroutines writing
+	// responses will be told it, and it is a variable closed over by a defer rather
+	// than an argument for one reason: a panic in the read loop has to reach flow
+	// control too. That panic is recovered by runConn, so the process survives it and
+	// every goroutine parked for send credit on this connection does not — it waits
+	// on a condition variable no surviving goroutine will signal.
+	//
+	// Registered after the socket's close and therefore run before it, and run after
+	// the writer has been waited for, which is what stops a writer woken here from
+	// enqueueing a frame behind the GOAWAY. Nothing below is allowed to nil it: the
+	// four sentinel endings are set to nil in err so Serve does not report them as
+	// failures, and a parked writer still needs to be told which one it was.
+	ended := errReadLoopPanicked
+	defer func() { c.handler.Close(ended) }()
+
 	err := c.run()
+	ended = err
 
 	// sendErr is a failure to deliver the final GOAWAY, kept apart from err
 	// because it is a consequence of the ending rather than the ending itself.
@@ -342,6 +444,13 @@ func (c *conn) Serve() error {
 // Both errors are returned together rather than one being chosen. They describe
 // different halves of the same teardown, and a caller logging this wants whichever of
 // them is not nil without having to ask twice.
+//
+// The stream handler is deliberately not closed here, and this is the only path on
+// which it is not. StreamHandler.Close exists to hand a reason to goroutines parked
+// waiting for something the connection can no longer produce, and on this path there
+// are none: no frame has been dispatched, so nothing has been given a response to
+// write or credit to wait for. Serve is where a connection acquires goroutines and
+// Serve is where they are woken.
 func (c *conn) discard() error {
 	c.w.Close()
 	return errors.Join(c.w.Wait(), c.sock.Close())
@@ -677,13 +786,20 @@ func (c *conn) applySetting(s frame.Setting) error {
 		// its own SETTINGS. A client that sets ENABLE_PUSH to 1 gets no pushes
 		// anyway, which is permitted — the setting is a ceiling, not a request.
 
-	case frame.SettingHeaderTableSize, frame.SettingMaxHeaderListSize:
-		// Both belong to the HPACK encoder, which does not exist on this branch
-		// yet. HEADER_TABLE_SIZE reaches it through
-		// h2.HeaderCodec.SetMaxDynamicTableSize; MAX_HEADER_LIST_SIZE bounds the
-		// decoded size of a response's header list and has to be enforced where
-		// the list is built. Both are internal/hpack's, and neither can be
-		// obeyed or disobeyed until this connection sends a response.
+	case frame.SettingHeaderTableSize:
+		// The size of the dynamic table the peer keeps for decoding, and therefore a
+		// ceiling on the encoding context this connection's responses are compressed
+		// against. Forwarded because the codec is the handler's and this file has
+		// none: see StreamHandler.SetHeaderTableSize.
+		c.handler.SetHeaderTableSize(s.Value)
+
+	case frame.SettingMaxHeaderListSize:
+		// A ceiling on the field list a response may carry, enforced where the list
+		// is assembled: see StreamHandler.SetMaxHeaderListSize. §6.5.2 makes it
+		// advisory, so obeying it is this server's choice rather than a requirement —
+		// and the choice is made on the other side of this interface too, because the
+		// accounting is over a list this file never sees.
+		c.handler.SetMaxHeaderListSize(s.Value)
 
 	case frame.SettingInitialWindowSize:
 		// The awkward one, and the reason StreamHandler has a method for it.

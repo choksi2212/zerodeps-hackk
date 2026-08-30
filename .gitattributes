@@ -8,6 +8,7 @@
 *.go   text eol=lf
 *.md   text eol=lf
 *.sh   text eol=lf
+*.py   text eol=lf
 *.pem  text eol=lf
 
 # Byte-exact protocol fixtures must never be touched by any line-ending
@@ -15,3 +16,8 @@
 # reads as "my parser is broken" and costs hours to find.
 testdata/**/*.bin -text
 testdata/**/*.raw -text
+
+# `text=auto` above would detect these as binary on its own. Saying so is not
+# redundant: the cost of a wrong guess is a corrupt file, and this is the one
+# file in the repo whose job is to leave nothing to detection.
+*.png -text

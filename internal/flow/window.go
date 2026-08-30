@@ -36,9 +36,17 @@
 //
 // The blocking half of the send side — a stream goroutine that wants to write a
 // body larger than its credit and must park until a WINDOW_UPDATE arrives — is
-// not here yet. It belongs on top of this type rather than inside it: the
+// Sender, in the next file. It sits on top of this type rather than inside it: the
 // arithmetic and the RFC's error scoping are worth testing without a scheduler
-// involved.
+// involved, and the parking is worth testing without the arithmetic.
+//
+// The receive side has no counterpart here and deliberately so. Deciding when to
+// give credit back is policy rather than arithmetic — how much a receiver is willing
+// to have in flight, and how many frames it will spend saying so — and it needs to
+// know what a handler has read, which is a fact from a third goroutine that no
+// window can see. internal/stream owns that decision; see Table.ReportConsumed. What
+// arrives here is only the result, through Increase, from the goroutine that owns the
+// window.
 package flow
 
 import "zerodeps/zdh/internal/h2"

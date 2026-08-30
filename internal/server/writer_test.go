@@ -926,6 +926,42 @@ func TestFrameWriterSetMaxFrameSizeRaisesTheLimit(t *testing.T) {
 	}
 }
 
+// TestFrameWriterReportsTheCapAResponseMustSplitAt covers the value rather than its
+// effect. The effect is the test above; this is the reading that internal/stream's
+// side of ConnWriter does before it splits a header list, and it has to be right in
+// three ways: the protocol's default before the peer has said anything (§6.5.2), the
+// peer's value once it has, and never below the default even if the peer asks for
+// less — §6.5.2 sets 16384 as the smallest value the setting may carry, so a smaller
+// one is a peer bug, and a writer that honoured it would fragment every response
+// against a limit the protocol forbids.
+func TestFrameWriterReportsTheCapAResponseMustSplitAt(t *testing.T) {
+	tt := &testTarget{}
+	w := startFrameWriter(tt, time.Second)
+	defer func() {
+		w.Shutdown()
+		if err := waitStopped(t, w, tt); err != nil {
+			t.Errorf("Wait: %v", err)
+		}
+	}()
+
+	if got := w.MaxFrameSize(); got != frame.DefaultMaxFrameSize {
+		t.Errorf("a new writer reports a cap of %d, want the protocol default %d",
+			got, uint32(frame.DefaultMaxFrameSize))
+	}
+
+	const raised = 1 << 15
+	w.SetMaxFrameSize(raised)
+	if got := w.MaxFrameSize(); got != raised {
+		t.Errorf("after the peer raised the cap to %d the writer reports %d", uint32(raised), got)
+	}
+
+	w.SetMaxFrameSize(frame.DefaultMaxFrameSize - 1)
+	if got := w.MaxFrameSize(); got != frame.DefaultMaxFrameSize {
+		t.Errorf("after a peer asked for %d the writer reports %d, want the floor %d",
+			frame.DefaultMaxFrameSize-1, got, uint32(frame.DefaultMaxFrameSize))
+	}
+}
+
 // --- concurrency and lifetime ------------------------------------------------
 
 // TestFrameWriterSurvivesConcurrentEnqueue is the invariant the whole type exists
