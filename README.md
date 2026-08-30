@@ -13,11 +13,11 @@ This section is kept honest as the build proceeds; nothing is claimed here befor
 | Build gate, zero-dependency guards, reproducible build | working |
 | Shared `internal/h2` contract | frozen |
 | Frame layer (RFC 9113 §4, §6) | working — all 10 frame types, 198 tests, 5 fuzz targets |
-| Connection timeouts and peer bounds (`internal/limits`) | working — six timeouts, 36 tests; the reset bucket is not yet wired to a connection |
+| Connection timeouts and peer bounds (`internal/limits`) | working — six timeouts, 36 tests; the reset bucket is wired into `internal/stream`'s table and confirmed firing by `internal/attack.TestRapidReset` |
 | Connection lifecycle, SETTINGS, PING, GOAWAY | working — 75 tests, and 65 guards each observed failing |
 | Accept loop, connection bound, graceful shutdown | working — 28 tests, and 38 guards each observed failing |
 | Streams and flow control (§5) | working — 151 tests, and 223 guards each observed failing; both halves of flow control are wired to the stream table, and reachable from `cmd/zdh` |
-| HPACK (RFC 7541) | in progress, separate author |
+| HPACK (RFC 7541) | working — 48 tests (38 `internal/hpack`, 10 `internal/huffman`), 1 fuzz target with 13.5M+ clean executions; RFC 7541 Appendix C.1–C.6 byte-exact, including the eviction-heavy C.5/C.6 |
 | Request semantics (RFC 9113 §8) | working — 70 tests, and 132 guards each observed failing |
 | Response header encoding and the per-stream body writer (§8.3, §6.10, §6.5.2) | working — 61 tests, and 116 guards each observed failing |
 | Request-to-handler plumbing (`internal/exchange`) | working — 51 tests, and 64 guards each observed failing |
@@ -26,6 +26,7 @@ This section is kept honest as the build proceeds; nothing is claimed here befor
 | TLS 1.2/1.3, ALPN, RFC 9113 §9.2 cipher policy | working — 24 tests, and 31 guards each observed failing |
 | The server itself (`cmd/zdh`) | working — 20 tests, and 29 guards each observed failing; the only end-to-end coverage in the module |
 | Browser demo | working — `public/`, and the browser's own `window.performance` numbers in [docs/demo.png](docs/demo.png): 64 requests, all `h2`, zero connections opened |
+| CVE reproduction (`internal/attack`) | working — 5 tests; `TestRapidReset` (CVE-2023-44487) and `TestContinuationFlood` (CVE-2023-45288) drive a real in-process server and confirm `GOAWAY(ENHANCE_YOUR_CALM)` |
 | h2spec conformance score | **147 tests, 147 passed, 0 failed** on `--strict` — the transcript is [docs/H2SPEC.md](docs/H2SPEC.md) |
 
 Every count above is a top-level test function, which is what `go test -list '.*' ./...` prints: a table-driven test counts once rather than once per case, so the number is one command away from being checked rather than one convention away from being argued about.
