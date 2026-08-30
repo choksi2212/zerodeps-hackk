@@ -292,12 +292,17 @@ func (e *Encoder) writeSection(id uint32, fields []h2.Field, endStream bool) err
 			EndHeaders: n == len(rest),
 			Fragment:   fragment(rest[:n]),
 		}); err != nil {
-			// The HEADERS frame is already queued, and this stream's header block
-			// therefore ends without END_HEADERS. That is not a stream this server
-			// can rescue: §6.10 forbids sending anything else until the block is
-			// finished, and the reason a frame was refused is that the write half
-			// has stopped, so nothing further will be sent on this connection at
-			// all. Reporting it is the whole of the remedy.
+			// The HEADERS frame and every CONTINUATION before this one are already
+			// with the write half, and they stay there. §4.3: "Field blocks MUST be
+			// transmitted as a contiguous sequence of frames", so the write half
+			// holds a block aside until it is complete and writes it as one item —
+			// and a block that is never completed is one the peer never sees a
+			// fragment of. See internal/server's scheduler.
+			//
+			// Which leaves nothing to rescue and nothing to rescue it with: a frame
+			// is refused because the write half has stopped, so nothing further will
+			// be sent on this connection at all. Reporting it is the whole of the
+			// remedy.
 			return err
 		}
 		rest = rest[n:]
