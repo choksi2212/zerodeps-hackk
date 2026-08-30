@@ -24,8 +24,9 @@ import (
 // per seek and a download resumed after a dropped connection sends one for the tail, and neither
 // costs this server a re-read of the part the peer already has.
 //
-// if-range is read, and its presence is all that is read: the condition it asks about cannot be
-// true here, so the field's effect is to cancel the range. See ifRangeIsFalse.
+// if-range is evaluated, in both the forms §13.1.5 of RFC 9110 defines: an entity tag is compared
+// against this representation's, and a date cancels the range because a last-modified is a weak
+// validator and that field requires a strong one. See ifRangeIsFalse.
 const (
 	fieldRange   = "range"
 	fieldIfRange = "if-range"
@@ -195,7 +196,7 @@ const (
 //     comma-separated list by §5.3 of RFC 9110, and a list of two ranges-specifiers is not a
 //     ranges-specifier: §14.2 of RFC 9110's grammar makes Range one ranges-specifier, singular,
 //     with the unit named once.
-//  3. if-range is present. See ifRangeIsFalse.
+//  3. if-range is present and its condition is false. See ifRangeIsFalse.
 //  4. The representation is empty. §14.2 of RFC 9110: "A server that supports range requests
 //     MAY ignore a Range header field when the selected representation has no content". Taking
 //     that permission also disposes of a shape this server could not spell, since one range-spec
@@ -216,9 +217,9 @@ const (
 // where saying so is more useful than sending the file: the content-range on it carries the
 // length the peer guessed wrong about. Too many range-specs is the other, and maxRanges says why
 // that is a 416 too.
-func evaluateRange(r *exchange.Request, size int64) ([]span, rangeVerdict) {
+func evaluateRange(r *exchange.Request, tag string, size int64) ([]span, rangeVerdict) {
 	value, lines := lookup(r.Fields, fieldRange)
-	if lines != 1 || r.Method != methodGet || size == 0 || ifRangeIsFalse(r) {
+	if lines != 1 || r.Method != methodGet || size == 0 || ifRangeIsFalse(r, tag) {
 		return nil, rangeIgnore
 	}
 
@@ -260,42 +261,53 @@ func evaluateRange(r *exchange.Request, size int64) ([]span, rangeVerdict) {
 	return spans, rangePartial
 }
 
-// ifRangeIsFalse reports whether r carries an if-range field whose condition this server cannot
-// satisfy, which is any if-range field at all.
+// ifRangeIsFalse reports whether r carries an if-range field whose condition is false, which is the
+// one case where a range field that is otherwise perfectly good is disregarded.
 //
-// # The condition is false, and it is false for the same reason there is no ETag
+// # The two forms, and why only one of them can be true
 //
-// §13.1.5 of RFC 9110 gives if-range two forms and this server loses both.
+// §13.1.5 of RFC 9110 gives if-range two forms, and this server can satisfy the accurate one.
 //
-// The entity-tag form needs an entity tag to compare against — §13.1.5 of RFC 9110: "If the
-// entity-tag validator provided exactly matches the ETag field value for the selected
-// representation using the strong comparison function" — and the package comment explains why
-// this server has none. Nothing matches a field that is never sent.
+// The entity-tag form is compared against the tag etag computed for this representation, under the
+// comparison §13.1.5 of RFC 9110 names: "If the entity-tag validator provided exactly matches the
+// ETag field value for the selected representation using the strong comparison function". Strong is
+// the operative word and matchesStrong is the function — a peer that sends a W/ tag has sent a weak
+// validator, which cannot satisfy this field however well its opaque-tag matches. The tag is a hash
+// of the content, so a match is a proof that the octets the peer already holds are the octets this
+// response would continue.
 //
-// The HTTP-date form fails one step earlier, before any comparison happens. §13.1.5 of RFC 9110:
-// "If the HTTP-date validator provided is not a strong validator in the sense defined by Section
-// 8.8.2.2, the condition is false." And the burden runs the other way round from what a server
-// might hope. §8.8.2.2 of RFC 9110: "A Last-Modified time, when used as a validator in a request,
-// is implicitly weak unless it is possible to deduce that it is strong". The deduction available
-// to an origin server requires, per §8.8.2.2 of RFC 9110, that "That origin server reliably knows
-// that the associated representation did not change twice during the second covered by the
-// presented validator" — which a server whose representations are files that somebody else is free
-// to rewrite cannot know about any second. modTime makes the same argument about the same
-// validator from the other end.
+// The HTTP-date form fails one step earlier, before any comparison happens, and it fails for every
+// date. §13.1.5 of RFC 9110: "If the HTTP-date validator provided is not a strong validator in the
+// sense defined by Section 8.8.2.2, the condition is false." And the burden runs the other way round
+// from what a server might hope. §8.8.2.2 of RFC 9110: "A Last-Modified time, when used as a
+// validator in a request, is implicitly weak unless it is possible to deduce that it is strong". The
+// deduction available to an origin server requires, per §8.8.2.2 of RFC 9110, that "That origin
+// server reliably knows that the associated representation did not change twice during the second
+// covered by the presented validator" — which a server whose representations are files that somebody
+// else is free to rewrite cannot know about any second. modTime makes the same argument about the
+// same validator from the other end.
 //
-// # What that costs, and what it does not
+// So the date form is refused and the tag form is answered, which is the reason there is a tag at
+// all: a client resuming a download with the etag it was given gets the tail it asked for, and one
+// resuming with a last-modified gets the whole file. Both are correct, and both are the pair
+// §13.1.5 of RFC 9110 glosses the field as: "if the representation is unchanged, send me the
+// part(s) that I am requesting in Range; otherwise, send me the entire representation."
 //
-// §13.1.5 of RFC 9110 is explicit about the outcome: "A recipient of an If-Range header field
-// MUST ignore the Range header field if the If-Range condition evaluates to false." So the peer
-// gets the whole representation with a 200. That is not a failure — it is the branch if-range
-// exists to select, and it is how the same section glosses the field. §13.1.5 of RFC 9110: "if the
-// representation is unchanged, send me the part(s) that I am requesting in Range; otherwise, send
-// me the entire representation." A client resuming a download of a file this server cannot prove
-// is unchanged is sent the file, which is what it asked for in the second half of that sentence.
+// # Which form a value is, decided the way the RFC says to decide it
 //
-// What it does not cost is seeking. A browser scrubbing through a video sends range with no
-// if-range on it, because it is not resuming a partial copy of anything; those requests never
-// reach this function's true branch and are answered with a 206.
+// §13.1.5 of RFC 9110: "A valid entity-tag can be distinguished from a valid HTTP-date by examining
+// the first three characters for a DQUOTE". Three characters, not one, because of the weakness
+// indicator: an entity tag begins with a DQUOTE or with W/ and then a DQUOTE, and no HTTP-date in
+// any of the three formats §5.6.7 of RFC 9110 defines contains a DQUOTE anywhere. Anything that is
+// neither is not a valid if-range value, and an invalid one is treated as a false condition rather
+// than as an absent field — which costs the peer a full transfer and cannot send it the wrong
+// octets.
+//
+// The value must be one entity tag and nothing else. §13.1.5 of RFC 9110's grammar is "If-Range =
+// entity-tag / HTTP-date", singular in both branches, so a comma-separated list is not an if-range
+// however many of its members would have matched. That is the one place this differs from if-match
+// and if-none-match, and it is why splitEntityTag is called directly here instead of matchesStrong:
+// the list parser would accept a list.
 //
 // # Ignored when there is nothing to cancel
 //
@@ -304,14 +316,20 @@ func evaluateRange(r *exchange.Request, size int64) ([]span, rangeVerdict) {
 // does not contain a Range header field." The caller has already established the range field, so
 // the ordering inside its condition is what implements this.
 //
-// The value is not looked at either, and there are two reasons not to. The field's two forms are
-// distinguished by inspection — §13.1.5 of RFC 9110: "A valid entity-tag can be distinguished from
-// a valid HTTP-date by examining the first three characters for a DQUOTE" — and this server would
-// be doing that in order to reach the same answer down both branches. A parser whose output
-// cannot change an outcome is a parser that can only be wrong.
-func ifRangeIsFalse(r *exchange.Request) bool {
-	_, lines := lookup(r.Fields, fieldIfRange)
-	return lines > 0
+// More than one field line is a false condition for the reason it is everywhere else in this
+// package: two lines carrying one name are one comma-separated list by §5.3 of RFC 9110, and a list
+// is not an entity-tag.
+func ifRangeIsFalse(r *exchange.Request, tag string) bool {
+	value, lines := lookup(r.Fields, fieldIfRange)
+	if lines == 0 {
+		return false
+	}
+	if lines > 1 {
+		return true
+	}
+
+	opaque, weak, rest, ok := splitEntityTag(value)
+	return !ok || weak || rest != "" || tag == "" || opaque != tag
 }
 
 // parseRangeSet reads a range-set, returning the spans of the satisfiable range-specs in it, how
@@ -650,14 +668,14 @@ func boundary() string {
 // Content-Range header field includes information about the selected representation's complete
 // length." So the length describes what is being sent, multipart framing included, and the size
 // of the file is carried by the content-range fields instead.
-func (h *Handler) partial(w *response.Writer, f *os.File, spans []span, size int64, kind string, now, mod time.Time) error {
+func (h *Handler) partial(w *response.Writer, f *os.File, spans []span, size int64, kind, tag string, now, mod time.Time) error {
 	if len(spans) == 1 {
 		s := spans[0]
 
 		// §15.3.7.1 of RFC 9110: "If a single part is being transferred, the server generating
 		// the 206 response MUST generate a Content-Range header field, describing what range of
 		// the selected representation is enclosed, and a content consisting of the range."
-		fields := withRanges(withValidator(h.fields(now, status206, kind, s.length()), mod))
+		fields := withRanges(withValidator(h.fields(now, status206, kind, s.length()), tag, mod))
 		fields = append(fields, h2.Field{Name: "content-range", Value: s.contentRange(size)})
 		return h.send(w, f, fields, single(s))
 	}
@@ -668,7 +686,7 @@ func (h *Handler) partial(w *response.Writer, f *os.File, spans []span, size int
 	// response". Each part carries its own; multipart is where.
 	edge := boundary()
 	p := multipart(spans, size, kind, edge)
-	fields := withRanges(withValidator(h.fields(now, status206, multipartByteranges+edge, p.length), mod))
+	fields := withRanges(withValidator(h.fields(now, status206, multipartByteranges+edge, p.length), tag, mod))
 	return h.send(w, f, fields, p)
 }
 
@@ -740,8 +758,8 @@ func (h *Handler) send(w *response.Writer, f *os.File, fields []h2.Field, p plan
 // The value is a single unit, and that is the whole of what this server promises — the field is
 // not a guarantee, and §14.3 of RFC 9110 says so: "a client MUST NOT assume that receiving an
 // Accept-Ranges field means that future range requests will return partial responses". Which is
-// just as well, since a request for too many ranges gets a 416 and one carrying an if-range gets
-// the file.
+// just as well, since a request for too many ranges gets a 416 and one carrying an if-range whose
+// condition is false gets the file.
 //
 // It is also nearly free on the wire: accept-ranges is entry 18 of Appendix A of RFC 7541's
 // static table, so the name costs one octet of a field block and only the value is literal.

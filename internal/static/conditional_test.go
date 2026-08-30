@@ -46,11 +46,26 @@ const (
 	aDayAfter       = "Sun, 05 Jul 2026 11:22:33 GMT"
 )
 
-// anEntityTag is a syntactically valid entity tag that cannot match anything this server
-// sends, because this server sends none. Every If-Match and If-None-Match test below uses it
-// rather than a plausible-looking value, so that no reader mistakes a passing test for
-// evidence that tags are compared here.
-const anEntityTag = `"cafe"`
+// The two entity tags the tables below are built from: the one the file is taken to have, and
+// one that is syntactically valid and never equal to it.
+//
+// Neither is a hash of anything, and theEntityTag deliberately does not look like one. evaluate
+// compares the tags it is given and never inspects them, so what a real tag would be — 43
+// characters of base64 between two quotes, per etag.go — buys a table nothing but width. The
+// property that matters is that the two differ, and that both are well-formed: a test whose
+// non-matching tag were malformed would pass against a comparison that rejected every
+// malformed list and never compared anything.
+//
+// The weak forms are the same opaque-tags behind a weakness indicator. They exist because the
+// two comparison functions §8.8.3.2 of RFC 9110 defines differ on exactly this input and on
+// nothing else, so a handler that used one function for all four fields still answers every
+// strong case correctly.
+const (
+	theEntityTag     = `"decaf"`
+	theEntityTagWeak = `W/"decaf"`
+	anEntityTag      = `"cafe"`
+	anEntityTagWeak  = `W/"cafe"`
+)
 
 // stamped is an fs.FileInfo that reports one modification time and nothing else worth
 // reading.
@@ -100,7 +115,17 @@ func TestEvaluateFollowsSectionOrder(t *testing.T) {
 			name:  "if-match entity tag",
 			when:  []h2.Field{{Name: fieldIfMatch, Value: anEntityTag}},
 			want:  verdictFailed,
-			notes: "no tag can match a representation that has none",
+			notes: "the listed tag is not the one the file has",
+		}, {
+			name:  "if-match the file's own entity tag",
+			when:  []h2.Field{{Name: fieldIfMatch, Value: theEntityTag}},
+			want:  verdictSend,
+			notes: "the condition is true, so the request proceeds",
+		}, {
+			name:  "if-match the file's own entity tag, weakened",
+			when:  []h2.Field{{Name: fieldIfMatch, Value: theEntityTagWeak}},
+			want:  verdictFailed,
+			notes: "strong comparison: the opaque-tags match and the weakness indicator still loses",
 		}, {
 			name:  "if-unmodified-since older than the file",
 			when:  []h2.Field{{Name: fieldIfUnmodifiedSince, Value: aDayBefore}},
@@ -127,6 +152,28 @@ func TestEvaluateFollowsSectionOrder(t *testing.T) {
 			when:  []h2.Field{{Name: fieldIfNoneMatch, Value: anEntityTag}},
 			want:  verdictSend,
 			notes: "no listed tag matches, so the condition is true",
+		}, {
+			name:  "if-none-match the file's own entity tag",
+			when:  []h2.Field{{Name: fieldIfNoneMatch, Value: theEntityTag}},
+			want:  verdictNotModified,
+			notes: "the cache hit an entity tag exists to make possible",
+		}, {
+			name:  "if-none-match the file's own entity tag, weakened",
+			when:  []h2.Field{{Name: fieldIfNoneMatch, Value: theEntityTagWeak}},
+			want:  verdictNotModified,
+			notes: "weak comparison: the weakness indicator is disregarded on either side",
+		}, {
+			name:  "if-none-match a weakened tag that is not the file's",
+			when:  []h2.Field{{Name: fieldIfNoneMatch, Value: anEntityTagWeak}},
+			want:  verdictSend,
+			notes: "weak comparison ignores the indicator, not the opaque-tag",
+		}, {
+			name: "if-none-match a list whose last member is the file's own entity tag",
+			when: []h2.Field{
+				{Name: fieldIfNoneMatch, Value: anEntityTag + ", " + theEntityTagWeak},
+			},
+			want:  verdictNotModified,
+			notes: "any member matching is enough",
 		}, {
 			name: "if-modified-since older than the file",
 			when: []h2.Field{{Name: fieldIfModifiedSince, Value: aDayBefore}},
@@ -161,6 +208,14 @@ func TestEvaluateFollowsSectionOrder(t *testing.T) {
 			want:  verdictSend,
 			notes: "the date alone would be a 412",
 		}, {
+			name: "a matching if-match silences a failing if-unmodified-since",
+			when: []h2.Field{
+				{Name: fieldIfMatch, Value: theEntityTag},
+				{Name: fieldIfUnmodifiedSince, Value: aDayBefore},
+			},
+			want:  verdictSend,
+			notes: "the tag is the stronger evidence and it says the copy is current",
+		}, {
 			name: "a failing if-match is not rescued by a passing if-unmodified-since",
 			when: []h2.Field{
 				{Name: fieldIfMatch, Value: anEntityTag},
@@ -179,6 +234,14 @@ func TestEvaluateFollowsSectionOrder(t *testing.T) {
 			name: "if-none-match wildcard silences a failing if-modified-since",
 			when: []h2.Field{
 				{Name: fieldIfNoneMatch, Value: "*"},
+				{Name: fieldIfModifiedSince, Value: aDayBefore},
+			},
+			want:  verdictNotModified,
+			notes: "the date alone would be a 200",
+		}, {
+			name: "a matching if-none-match silences a failing if-modified-since",
+			when: []h2.Field{
+				{Name: fieldIfNoneMatch, Value: theEntityTag},
 				{Name: fieldIfModifiedSince, Value: aDayBefore},
 			},
 			want:  verdictNotModified,
@@ -205,22 +268,28 @@ func TestEvaluateFollowsSectionOrder(t *testing.T) {
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			r := reqWith(t, methodGet, "/a.txt", c.when...)
-			if got := evaluate(r, fileTime, clock.UTC()); got != c.want {
+			if got := evaluate(r, theEntityTag, fileTime, clock.UTC()); got != c.want {
 				t.Errorf("evaluate = %v, want %v %s", got, c.want, c.notes)
 			}
 		})
 	}
 }
 
-// TestEvaluateWithoutAValidator is the same order on a file whose modification time the
-// filesystem did not keep. Both date conditions are then unanswerable and are ignored, which
-// is one of the cases §13.1.3 of RFC 9110 names: "A recipient MUST ignore the If-Modified-Since
-// header field if the resource does not have a modification date available."
+// TestEvaluateWithoutAValidator is the same order on a file that has neither validator: no
+// entity tag, because reading the content to hash it failed, and no modification time, because
+// the filesystem did not keep one. Both date conditions are then unanswerable and are ignored,
+// which is one of the cases §13.1.3 of RFC 9110 names: "A recipient MUST ignore the
+// If-Modified-Since header field if the resource does not have a modification date available."
 //
-// The two entity-tag fields are unaffected, because neither of them asks about a date. That
-// asymmetry is the whole content of this test: a handler that gave up on all four
-// preconditions the moment it had no validator would answer 200 to an if-none-match of *, and
-// send a representation the peer had just said it already had.
+// The two entity-tag fields are not ignored, because neither of them asks about a date and both
+// have an answer for a representation with no tag: nothing matches it, so If-Match fails and
+// If-None-Match holds. That asymmetry is the whole content of this test — a handler that gave
+// up on all four preconditions the moment it had no validator would answer 200 to an
+// if-none-match of *, and send a representation the peer had just said it already had.
+//
+// The last case is the one that would break if the empty tag were ever treated as a value rather
+// than as an absence: a peer that sent the tag the file would have had, back when it had one,
+// must still be told the condition is false.
 func TestEvaluateWithoutAValidator(t *testing.T) {
 	for _, c := range []struct {
 		name string
@@ -233,10 +302,14 @@ func TestEvaluateWithoutAValidator(t *testing.T) {
 		{"if-match tag still fails", []h2.Field{{Name: fieldIfMatch, Value: anEntityTag}}, verdictFailed},
 		{"if-none-match wildcard still holds", []h2.Field{{Name: fieldIfNoneMatch, Value: "*"}}, verdictNotModified},
 		{"if-none-match tag still holds", []h2.Field{{Name: fieldIfNoneMatch, Value: anEntityTag}}, verdictSend},
+		{"if-match the tag it would have had", []h2.Field{{Name: fieldIfMatch, Value: theEntityTag}}, verdictFailed},
+		{"if-none-match the tag it would have had", []h2.Field{{Name: fieldIfNoneMatch, Value: theEntityTag}}, verdictSend},
+		{"if-match an empty list", []h2.Field{{Name: fieldIfMatch, Value: ""}}, verdictFailed},
+		{"if-none-match an empty list", []h2.Field{{Name: fieldIfNoneMatch, Value: ""}}, verdictSend},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			r := reqWith(t, methodGet, "/a.txt", c.when...)
-			if got := evaluate(r, time.Time{}, clock.UTC()); got != c.want {
+			if got := evaluate(r, "", time.Time{}, clock.UTC()); got != c.want {
 				t.Errorf("evaluate against no validator = %v, want %v", got, c.want)
 			}
 		})
@@ -286,6 +359,20 @@ func TestEvaluateIgnoresRepeatedFieldLines(t *testing.T) {
 			},
 			want: verdictSend,
 		}, {
+			name: "two if-match lines each carrying the file's own tag",
+			when: []h2.Field{
+				{Name: fieldIfMatch, Value: theEntityTag},
+				{Name: fieldIfMatch, Value: theEntityTag},
+			},
+			want: verdictFailed,
+		}, {
+			name: "two if-none-match lines each carrying the file's own tag",
+			when: []h2.Field{
+				{Name: fieldIfNoneMatch, Value: theEntityTag},
+				{Name: fieldIfNoneMatch, Value: theEntityTag},
+			},
+			want: verdictSend,
+		}, {
 			name: "a repeated if-match still hides if-unmodified-since",
 			when: []h2.Field{
 				{Name: fieldIfMatch, Value: "*"},
@@ -297,7 +384,7 @@ func TestEvaluateIgnoresRepeatedFieldLines(t *testing.T) {
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			r := reqWith(t, methodGet, "/a.txt", c.when...)
-			if got := evaluate(r, fileTime, clock.UTC()); got != c.want {
+			if got := evaluate(r, theEntityTag, fileTime, clock.UTC()); got != c.want {
 				t.Errorf("evaluate = %v, want %v", got, c.want)
 			}
 		})
@@ -706,20 +793,39 @@ func TestModTimeOfAFileWithoutOneIsZero(t *testing.T) {
 
 // TestWithValidatorLeavesTheFieldOutWhenThereIsNone is the other half of the same case, at the
 // point where the decision becomes a field or no field.
+//
+// Four calls, because the two validators are independent: a file can have a modification time
+// and no tag, because hashing it failed, or a tag and no modification time, because the
+// filesystem does not keep one. Neither absence may take the other field down with it, and the
+// order is asserted too — the etag precedes the last-modified in every response this handler
+// sends, so that a peer reading the pair sees the stronger one first.
 func TestWithValidatorLeavesTheFieldOutWhenThereIsNone(t *testing.T) {
 	base := []h2.Field{{Name: ":status", Value: status200}}
+	etag := h2.Field{Name: "etag", Value: theEntityTag}
+	modified := h2.Field{Name: "last-modified", Value: fileTimeField}
 
-	if got := withValidator(base, time.Time{}); len(got) != 1 {
-		t.Errorf("withValidator added %d fields for a file with no modification time: %v",
-			len(got)-1, got[1:])
-	}
-
-	got := withValidator(base, fileTime)
-	if len(got) != 2 {
-		t.Fatalf("withValidator produced %d fields, want 2: %v", len(got), got)
-	}
-	if want := (h2.Field{Name: "last-modified", Value: fileTimeField}); got[1] != want {
-		t.Errorf("withValidator added %v, want %v", got[1], want)
+	for _, c := range []struct {
+		name string
+		tag  string
+		mod  time.Time
+		want []h2.Field
+	}{
+		{"neither", "", time.Time{}, nil},
+		{"only the modification time", "", fileTime, []h2.Field{modified}},
+		{"only the entity tag", theEntityTag, time.Time{}, []h2.Field{etag}},
+		{"both", theEntityTag, fileTime, []h2.Field{etag, modified}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			got := withValidator(base, c.tag, c.mod)
+			if len(got) != len(c.want)+1 {
+				t.Fatalf("withValidator added %v, want %v", got[1:], c.want)
+			}
+			for i, want := range c.want {
+				if got[i+1] != want {
+					t.Errorf("field %d is %v, want %v", i+1, got[i+1], want)
+				}
+			}
+		})
 	}
 }
 
@@ -745,6 +851,7 @@ func TestServeNotModifiedIsTheWholeFieldSet(t *testing.T) {
 		{Name: ":status", Value: status304},
 		{Name: "date", Value: clockField},
 		{Name: "server", Value: serverName},
+		{Name: "etag", Value: pageTag},
 		{Name: "last-modified", Value: fileTimeField},
 	})
 }
@@ -778,19 +885,20 @@ func TestServeNotModifiedCarriesNothing(t *testing.T) {
 	}
 }
 
-// TestServeNotModifiedWithoutAValidator is the 304 that carries no last-modified, which is
+// TestServeNotModifiedWithoutAValidator is the 304 that carries neither validator, which is
 // reachable only through an entity-tag field: the two date fields are ignored when there is no
 // modification time to compare them against, so an if-none-match of * is the one precondition
 // that can produce this response.
 //
-// Driven through notModified directly, because the zero modification time cannot be arranged
-// on disk — os.Chtimes reads the zero time as a request to leave the file alone.
+// Driven through notModified directly, because neither absence can be arranged on disk — the
+// zero modification time is what os.Chtimes reads as a request to leave the file alone, and the
+// missing tag needs a read of the content to fail.
 func TestServeNotModifiedWithoutAValidator(t *testing.T) {
 	h := newHandler(t, map[string]string{"index.html": page})
 
 	out := &collector{max: limits.MaxFrameSize}
 	w := response.NewWriter(response.NewEncoder(hpack.New(), out), &grants{}, 1)
-	a := read(t, out, h.notModified(w, clock.UTC(), time.Time{}))
+	a := read(t, out, h.notModified(w, clock.UTC(), "", time.Time{}))
 
 	if a.err != nil {
 		t.Fatalf("notModified: %v", a.err)
