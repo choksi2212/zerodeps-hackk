@@ -3,12 +3,14 @@
 Each entry below removes exactly one guard and names the tests that must fail as a
 result. See breakage.py for the harness and for what the five outcomes mean.
 
-Three files, because the package is three jobs and only the first of them is dangerous.
+Four files, because the package is four jobs and only the first of them is dangerous.
 path.go decides which file a request target names, which is the whole attack surface:
 every path-traversal bug in the history of static file serving is that decision made in a
 way that looked right. media.go is the table that says what a file is, where being wrong
 in one direction is a download and in the other is script running in the origin. static.go
-is the response itself -- the statuses, the fields, and the octets.
+is the response itself -- the statuses, the fields, and the octets. conditional.go is the
+response the peer already has, which is the one place in the package where being wrong is
+silent: a wrong 304 is a stale page in a browser with no way for either end to notice.
 
   Most of path.go's guards are checked twice on purpose, and the campaign is where that
   pays off. resolve refuses an octet whether it arrived raw or percent-encoded, so removing
@@ -45,7 +47,31 @@ is the response itself -- the statuses, the fields, and the octets.
   reached. A bound the test computes from the bound is not a tested bound, and that is the
   single most useful thing this campaign found.
 
-Four guards are not in this campaign, and all four absences are deliberate.
+  conditional.go is where an ordering is the thing being tested, so most of its breaks are
+  reorderings rather than removals. §13.2.2 of RFC 9110 fixes six steps in one sequence, and
+  a handler that read its fields in the order the peer happened to send them would answer
+  every single-field case correctly: the breaks that split step 1 from step 2, that let a
+  list of entity tags fall through to step 4, and that swap the two verdicts are there
+  because a suite which only ever sent one precondition at a time could not tell any of
+  those from correct code. The boundary breaks are the other half of it. Both date
+  comparisons are inclusive on the second the peer names -- that second is the ordinary
+  cache hit for one field and the ordinary permission for the other -- so each of them is
+  broken twice, once inverted and once shifted off the boundary by a second, because an
+  inversion is caught by any case at all and an off-by-one second is caught only by the
+  three cases written around the file's own timestamp.
+
+  Three assertions were added to conditional_test.go for the same reason as static_test.go's
+  four: the guard existed and nothing could fail on it. modTime truncates the clock as well
+  as the file, which is unobservable under a fixed test clock that has no fraction in it and
+  which the real clock always does have, so TestModTimeClampsAFutureFile now runs the clamp
+  against a fractional now. condDate passes the server's clock down to the century
+  arithmetic, and no rfc850 date reached the handler through a whole serve, so
+  TestServeIfUnmodifiedSinceGuardsAgainstAnEditRace now sends one. And the four field-name
+  constants were spelled from the constants on both sides of every table, so a name with a
+  capital in it would have matched itself and passed everything while matching nothing a
+  real peer sends -- TestPreconditionFieldNamesAreTheWireNames asserts the four literals.
+
+Eight guards are not in this campaign, and all eight absences are deliberate.
 
   open's stat is taken on the handle rather than on the name, which is what makes the size,
   the mode and the content one file. Replacing f.Stat() with h.root.Stat(name) reintroduces
@@ -75,7 +101,42 @@ Four guards are not in this campaign, and all four absences are deliberate.
   buffer as another file's octets and which the race detector names outright. This harness
   does not pass -race; that test is run with it by the suite.
 
-Run from the repository root. Restores all three files on the way out, including on error.
+  modTime's early return on a file with no modification time changes no answer when it is
+  removed. The zero time converted to UTC and truncated to the second is still the zero
+  time, and the zero time is not after any clock this server can read, so the clamp returns
+  it unchanged -- the function's answer is identical with the check and without it. It stays
+  in the code because it names the case §13.1.3 of RFC 9110 describes rather than relying on
+  two later operations to be identities, and it stays out of this campaign because a break
+  nothing can observe is not a hole in the suite. The decision it stands for becomes
+  observable one function later, in withValidator, which is broken above.
+
+  parseHTTPDate tries every layout before it retries a leap second, and the order cannot be
+  swapped into a wrong answer. leapSecond only rewrites a value whose last colon is followed
+  by the two octets 60, and no such value parses in any of the three layouts -- time.Parse
+  refuses a second of 60 as out of range, which is the entire reason the retry exists. So a
+  retry attempted first would rewrite nothing that would have parsed, and the property is
+  asserted directly at the level of the rewriter, by
+  TestLeapSecondRetryCannotAlterAValidDate, rather than through an ordering this campaign
+  could break.
+
+  serve reads the clock once and hands the same instant to modTime, to evaluate and to the
+  field set, which is what makes the clamp and the date field the same number. Replacing
+  either use with a second h.now() is not observable under this package's test clock, which
+  returns one fixed instant however often it is called. Seeing it would need a clock that
+  advanced between two reads and a response whose two dates were then compared -- which is
+  the assertion TestServeClampsAFileFromTheFuture already makes about the two fields being
+  one value, from the other direction.
+
+  The underscore in asctimeDate's "Mon Jan _2" is not observable either, and this one was
+  measured rather than reasoned about: the break was written, run, and reported as a hole.
+  A layout of "Mon Jan 2" accepts every value the padded one does, because time.Parse
+  matches a run of spaces in the value against a single space in the layout -- so the one
+  and three space forms in TestParseHTTPDateIsRobustWhereItSaysItIs parse under both. The
+  underscore is the correct spelling of date3's space-padded day for a layout that might one
+  day be formatted with, and it changes nothing about what is accepted, so the break was
+  removed rather than left in as a hole.
+
+Run from the repository root. Restores all four files on the way out, including on error.
 """
 
 import breakage
@@ -84,6 +145,7 @@ SRC = [
     "internal/static/path.go",
     "internal/static/media.go",
     "internal/static/static.go",
+    "internal/static/conditional.go",
 ]
 PKG = "./internal/static/"
 
@@ -562,8 +624,8 @@ BREAKS = [
 		return h.answer(w, r, status404, textPlain, body404)
 	}
 
-	return h.file(w, r, f, info.Size(), mediaType(name))""",
-        """	return h.file(w, r, f, info.Size(), mediaType(name))""",
+	// One instant for the whole response, taken here rather than in fields, because the clamp""",
+        """	// One instant for the whole response, taken here rather than in fields, because the clamp""",
         ["TestServeIndexThatIsADirectory"],
     ),
 
@@ -715,20 +777,20 @@ BREAKS = [
     # --- static.go: the fields ----------------------------------------------
     (
         "the fields a status brings with it are dropped, so no 405 says allow and no 301 where",
-        """	fields := append(h.fields(status, kind, int64(len(body))), extra...)""",
-        """	fields := h.fields(status, kind, int64(len(body)))""",
+        """	fields := append(h.fields(h.now().UTC(), status, kind, int64(len(body))), extra...)""",
+        """	fields := h.fields(h.now().UTC(), status, kind, int64(len(body)))""",
         ["TestServeMethodNotAllowed", "TestServeDirectoryRedirects"],
     ),
     (
         "an error response declares no content and sends some",
-        """	fields := append(h.fields(status, kind, int64(len(body))), extra...)""",
-        """	fields := append(h.fields(status, kind, 0), extra...)""",
+        """	fields := append(h.fields(h.now().UTC(), status, kind, int64(len(body))), extra...)""",
+        """	fields := append(h.fields(h.now().UTC(), status, kind, 0), extra...)""",
         ["TestContentLengthIsTheContent", "TestServeMissingFile"],
     ),
     (
         "a file's length is not the file's length",
-        """	fields := h.fields(status200, kind, size)""",
-        """	fields := h.fields(status200, kind, 0)""",
+        """	fields := withValidator(h.fields(now, status200, kind, size), mod)""",
+        """	fields := withValidator(h.fields(now, status200, kind, 0), mod)""",
         [
             "TestContentLengthIsTheContent",
             "TestServeFile",
@@ -745,20 +807,20 @@ BREAKS = [
     ),
     (
         "the status comes after a field line, which 8.3 puts it before",
-        '''	fields = append(fields,
-		h2.Field{Name: ":status", Value: status},
-		h2.Field{Name: "content-length", Value: strconv.FormatInt(length, 10)},
-	)''',
-        '''	fields = append(fields,
-		h2.Field{Name: "content-length", Value: strconv.FormatInt(length, 10)},
-		h2.Field{Name: ":status", Value: status},
-	)''',
+        '''	fields = append(fields, h2.Field{Name: ":status", Value: status})
+	if length != noContentLength {
+		fields = append(fields, h2.Field{Name: "content-length", Value: strconv.FormatInt(length, 10)})
+	}''',
+        '''	if length != noContentLength {
+		fields = append(fields, h2.Field{Name: "content-length", Value: strconv.FormatInt(length, 10)})
+	}
+	fields = append(fields, h2.Field{Name: ":status", Value: status})''',
         ["TestFieldsAreLowerCaseAndPseudoFirst", "TestServeFile"],
     ),
     (
         "nothing declares how long the content is, because the field is misspelled",
-        '''		h2.Field{Name: "content-length", Value: strconv.FormatInt(length, 10)},''',
-        '''		h2.Field{Name: "content-len", Value: strconv.FormatInt(length, 10)},''',
+        '''h2.Field{Name: "content-length", Value: strconv.FormatInt(length, 10)}''',
+        '''h2.Field{Name: "content-len", Value: strconv.FormatInt(length, 10)}''',
         [
             "TestContentLengthIsTheContent",
             "TestServeFile",
@@ -768,7 +830,7 @@ BREAKS = [
     (
         "no response carries a date, which 6.6.1 requires of all three statuses sent here",
         '''	fields = append(fields,
-		h2.Field{Name: "date", Value: h.now().UTC().Format(imfFixdate)},
+		h2.Field{Name: "date", Value: now.Format(imfFixdate)},
 		h2.Field{Name: "server", Value: serverName},
 	)''',
         '''	fields = append(fields,
@@ -777,10 +839,16 @@ BREAKS = [
         ["TestDateIsGMT", "TestDateFromTheRealClock", "TestServeFile"],
     ),
     (
-        "the date is the host's local time under a field whose format ends in GMT",
-        '''		h2.Field{Name: "date", Value: h.now().UTC().Format(imfFixdate)},''',
-        '''		h2.Field{Name: "date", Value: h.now().Format(imfFixdate)},''',
+        "an error response's date is the host's local time under a field whose format ends in GMT",
+        '''	fields := append(h.fields(h.now().UTC(), status, kind, int64(len(body))), extra...)''',
+        '''	fields := append(h.fields(h.now(), status, kind, int64(len(body))), extra...)''',
         ["TestDateIsGMT"],
+    ),
+    (
+        "a file's date and validator are the host's local time under a format that ends in GMT",
+        """	now := h.now().UTC()""",
+        """	now := h.now()""",
+        ["TestDateIsGMT", "TestServeFile"],
     ),
     (
         "the date's day is not padded, so it is a narrower field for nine days of every month",
@@ -802,6 +870,361 @@ BREAKS = [
         """	)
 	return fields""",
         ["TestServeFile", "TestServeMissingFile"],
+    ),
+    # --- conditional.go: which of the four steps decides ---------------------
+    (
+        "one if-match line is ignored, so the field only works when it is sent twice",
+        """	if value, lines := lookup(r.Fields, fieldIfMatch); lines > 0 {""",
+        """	if value, lines := lookup(r.Fields, fieldIfMatch); lines > 1 {""",
+        ["TestEvaluateFollowsSectionOrder", "TestServePreconditionFailedIsAnOrdinaryError"],
+    ),
+    (
+        "two if-match lines are read as a wildcard, which 13.1.1 says a list holding one is not",
+        '''		if lines > 1 || value != "*" {''',
+        '''		if value != "*" {''',
+        ["TestEvaluateIgnoresRepeatedFieldLines"],
+    ),
+    (
+        "any if-match value that is not empty is a wildcard, so no entity tag can fail",
+        '''		if lines > 1 || value != "*" {''',
+        '''		if lines > 1 || value == "" {''',
+        ["TestEvaluateFollowsSectionOrder", "TestEvaluateWithoutAValidator"],
+    ),
+    (
+        "step 2 runs even when if-match is present, which 13.1.4 says to ignore it for",
+        '''	if value, lines := lookup(r.Fields, fieldIfMatch); lines > 0 {
+		if lines > 1 || value != "*" {
+			return verdictFailed
+		}
+	} else if date, ok := condDate(r, fieldIfUnmodifiedSince, mod, now); ok && mod.After(date) {''',
+        '''	if value, lines := lookup(r.Fields, fieldIfMatch); lines > 0 {
+		if lines > 1 || value != "*" {
+			return verdictFailed
+		}
+	}
+	if date, ok := condDate(r, fieldIfUnmodifiedSince, mod, now); ok && mod.After(date) {''',
+        ["TestEvaluateFollowsSectionOrder"],
+    ),
+    (
+        "if-unmodified-since is inverted, so the lost-update guard fires on the files it protects",
+        """	} else if date, ok := condDate(r, fieldIfUnmodifiedSince, mod, now); ok && mod.After(date) {""",
+        """	} else if date, ok := condDate(r, fieldIfUnmodifiedSince, mod, now); ok && !mod.After(date) {""",
+        [
+            "TestEvaluateFollowsSectionOrder",
+            "TestServeIfUnmodifiedSinceGuardsAgainstAnEditRace",
+        ],
+    ),
+    (
+        "if-unmodified-since fails on the second it names, which is a second it permits",
+        """	} else if date, ok := condDate(r, fieldIfUnmodifiedSince, mod, now); ok && mod.After(date) {""",
+        """	} else if date, ok := condDate(r, fieldIfUnmodifiedSince, mod, now); ok && !mod.Before(date) {""",
+        [
+            "TestEvaluateFollowsSectionOrder",
+            "TestServeIfUnmodifiedSinceGuardsAgainstAnEditRace",
+        ],
+    ),
+    (
+        "two if-none-match lines are read as a wildcard, so a repeated field line is a 304",
+        '''		if lines == 1 && value == "*" {''',
+        '''		if lines >= 1 && value == "*" {''',
+        ["TestEvaluateIgnoresRepeatedFieldLines"],
+    ),
+    (
+        "a list of entity tags falls through to step 4, which 13.1.3 says to ignore it for",
+        """		return verdictSend
+	}""",
+        """	}""",
+        ["TestEvaluateFollowsSectionOrder"],
+    ),
+    (
+        "if-modified-since is inverted, so every cache hit transfers and every miss is a 304",
+        """	if date, ok := condDate(r, fieldIfModifiedSince, mod, now); ok && !mod.After(date) {""",
+        """	if date, ok := condDate(r, fieldIfModifiedSince, mod, now); ok && mod.After(date) {""",
+        ["TestEvaluateFollowsSectionOrder", "TestServeConditionalRoundTrip"],
+    ),
+    (
+        "if-modified-since transfers on the second it names, which is the ordinary cache hit",
+        """	if date, ok := condDate(r, fieldIfModifiedSince, mod, now); ok && !mod.After(date) {""",
+        """	if date, ok := condDate(r, fieldIfModifiedSince, mod, now); ok && mod.Before(date) {""",
+        ["TestEvaluateFollowsSectionOrder", "TestServeConditionalRoundTrip"],
+    ),
+    (
+        "a date is compared against a file that has no modification time to compare it to",
+        """	if mod.IsZero() {
+		return time.Time{}, false
+	}
+	value, lines := lookup(r.Fields, name)""",
+        """	value, lines := lookup(r.Fields, name)""",
+        ["TestEvaluateWithoutAValidator"],
+    ),
+    (
+        "a repeated date field is acted on rather than ignored, using the last line sent",
+        """	if lines != 1 {
+		return time.Time{}, false
+	}""",
+        """	if lines < 1 {
+		return time.Time{}, false
+	}""",
+        ["TestEvaluateIgnoresRepeatedFieldLines"],
+    ),
+    (
+        "the century arithmetic is handed no clock, so a two-digit year lands in the first century",
+        """	return parseHTTPDate(value, now)""",
+        """	return parseHTTPDate(value, time.Time{})""",
+        ["TestServeIfUnmodifiedSinceGuardsAgainstAnEditRace"],
+    ),
+    (
+        "repeated field lines are counted as one, which is what makes a list look like a value",
+        """			value, lines = f.Value, lines+1""",
+        """			value, lines = f.Value, 1""",
+        ["TestLookupCountsLinesAndTakesTheLast", "TestEvaluateIgnoresRepeatedFieldLines"],
+    ),
+    (
+        "a repeated name yields the first line rather than the last",
+        """		if f.Name == name {
+			value, lines = f.Value, lines+1
+		}""",
+        """		if f.Name == name {
+			if lines == 0 {
+				value = f.Value
+			}
+			lines++
+		}""",
+        ["TestLookupCountsLinesAndTakesTheLast"],
+    ),
+    (
+        "if-match is spelled with the capitals HTTP/1.1 used, which no HTTP/2 field name has",
+        '''	fieldIfMatch           = "if-match"''',
+        '''	fieldIfMatch           = "If-Match"''',
+        ["TestPreconditionFieldNamesAreTheWireNames"],
+    ),
+    (
+        "if-none-match is misspelled, so the field a browser revalidates with is never seen",
+        '''	fieldIfNoneMatch       = "if-none-match"''',
+        '''	fieldIfNoneMatch       = "if-nonematch"''',
+        ["TestPreconditionFieldNamesAreTheWireNames"],
+    ),
+    (
+        "if-modified-since is misspelled, so no conditional GET is ever answered with a 304",
+        '''	fieldIfModifiedSince   = "if-modified-since"''',
+        '''	fieldIfModifiedSince   = "if-modified"''',
+        ["TestPreconditionFieldNamesAreTheWireNames"],
+    ),
+    (
+        "if-unmodified-since is spelled as if-modified-since, so one field answers both questions",
+        '''	fieldIfUnmodifiedSince = "if-unmodified-since"''',
+        '''	fieldIfUnmodifiedSince = "if-modified-since"''',
+        ["TestPreconditionFieldNamesAreTheWireNames"],
+    ),
+    # --- conditional.go: the validator ---------------------------------------
+    (
+        "the validator keeps a fraction of a second the field it is published in cannot carry",
+        """	mod = mod.UTC().Truncate(time.Second)""",
+        """	mod = mod.UTC()""",
+        ["TestModTimeTruncatesToTheSecond"],
+    ),
+    (
+        "the validator stays in the filesystem's zone under a format that ends in GMT",
+        """	mod = mod.UTC().Truncate(time.Second)""",
+        """	mod = mod.Truncate(time.Second)""",
+        ["TestModTimeConvertsToUTC"],
+    ),
+    (
+        "a file stamped in the future is published unclamped, which 8.8.2.1 forbids",
+        """	if origin := now.Truncate(time.Second); mod.After(origin) {
+		return origin
+	}
+	return mod""",
+        """	return mod""",
+        ["TestModTimeClampsAFutureFile", "TestServeClampsAFileFromTheFuture"],
+    ),
+    (
+        "the date that replaces a future timestamp keeps the fraction the real clock has",
+        """	if origin := now.Truncate(time.Second); mod.After(origin) {""",
+        """	if origin := now; mod.After(origin) {""",
+        ["TestModTimeClampsAFutureFile"],
+    ),
+    (
+        "a file with no modification time is given one: the first of January, year one",
+        """	if mod.IsZero() {
+		return fields
+	}
+""",
+        "",
+        [
+            "TestWithValidatorLeavesTheFieldOutWhenThereIsNone",
+            "TestServeNotModifiedWithoutAValidator",
+        ],
+    ),
+    (
+        "the validator is sent under a name no cache revalidates against",
+        '''	return append(fields, h2.Field{Name: "last-modified", Value: mod.Format(imfFixdate)})''',
+        '''	return append(fields, h2.Field{Name: "last-modified-at", Value: mod.Format(imfFixdate)})''',
+        [
+            "TestWithValidatorLeavesTheFieldOutWhenThereIsNone",
+            "TestServeNotModifiedIsTheWholeFieldSet",
+        ],
+    ),
+    # --- conditional.go: the three formats ------------------------------------
+    (
+        "the one format 5.6.7 requires a sender to generate is not one this parser accepts",
+        """	if t, err := time.Parse(imfFixdate, s); err == nil {
+		return t, true
+	}
+""",
+        "",
+        ["TestParseHTTPDateAcceptsAllThreeFormats", "TestServeConditionalRoundTrip"],
+    ),
+    (
+        "the rfc850 format is refused, which 5.6.7 makes a MUST to accept",
+        """	if t, err := time.Parse(rfc850Date, s); err == nil {
+		return slideCentury(t, now)
+	}
+""",
+        "",
+        [
+            "TestParseHTTPDateAcceptsAllThreeFormats",
+            "TestSlideCenturyFollowsTheFiftyYearRule",
+        ],
+    ),
+    (
+        "the asctime layout is never tried, so the third of the three formats is refused",
+        """	if t, err := time.Parse(asctimeDate, s); err == nil {""",
+        """	if t, err := time.Parse(rfc850Date, s); err == nil {""",
+        [
+            "TestParseHTTPDateAcceptsAllThreeFormats",
+            "TestParseHTTPDateIsRobustWhereItSaysItIs",
+        ],
+    ),
+    (
+        "the rfc850 day name is the abbreviation, which is the one thing that format does not use",
+        '''	rfc850Date  = "Monday, 02-Jan-06 15:04:05 GMT"''',
+        '''	rfc850Date  = "Mon, 02-Jan-06 15:04:05 GMT"''',
+        [
+            "TestParseHTTPDateAcceptsAllThreeFormats",
+            "TestSlideCenturyFollowsTheFiftyYearRule",
+        ],
+    ),
+    (
+        "the leap-second retry looks at the first colon, which is the hour",
+        """	i := strings.LastIndexByte(s, ':')""",
+        """	i := strings.IndexByte(s, ':')""",
+        [
+            "TestLeapSecondRetryCannotAlterAValidDate",
+            "TestParseHTTPDateRefusesWhatIsNotADate",
+        ],
+    ),
+    (
+        "the retry indexes two octets past a value that may not have them",
+        '''	if i < 0 || i+3 > len(s) || s[i+1:i+3] != "60" {''',
+        '''	if i < 0 || s[i+1:i+3] != "60" {''',
+        ["TestLeapSecondRetryCannotAlterAValidDate"],
+    ),
+    (
+        "the rewritten value loses everything after the seconds, including the zone",
+        '''	return s[:i+1] + "59" + s[i+3:], true''',
+        '''	return s[:i+1] + "59", true''',
+        [
+            "TestParseHTTPDateTakesTheLeapSecond",
+            "TestLeapSecondRetryCannotAlterAValidDate",
+        ],
+    ),
+    (
+        "the leap second is retried as the first second of its minute rather than the last",
+        '''	return s[:i+1] + "59" + s[i+3:], true''',
+        '''	return s[:i+1] + "00" + s[i+3:], true''',
+        [
+            "TestParseHTTPDateTakesTheLeapSecond",
+            "TestLeapSecondRetryCannotAlterAValidDate",
+        ],
+    ),
+    (
+        "the second taken off for the retry is never added back, so 08:49:60 is 08:49:59",
+        """			return t.Add(time.Second), true""",
+        """			return t, true""",
+        ["TestParseHTTPDateTakesTheLeapSecond"],
+    ),
+    (
+        "the two-digit year is Go's fixed table rather than 5.6.7's fifty-year rule",
+        """	year := now.Year() - now.Year()%100 + t.Year()%100""",
+        """	year := t.Year()""",
+        ["TestSlideCenturyFollowsTheFiftyYearRule"],
+    ),
+    (
+        "a year exactly fifty ahead is read as fifty in the past, which is one year too eager",
+        """	if year-now.Year() > 50 {""",
+        """	if year-now.Year() >= 50 {""",
+        ["TestSlideCenturyFollowsTheFiftyYearRule"],
+    ),
+    (
+        "nothing slides a far-future year back, so 5.6.7's rule is quoted and not applied",
+        """	if year-now.Year() > 50 {
+		year -= 100
+	}
+""",
+        "",
+        ["TestSlideCenturyFollowsTheFiftyYearRule"],
+    ),
+    (
+        "the slid date is not checked against its new century, so 29 February becomes 1 March",
+        """	if slid.Month() != t.Month() || slid.Day() != t.Day() {
+		return time.Time{}, false
+	}
+""",
+        "",
+        ["TestSlideCenturyRefusesADayThatTheCenturyDoesNotHave"],
+    ),
+    (
+        "the slid date is built in the host's zone, so a parsed date is not the instant it names",
+        """	slid := time.Date(year, t.Month(), t.Day(), t.Hour(), t.Minute(), t.Second(), 0, time.UTC)""",
+        """	slid := time.Date(year, t.Month(), t.Day(), t.Hour(), t.Minute(), t.Second(), 0, time.Local)""",
+        ["TestParseHTTPDateAcceptsAllThreeFormats"],
+    ),
+    # --- static.go: the two conditional responses ----------------------------
+    (
+        "the 304 declares a content-length, which 15.4.5 argues against carrying",
+        '''	return w.WriteBodylessHeader(withValidator(h.fields(now, status304, "", noContentLength), mod))''',
+        '''	return w.WriteBodylessHeader(withValidator(h.fields(now, status304, "", 0), mod))''',
+        ["TestServeNotModifiedIsTheWholeFieldSet", "TestServeConditionalOnAnEmptyFile"],
+    ),
+    (
+        "the 304 leaves the stream open, so a peer waits for content 15.4.5 forbids sending",
+        '''	return w.WriteBodylessHeader(withValidator(h.fields(now, status304, "", noContentLength), mod))''',
+        '''	return w.WriteHeader(withValidator(h.fields(now, status304, "", noContentLength), mod))''',
+        ["TestServeNotModifiedCarriesNothing", "TestServeNotModifiedWithoutAValidator"],
+    ),
+    (
+        "the two verdicts are answered with each other's response",
+        """	case verdictNotModified:
+		return h.notModified(w, now, mod)
+	case verdictFailed:
+		return h.answer(w, r, status412, textPlain, body412)""",
+        """	case verdictNotModified:
+		return h.answer(w, r, status412, textPlain, body412)
+	case verdictFailed:
+		return h.notModified(w, now, mod)""",
+        [
+            "TestServeNotModifiedCarriesNothing",
+            "TestServePreconditionFailedIsAnOrdinaryError",
+        ],
+    ),
+    (
+        "the preconditions are evaluated and the answer is thrown away",
+        """	switch evaluate(r, mod, now) {
+	case verdictNotModified:
+		return h.notModified(w, now, mod)
+	case verdictFailed:
+		return h.answer(w, r, status412, textPlain, body412)
+	}
+""",
+        "",
+        ["TestServeConditionalRoundTrip", "TestServeNotModifiedCarriesNothing"],
+    ),
+    (
+        "a 200 carries no validator, so there is nothing for a peer to send back",
+        """	return h.file(w, r, f, info.Size(), mediaType(name), now, mod)""",
+        """	return h.file(w, r, f, info.Size(), mediaType(name), now, time.Time{})""",
+        ["TestServeValidatorIsTheFileOnDisk", "TestServeConditionalRoundTrip"],
     ),
 ]
 

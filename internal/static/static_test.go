@@ -87,6 +87,15 @@ var clock = time.Date(2026, time.August, 9, 14, 5, 9, 0, time.FixedZone("+0530",
 // and 9 August 2026 is a Sunday.
 const clockField = "Sun, 09 Aug 2026 08:35:09 GMT"
 
+// fileTime is the modification time tree gives every file it writes, so that a
+// last-modified is a fixed string in this file rather than whatever the disk happened to
+// record. Well before clock, because the clamp in modTime replaces a future one with the
+// response's own date and would hide the field it is supposed to be checking.
+var fileTime = time.Date(2026, time.July, 4, 11, 22, 33, 0, time.UTC)
+
+// fileTimeField is fileTime as an IMF-fixdate. 4 July 2026 is a Saturday.
+const fileTimeField = "Sat, 04 Jul 2026 11:22:33 GMT"
+
 // newHandler serves a temporary directory holding files. A key ending in "/" is an empty
 // directory; every other key is a file with that content, and its parents are created.
 func newHandler(t *testing.T, files map[string]string) *Handler {
@@ -111,6 +120,13 @@ func tree(t *testing.T, files map[string]string) string {
 		}
 		if err := os.WriteFile(full, []byte(content), 0o644); err != nil {
 			t.Fatalf("writing %q: %v", name, err)
+		}
+
+		// Both times, because Chtimes cannot set one without the other and this package
+		// never reads the access time. A zero value means "leave it alone", so the write's
+		// own timestamps are what would survive — the thing this call exists to replace.
+		if err := os.Chtimes(full, fileTime, fileTime); err != nil {
+			t.Fatalf("setting the modification time of %q: %v", name, err)
 		}
 	}
 	return dir
@@ -188,17 +204,35 @@ func serveWith(t *testing.T, h *Handler, method, target string, out *collector, 
 // rather than a silent pass if that ever stops being true.
 func req(t *testing.T, method, target string) *exchange.Request {
 	t.Helper()
-	r, err := request.Parse(1, []h2.Field{
+	return reqWith(t, method, target)
+}
+
+// reqWith is req with regular field lines after the pseudo-header fields, which is where
+// §8.3 requires them and so the only place a precondition can be tested from.
+func reqWith(t *testing.T, method, target string, extra ...h2.Field) *exchange.Request {
+	t.Helper()
+	fields := append([]h2.Field{
 		{Name: ":method", Value: method},
 		{Name: ":scheme", Value: "https"},
 		{Name: ":authority", Value: "zdh.test"},
 		{Name: ":path", Value: target},
-	}, true)
+	}, extra...)
+
+	r, err := request.Parse(1, fields, true)
 	if err != nil {
 		t.Fatalf("internal/request refused %s %.60q, so no peer could have sent it: %v",
 			method, target, err)
 	}
 	return &exchange.Request{Request: r}
+}
+
+// serveCond is serve with preconditions on the request.
+func serveCond(t *testing.T, h *Handler, method, target string, extra ...h2.Field) *answer {
+	t.Helper()
+	out := &collector{max: limits.MaxFrameSize}
+	w := response.NewWriter(response.NewEncoder(hpack.New(), out), &grants{}, 1)
+	err := h.serve(w, reqWith(t, method, target, extra...))
+	return read(t, out, err)
 }
 
 // read decodes the collected frames into the response they carry, and holds the sequence
@@ -291,7 +325,8 @@ func assertFields(t *testing.T, a *answer, want []h2.Field) {
 	}
 }
 
-// ok is the header section of a 200, which is four fields and a content-type.
+// ok is the header section of a 200 on a file tree wrote: five fields and the validator,
+// in the order the encoder receives them.
 func ok(kind string, length int) []h2.Field {
 	return []h2.Field{
 		{Name: ":status", Value: status200},
@@ -299,6 +334,7 @@ func ok(kind string, length int) []h2.Field {
 		{Name: "content-type", Value: kind},
 		{Name: "date", Value: clockField},
 		{Name: "server", Value: serverName},
+		{Name: "last-modified", Value: fileTimeField},
 	}
 }
 
@@ -961,7 +997,7 @@ func TestFileGrewIsSentAsDeclared(t *testing.T) {
 
 	out := &collector{max: limits.MaxFrameSize}
 	w := response.NewWriter(response.NewEncoder(hpack.New(), out), &grants{}, 1)
-	err = h.file(w, req(t, methodGet, "/a.txt"), f, info.Size(), textPlain)
+	err = h.file(w, req(t, methodGet, "/a.txt"), f, info.Size(), textPlain, clock.UTC(), fileTime)
 	a := read(t, out, err)
 
 	if a.err != nil {
@@ -996,7 +1032,7 @@ func TestFileShrankEndsTheStreamFirst(t *testing.T) {
 
 	out := &collector{max: limits.MaxFrameSize}
 	w := response.NewWriter(response.NewEncoder(hpack.New(), out), &grants{}, 1)
-	err = h.file(w, req(t, methodGet, "/a.txt"), f, int64(len(body))+10, textPlain)
+	err = h.file(w, req(t, methodGet, "/a.txt"), f, int64(len(body))+10, textPlain, clock.UTC(), fileTime)
 	a := read(t, out, err)
 
 	if !errors.Is(a.err, errFileChanged) {
@@ -1071,15 +1107,18 @@ func TestDateFromTheRealClock(t *testing.T) {
 	}
 }
 
-// TestNoValidatorsAndNoRanges is the scope in the package documentation, asserted as the
-// absence it is. Each of these fields is a promise this handler does not keep: an ETag or a
-// last-modified invites the conditional request it cannot evaluate, and an accept-ranges
+// TestNoEntityTagAndNoRanges is the scope in the package documentation, asserted as the
+// absence it is. Each of these fields is a promise this handler does not keep: an ETag
+// invites the comparison against a strong validator it does not have, and an accept-ranges
 // invites the range request it ignores.
-func TestNoValidatorsAndNoRanges(t *testing.T) {
+//
+// last-modified is not in the list any more — it is the one validator this handler does
+// send — and TestValidatorOnlyWhereThereIsARepresentation is where it belongs instead.
+func TestNoEntityTagAndNoRanges(t *testing.T) {
 	h := newHandler(t, map[string]string{"index.html": page, "docs/index.html": page})
 
 	unsent := []string{
-		"etag", "last-modified", "accept-ranges", "content-range",
+		"etag", "accept-ranges", "content-range",
 		"cache-control", "expires", "age", "vary", "content-encoding",
 		"transfer-encoding", "connection", "keep-alive", "upgrade",
 	}
@@ -1091,12 +1130,62 @@ func TestNoValidatorsAndNoRanges(t *testing.T) {
 		{methodGet, "/missing"},
 		{"POST", "/index.html"},
 	} {
-		a := serve(t, h, c.method, c.target)
+		a := serveCond(t, h, c.method, c.target, h2.Field{Name: fieldIfNoneMatch, Value: `"x"`})
 		for _, name := range unsent {
 			if v := a.get(name); v != "" {
 				t.Errorf("%s %q sent %s: %q", c.method, c.target, name, v)
 			}
 		}
+	}
+}
+
+// TestValidatorOnlyWhereThereIsARepresentation is which responses carry the last-modified and
+// which do not. §8.8.2.1 of RFC 9110: "An origin server SHOULD send Last-Modified for any
+// selected representation for which a last modification date can be reasonably and consistently
+// determined".
+//
+// On the answers below there is no selected representation: a 404 and a 405 describe no file at
+// all, a 301 describes where one would be found, a 414 refused to look, and a 412 is the refusal
+// §15.5.13 of RFC 9110 defines. A validator on any of them would be a modification time for a
+// representation the peer was not given.
+func TestValidatorOnlyWhereThereIsARepresentation(t *testing.T) {
+	h := newHandler(t, map[string]string{"index.html": page, "docs/index.html": page})
+
+	for _, c := range []struct {
+		method, target string
+		status         string
+		want           bool
+	}{
+		{methodGet, "/index.html", status200, true},
+		{methodHead, "/index.html", status200, true},
+		{methodGet, "/docs/", status200, true},
+		{methodGet, "/docs", status301, false},
+		{methodGet, "/missing", status404, false},
+		{"POST", "/index.html", status405, false},
+		{methodGet, "/" + strings.Repeat("a", MaxTargetLength), status414, false},
+	} {
+		a := serve(t, h, c.method, c.target)
+		if a.status() != c.status {
+			t.Errorf("%s %q answered %s, want %s", c.method, c.target, a.status(), c.status)
+			continue
+		}
+		got := a.get("last-modified")
+		switch {
+		case c.want && got != fileTimeField:
+			t.Errorf("%s %q last-modified = %q, want %q", c.method, c.target, got, fileTimeField)
+		case !c.want && got != "":
+			t.Errorf("%s %q sent last-modified %q on a %s", c.method, c.target, got, c.status)
+		}
+	}
+
+	// The 412 separately, because it is the one status here that needs a request to
+	// produce and the only one that is reached with a representation in hand.
+	a := serveCond(t, h, methodGet, "/index.html", h2.Field{Name: fieldIfMatch, Value: `"x"`})
+	if a.status() != status412 {
+		t.Fatalf("a failed if-match answered %s, want %s", a.status(), status412)
+	}
+	if got := a.get("last-modified"); got != "" {
+		t.Errorf("the 412 sent last-modified %q", got)
 	}
 }
 

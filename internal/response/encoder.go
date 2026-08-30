@@ -109,9 +109,11 @@ var ErrHeaderListTooLarge = errors.New("response: header list exceeds the peer's
 // two stream goroutines could encode blocks A then B, be descheduled, and enqueue B
 // then A, at which point every reference A made to the dynamic table means something
 // different than it did when we wrote it. The symptom is not a failed response but
-// header fields nobody sent, on every later request of the connection, which is why
-// §4.3 of RFC 7541 states the requirement as being about a decoder processing blocks
-// "in the same order in which they were encoded".
+// header fields nobody sent, on every later request of the connection. There is one
+// table for all of it, per §4.3.1: "Each endpoint has an HPACK encoder context and an
+// HPACK decoder context that are used for encoding and decoding all field blocks on a
+// connection." Every stream's fields go through the state this mutex guards, so the
+// order this mutex imposes is the order the peer's decoder will replay.
 //
 // §4.3 adds a second reason on top of the first, and it applies even to a connection
 // with one stream: a field block "MUST be transmitted as a contiguous sequence of
