@@ -647,6 +647,13 @@ func TestRangeInvalidIsIgnored(t *testing.T) {
 		"bytes=0-1,abc",
 		"bytes=0-1,abc,2-3",
 		"bytes=0-1,,,9-5",
+
+		// No separator at all, so there is neither an int-range nor a suffix-range: the
+		// grammar has no production a bare numeral fits. Worth pinning because a parser
+		// that read one as a first-pos with an absent last-pos would answer a 206 for
+		// the remainder of the file and look entirely reasonable doing it.
+		"bytes=5",
+		"bytes=0",
 	} {
 		a := rangeGet(t, h, "/"+filmName, value)
 		if a.err != nil {
