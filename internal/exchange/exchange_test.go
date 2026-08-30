@@ -75,16 +75,19 @@ func (c *collector) fail(err error) {
 	c.err = err
 }
 
-// reports records the finished responses this package hands back to the stream table,
-// and hands them on to the real table underneath.
+// reports records what this package hands back to the stream table — the finished
+// responses and the request content its handlers have read — and hands both on to the
+// real table underneath.
 //
 // Both halves matter. The record is what a test asserts on; the forwarding is what makes
-// the table's state machine and its §5.1.2 concurrency limit behave as they would on a
-// connection, so a test about a slot being freed is testing the real path.
+// the table's state machine, its §5.1.2 concurrency limit and its receive windows behave
+// as they would on a connection, so a test about a slot being freed or a window being
+// credited is testing the real path.
 type reports struct {
-	mu  sync.Mutex
-	ids []uint32
-	tab *stream.Table
+	mu       sync.Mutex
+	ids      []uint32
+	consumed []consumed
+	tab      *stream.Table
 }
 
 func (r *reports) ReportSendEnd(id uint32) {
@@ -96,6 +99,31 @@ func (r *reports) ReportSendEnd(id uint32) {
 	if tab != nil {
 		tab.ReportSendEnd(id)
 	}
+}
+
+func (r *reports) ReportConsumed(id uint32, n int, more bool) {
+	r.mu.Lock()
+	r.consumed = append(r.consumed, consumed{id: id, n: n, more: more})
+	tab := r.tab
+	r.mu.Unlock()
+
+	if tab != nil {
+		tab.ReportConsumed(id, n, more)
+	}
+}
+
+// credited is how many octets of content the handlers on stream id have reported reading.
+func (r *reports) credited(id uint32) int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	var n int
+	for _, c := range r.consumed {
+		if c.id == id {
+			n += c.n
+		}
+	}
+	return n
 }
 
 func (r *reports) all() []uint32 {
@@ -197,6 +225,7 @@ func build(t *testing.T, h Handler, logs *safeBuf, lg *log.Logger) *harness {
 		Requests: reqs,
 		Encoder:  enc,
 		Sender:   sender,
+		Writer:   out,
 	})
 	rep.tab = tab
 	reqs.Attach(rep)
@@ -1286,5 +1315,64 @@ func TestManyStreamsAtOnce(t *testing.T) {
 	}
 	if n := len(h.reqs.arriving); n != 0 {
 		t.Errorf("%d requests are still recorded as arriving after all %d finished, want 0", n, streams)
+	}
+}
+
+// --- returning receive-window credit ----------------------------------------
+
+// TestContentAHandlerReadsIsReportedToTheTable pins the wiring between the two halves of
+// this package and the stream table above them.
+//
+// The Body knows how many octets a handler took; only the table can turn that into the
+// WINDOW_UPDATE the peer is waiting for. What is easy to get wrong in between is the
+// stream identifier — a report is one uint32 and there are three streams here, so a body
+// built with the wrong one would return credit on somebody else's window and stall the
+// upload it belonged to while inflating a window nobody was spending.
+func TestContentAHandlerReadsIsReportedToTheTable(t *testing.T) {
+	read := make(chan int, 1)
+	h := newHarness(t, handlerFunc(func(w *response.Writer, r *Request) {
+		n, err := io.Copy(io.Discard, r.Body)
+		if err != nil {
+			t.Errorf("the handler could not read its body: %v", err)
+		}
+		read <- int(n)
+		_ = w.WriteBodylessHeader([]h2.Field{{Name: ":status", Value: "204"}})
+	}))
+
+	// Three uploads at once, so that a report naming the wrong stream is visible as a
+	// wrong total rather than only as a wrong sum.
+	const body = "the content of one upload"
+	for _, id := range []uint32{1, 3, 5} {
+		h.post(id)
+		h.mustSend(h.data(id, body, true))
+	}
+	for range 3 {
+		if got := <-read; got != len(body) {
+			t.Fatalf("a handler read %d octets, want %d", got, len(body))
+		}
+	}
+	for _, id := range []uint32{1, 3, 5} {
+		h.waitSent(id)
+		if got, want := h.rep.credited(id), len(body); got != want {
+			t.Errorf("stream %d reported %d octets of content consumed, want %d", id, got, want)
+		}
+	}
+}
+
+// TestAHandlerThatReadsNothingReturnsNoCredit.
+//
+// A handler is not obliged to read the request body — a 405 for a POST is the commonest
+// case in this server, and internal/static answers one without looking at the content.
+// The octets it did not read are octets the peer's window stays short of, which is
+// correct: returning credit for content nobody consumed is how a bound stops being one.
+func TestAHandlerThatReadsNothingReturnsNoCredit(t *testing.T) {
+	h := newHarness(t, serve200("answered without reading the body"))
+
+	h.post(1)
+	h.mustSend(h.data(1, "content the handler will never look at", true))
+	h.waitSent(1)
+
+	if got := h.rep.credited(1); got != 0 {
+		t.Errorf("a handler that read nothing reported %d octets consumed, want 0", got)
 	}
 }

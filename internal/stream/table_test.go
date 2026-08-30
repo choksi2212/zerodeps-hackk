@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -193,6 +194,61 @@ func (r *recorder) String() string {
 	return "[" + strings.Join(out, " ") + "]"
 }
 
+// testWriter stands in for the connection's frame writer, which this table reaches for
+// exactly one thing: the WINDOW_UPDATE that returns receive-window credit (§6.9).
+//
+// Locked, because that frame is enqueued from a handler's goroutine — that is the whole
+// reason Table.ReportConsumed exists — so a test reading the frames back is racing the
+// goroutine that wrote them by design, not by accident.
+type testWriter struct {
+	mu     sync.Mutex
+	frames []frame.Frame
+	err    error
+}
+
+func (w *testWriter) Enqueue(f frame.Frame) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.err != nil {
+		return w.err
+	}
+	w.frames = append(w.frames, f)
+	return nil
+}
+
+// fail makes every later Enqueue return err, which is what a connection whose write half
+// has finished looks like from a handler's goroutine.
+func (w *testWriter) fail(err error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.err = err
+}
+
+// updates is every WINDOW_UPDATE enqueued so far, in order.
+func (w *testWriter) updates() []frame.WindowUpdateFrame {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	var out []frame.WindowUpdateFrame
+	for _, f := range w.frames {
+		if u, ok := f.(frame.WindowUpdateFrame); ok {
+			out = append(out, u)
+		}
+	}
+	return out
+}
+
+// credit is the total increment enqueued for stream id, where 0 is the connection.
+func (w *testWriter) credit(id uint32) uint32 {
+	var n uint32
+	for _, u := range w.updates() {
+		if u.StreamID == id {
+			n += u.Increment
+		}
+	}
+	return n
+}
+
 // testClock is the RST_STREAM rate limit's clock.
 //
 // A fixed instant rather than time.Now, so that a test about a token bucket is a
@@ -215,6 +271,7 @@ type harness struct {
 	codec *testCodec
 	enc   *testEncoder
 	reqs  *recorder
+	w     *testWriter
 	clock *testClock
 }
 
@@ -225,6 +282,7 @@ func newHarness(t *testing.T, cfg Config) *harness {
 		codec: &testCodec{},
 		enc:   &testEncoder{},
 		reqs:  &recorder{},
+		w:     &testWriter{},
 		clock: newClock(),
 	}
 	if cfg.Codec == nil {
@@ -235,6 +293,9 @@ func newHarness(t *testing.T, cfg Config) *harness {
 	}
 	if cfg.Encoder == nil {
 		cfg.Encoder = h.enc
+	}
+	if cfg.Writer == nil {
+		cfg.Writer = h.w
 	}
 	if cfg.Now == nil {
 		cfg.Now = h.clock.now
@@ -445,28 +506,34 @@ func (h *harness) assertBlocks(want ...string) {
 
 // --- construction ----------------------------------------------------------
 
-// The three tests below each leave out one required field and supply the other two.
+// The four tests below each leave out one required field and supply the other three.
 //
-// Supplying the others is what makes them separate tests rather than three copies of
+// Supplying the others is what makes them separate tests rather than four copies of
 // one: assertPanics only reports whether a panic happened, so a Config missing two
 // fields panics for the first reason New checks and says nothing about the second. A
 // guard that had been dropped would still be covered by whichever guard came before it.
 
 func TestNewPanicsWithoutACodec(t *testing.T) {
 	assertPanics(t, "New with no codec", func() {
-		New(Config{Requests: &recorder{}, Encoder: &testEncoder{}})
+		New(Config{Requests: &recorder{}, Encoder: &testEncoder{}, Writer: &testWriter{}})
 	})
 }
 
 func TestNewPanicsWithoutRequests(t *testing.T) {
 	assertPanics(t, "New with no Requests", func() {
-		New(Config{Codec: &testCodec{}, Encoder: &testEncoder{}})
+		New(Config{Codec: &testCodec{}, Encoder: &testEncoder{}, Writer: &testWriter{}})
 	})
 }
 
 func TestNewPanicsWithoutAnEncoder(t *testing.T) {
 	assertPanics(t, "New with no Encoder", func() {
-		New(Config{Codec: &testCodec{}, Requests: &recorder{}})
+		New(Config{Codec: &testCodec{}, Requests: &recorder{}, Writer: &testWriter{}})
+	})
+}
+
+func TestNewPanicsWithoutAWriter(t *testing.T) {
+	assertPanics(t, "New with no Writer", func() {
+		New(Config{Codec: &testCodec{}, Requests: &recorder{}, Encoder: &testEncoder{}})
 	})
 }
 
@@ -510,7 +577,7 @@ func TestNewDefaultsTheClockToTimeNow(t *testing.T) {
 	// from it during New. A missing default is therefore not a wrong clock but a
 	// nil call in the constructor, which is why this is worth its own test rather
 	// than being left to the tests that inject one.
-	tab := New(Config{Codec: &testCodec{}, Requests: &recorder{}, Encoder: &testEncoder{}})
+	tab := New(Config{Codec: &testCodec{}, Requests: &recorder{}, Encoder: &testEncoder{}, Writer: &testWriter{}})
 	if err := tab.HandleFrame(request(1, false)); err != nil {
 		t.Fatalf("opening a stream on a table with the default clock: %v", err)
 	}
@@ -2326,5 +2393,278 @@ func TestTheResetFloodErrorNamesTheBurstItExceeded(t *testing.T) {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("the flood refusal reported %q, which does not mention %s", err, want)
 		}
+	}
+}
+
+// --- receive-window replenishment ------------------------------------------
+
+// TestReplenishThresholdIsHalfAWindow pins limits.ReplenishThreshold to the window it is
+// a fraction of.
+//
+// The constant is written out in internal/limits rather than derived, because that
+// package imports nothing — see its own comment. This is the other half of that
+// arrangement: a window size changed without the threshold, or the reverse, fails here
+// rather than becoming a server that sends a WINDOW_UPDATE per read or one per body.
+func TestReplenishThresholdIsHalfAWindow(t *testing.T) {
+	if got, want := limits.ReplenishThreshold, flow.InitialWindowSize/2; got != want {
+		t.Errorf("limits.ReplenishThreshold is %d, want half a window (%d)", got, want)
+	}
+}
+
+// TestReportConsumedHoldsCreditBackUntilTheThreshold is the frame-per-read case the
+// threshold exists to prevent.
+//
+// A handler reading a body in small pieces is the normal case, not a pathological one:
+// io.Copy uses a 32 KiB buffer and a JSON decoder much less. If every read put a
+// WINDOW_UPDATE on the wire, a peer sending full-size DATA frames would get two frames
+// back for each one it sent.
+func TestReportConsumedHoldsCreditBackUntilTheThreshold(t *testing.T) {
+	h := newHarness(t, Config{})
+	h.open(1, false)
+
+	// One octet short of the threshold, in pieces, and nothing has gone out.
+	for read := 0; read < limits.ReplenishThreshold-1; {
+		n := min(1000, limits.ReplenishThreshold-1-read)
+		h.tab.ReportConsumed(1, n, true)
+		read += n
+	}
+	if got := h.w.updates(); len(got) != 0 {
+		t.Fatalf("reporting %d octets sent %d WINDOW_UPDATEs, want none before the threshold",
+			limits.ReplenishThreshold-1, len(got))
+	}
+
+	// The octet that reaches it flushes both windows at once.
+	h.tab.ReportConsumed(1, 1, true)
+	if got, want := h.w.credit(0), uint32(limits.ReplenishThreshold); got != want {
+		t.Errorf("the connection was credited %d octets, want %d", got, want)
+	}
+	if got, want := h.w.credit(1), uint32(limits.ReplenishThreshold); got != want {
+		t.Errorf("stream 1 was credited %d octets, want %d", got, want)
+	}
+}
+
+// TestReportConsumedCreditsTheConnectionBeforeTheStream pins the order the two frames go
+// out in.
+//
+// It is not arbitrary. The connection's window is shared by every stream on it, so a
+// peer holding several uploads is unblocked by that frame and only then by this stream's
+// — and on a connection whose write half is closing, the connection's is the one worth
+// having got out.
+func TestReportConsumedCreditsTheConnectionBeforeTheStream(t *testing.T) {
+	h := newHarness(t, Config{})
+	h.open(1, false)
+	h.tab.ReportConsumed(1, limits.ReplenishThreshold, true)
+
+	got := h.w.updates()
+	if len(got) != 2 {
+		t.Fatalf("reporting a threshold's worth sent %d WINDOW_UPDATEs, want 2: %v", len(got), got)
+	}
+	if got[0].StreamID != 0 {
+		t.Errorf("the first WINDOW_UPDATE named stream %d, want the connection (0)", got[0].StreamID)
+	}
+	if got[1].StreamID != 1 {
+		t.Errorf("the second WINDOW_UPDATE named stream %d, want 1", got[1].StreamID)
+	}
+}
+
+// TestReportConsumedCreditsOnlyTheConnectionForAFinishedStream is the case that keeps a
+// frame off the wire.
+//
+// A handler that has read the last of a body has no use for stream credit — the peer
+// will not send more on it — but the connection's window is still short those octets, and
+// every other stream on the connection is spending it.
+func TestReportConsumedCreditsOnlyTheConnectionForAFinishedStream(t *testing.T) {
+	h := newHarness(t, Config{})
+	h.open(1, false)
+	h.tab.ReportConsumed(1, limits.ReplenishThreshold, false)
+
+	if got, want := h.w.credit(0), uint32(limits.ReplenishThreshold); got != want {
+		t.Errorf("the connection was credited %d octets, want %d", got, want)
+	}
+	if got := h.w.credit(1); got != 0 {
+		t.Errorf("stream 1 was credited %d octets, want none once its content is complete", got)
+	}
+}
+
+// TestReportConsumedIgnoresNothing is the empty read.
+//
+// io.Copy probes with a zero-length buffer and a Read at EOF returns nothing, while
+// §6.9.1 makes a WINDOW_UPDATE of 0 a PROTOCOL_ERROR — so a report of nothing has to
+// stop here rather than at the frame writer.
+func TestReportConsumedIgnoresNothing(t *testing.T) {
+	h := newHarness(t, Config{})
+	h.open(1, false)
+
+	h.tab.ReportConsumed(1, 0, true)
+	h.tab.ReportConsumed(1, -1, true)
+
+	if got := h.w.updates(); len(got) != 0 {
+		t.Errorf("reporting no content sent %d WINDOW_UPDATEs, want none: %v", len(got), got)
+	}
+}
+
+// TestReportedCreditReachesTheWindowsBeforeTheNextFrameIsJudged is the whole point of
+// draining at the top of HandleFrame, and the one ordering here that a correct peer's
+// traffic depends on.
+//
+// A WINDOW_UPDATE is a promise, and the peer may act on it the instant it arrives. So a
+// peer that spends its whole window, waits for credit, and then spends exactly what it
+// was granted must be accepted. It is only accepted if the credit reached the window
+// before the frame that spends it was measured.
+func TestReportedCreditReachesTheWindowsBeforeTheNextFrameIsJudged(t *testing.T) {
+	h := newHarness(t, Config{})
+	h.open(1, false)
+
+	// The peer spends every octet it was given, which leaves both windows empty.
+	for sent := 0; sent < flow.InitialWindowSize; {
+		n := min(limits.MaxFrameSize, flow.InitialWindowSize-sent)
+		h.mustSend(filler(1, n, false))
+		sent += n
+	}
+	if got := h.tab.RecvWindow().Available(); got != 0 {
+		t.Fatalf("the connection window has %d octets left after a full window was spent", got)
+	}
+
+	// The handler reads all of it, and the credit is advertised.
+	h.tab.ReportConsumed(1, flow.InitialWindowSize, true)
+	if got, want := h.w.credit(0), uint32(flow.InitialWindowSize); got != want {
+		t.Fatalf("the peer was offered %d octets on the connection, want %d", got, want)
+	}
+
+	// So the peer's next full window has to be accepted, and the frame carrying the
+	// first of it is the one the drain has to have happened before.
+	for sent := 0; sent < flow.InitialWindowSize; {
+		n := min(limits.MaxFrameSize, flow.InitialWindowSize-sent)
+		if err := h.send(filler(1, n, false)); err != nil {
+			t.Fatalf("the peer spent %d of the %d octets it was granted and was refused: %v",
+				sent+n, flow.InitialWindowSize, err)
+		}
+		sent += n
+	}
+}
+
+// TestCreditIsAppliedByAnyFrame, not only by DATA on the stream that earned it.
+//
+// The drain is at the top of HandleFrame rather than in the DATA path because a peer that
+// has spent its window sends no more DATA. What it does send — a PRIORITY, a
+// WINDOW_UPDATE of its own, a HEADERS on another stream — has to be enough, since a peer
+// that never sent another frame at all would be one this server could not reach.
+func TestCreditIsAppliedByAnyFrame(t *testing.T) {
+	h := newHarness(t, Config{})
+	h.open(1, false)
+	h.mustSend(filler(1, limits.MaxFrameSize, false))
+
+	before := h.tab.RecvWindow().Available()
+	h.tab.ReportConsumed(1, limits.ReplenishThreshold, true)
+	if got := h.tab.RecvWindow().Available(); got != before {
+		t.Fatalf("the connection window moved to %d from a handler's goroutine, want %d",
+			got, before)
+	}
+
+	// A frame that has nothing to do with stream 1's content.
+	h.mustSend(frame.PriorityFrame{StreamID: 3, Weight: 16})
+
+	if got, want := h.tab.RecvWindow().Available(),
+		before+int64(limits.ReplenishThreshold); got != want {
+		t.Errorf("the connection window is %d after an unrelated frame, want %d", got, want)
+	}
+	if got, want := h.tab.Stream(1).RecvWindow().Available(),
+		int64(flow.InitialWindowSize-limits.MaxFrameSize+limits.ReplenishThreshold); got != want {
+		t.Errorf("stream 1's receive window is %d, want %d", got, want)
+	}
+}
+
+// TestCreditForAStreamThatHasGoneIsStillCreditedToTheConnection is the case the
+// bookkeeping cannot avoid.
+//
+// A handler can be reading the last of a body after the stream that carried it has been
+// retired — the peer resets it, or the response finished first — and the goroutine
+// reporting that read has no way to know, because the stream table belongs to the
+// reader. The connection's window still has to come back: those octets were charged
+// against it and nothing else will return them.
+func TestCreditForAStreamThatHasGoneIsStillCreditedToTheConnection(t *testing.T) {
+	h := newHarness(t, Config{})
+	h.open(1, false)
+	h.mustSend(filler(1, limits.MaxFrameSize, false))
+
+	before := h.tab.RecvWindow().Available()
+	h.mustSend(frame.RSTStreamFrame{StreamID: 1, ErrCode: h2.Cancel})
+	if h.tab.Stream(1) != nil {
+		t.Fatal("stream 1 is still in the table after the peer reset it")
+	}
+
+	h.tab.ReportConsumed(1, limits.ReplenishThreshold, true)
+	h.mustSend(frame.PriorityFrame{StreamID: 1, Weight: 16})
+
+	if got, want := h.tab.RecvWindow().Available(),
+		before+int64(limits.ReplenishThreshold); got != want {
+		t.Errorf("the connection window is %d after a retired stream's content was read, want %d",
+			got, want)
+	}
+}
+
+// TestCreditBookkeepingDoesNotGrowWithTheStreamsThatUsedIt.
+//
+// The per-stream credit is keyed by identifier rather than kept on a Stream, because the
+// goroutine that earns it is a handler's and a Stream belongs to the reader. A map keyed
+// by identifier on a long-lived connection is a leak unless something drops the entries,
+// and the only place that can is the drain — the one place holding both the map and the
+// stream table.
+//
+// The reports here say there is more content to come on a stream whose END_STREAM has
+// already arrived, which is not a contradiction: a handler reads out of a buffer, so the
+// last payload of a body is still unread when the frame that ended it has been handled.
+// That is precisely the case that leaves an entry behind.
+func TestCreditBookkeepingDoesNotGrowWithTheStreamsThatUsedIt(t *testing.T) {
+	h := newHarness(t, Config{})
+
+	for id := uint32(1); id < 60; id += 2 {
+		h.open(id, false)
+		h.mustSend(filler(id, limits.ReplenishThreshold, true))
+		h.tab.ReportConsumed(id, limits.ReplenishThreshold, true)
+		h.tab.ReportSendEnd(id)
+		h.mustSend(frame.PriorityFrame{StreamID: id, Weight: 16})
+	}
+
+	h.tab.mu.Lock()
+	left := len(h.tab.streamCredit)
+	h.tab.mu.Unlock()
+	if left != 0 {
+		t.Errorf("%d streams' credit bookkeeping is still held after all of them closed", left)
+	}
+
+	// And the connection's window is where it started, which is what says the credit
+	// was returned rather than merely forgotten along with the entries.
+	if got := h.tab.RecvWindow().Available(); got != flow.InitialWindowSize {
+		t.Errorf("the connection window is %d after %d balanced uploads, want %d",
+			got, 30, flow.InitialWindowSize)
+	}
+}
+
+// TestReportConsumedSurvivesAWriterThatHasStopped.
+//
+// The report comes from a handler's goroutine, which has nowhere to return an error to
+// and nothing it could do with one: a failed Enqueue is the connection's write half
+// already finished. It has to be a report that returns, not one that panics or blocks,
+// because the handler behind it is in the middle of a Read.
+func TestReportConsumedSurvivesAWriterThatHasStopped(t *testing.T) {
+	h := newHarness(t, Config{})
+	h.open(1, false)
+	h.w.fail(errors.New("the connection is gone"))
+
+	h.tab.ReportConsumed(1, limits.ReplenishThreshold, true)
+
+	if got := h.w.updates(); len(got) != 0 {
+		t.Fatalf("a failing writer recorded %d frames: %v", len(got), got)
+	}
+
+	// And the credit is not lost twice: what was recorded still reaches this server's
+	// own window, which is the safe direction — a window larger than the peer believes
+	// accepts frames the peer will not send.
+	h.mustSend(frame.PriorityFrame{StreamID: 1, Weight: 16})
+	if got, want := h.tab.RecvWindow().Available(),
+		int64(flow.InitialWindowSize+limits.ReplenishThreshold); got != want {
+		t.Errorf("the connection window is %d after credit that could not be sent, want %d",
+			got, want)
 	}
 }

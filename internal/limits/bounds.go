@@ -64,6 +64,35 @@ const (
 // Enforced in internal/stream, which owns the stream table.
 const MaxConcurrentStreams = 100
 
+// ReplenishThreshold is how much request content a handler must have read before
+// this server returns the flow-control credit those octets occupied, as a
+// WINDOW_UPDATE (§6.9).
+//
+// Flow control is only a bound if the credit comes back. §6.9 puts the obligation
+// plainly — "The receiver of a frame sends a WINDOW_UPDATE frame as it consumes data
+// and frees up space in flow-control windows" — and §6.9 also warns against overdoing
+// it: "Receivers are advised to have mechanisms in place to avoid sending WINDOW_UPDATE
+// frames with very small increments". A frame per read is exactly that mistake. A
+// handler copying a body with io.Copy's 32 KiB buffer would put a frame on the wire for
+// every buffer's worth, so a peer sending full-size DATA frames would get two
+// WINDOW_UPDATEs for each one it sent, each costing a frame header and a write. A
+// threshold turns that into one frame per half window however small the reads are.
+//
+// Half a window is what makes it impossible for a peer to stall on a body this
+// server is reading. The credit is returned once half of it has been consumed, so
+// a peer whose reads are keeping up never has less than half a window outstanding
+// and never waits. A larger threshold saves frames and starts letting a fast peer
+// block on one; a smaller one costs frames and buys nothing, because the peer was
+// not waiting.
+//
+// It is written out rather than derived from flow.InitialWindowSize because this
+// package imports nothing — it is the leaf of the module's import graph, so that
+// every bound in it can be read without following a dependency, and so that
+// internal/flow can name a bound from here without a cycle.
+// TestReplenishThresholdIsHalfAWindow in internal/stream pins the two together, so
+// changing either without the other fails the build.
+const ReplenishThreshold = (1<<16 - 1) / 2
+
 // MaxEncoderTableSize bounds the HPACK dynamic table this server keeps for the
 // direction it sends in, whatever the peer's SETTINGS_HEADER_TABLE_SIZE asks for.
 //

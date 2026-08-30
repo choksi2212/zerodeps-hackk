@@ -41,18 +41,30 @@
 // # Concurrency
 //
 // A Table's streams are not safe for concurrent use and are not behind a lock. Every
-// method but one is called from the connection's single reader goroutine, in frame
+// method but two is called from the connection's single reader goroutine, in frame
 // arrival order, which is the only order the HPACK codec can be driven in at all (see
 // h2.HeaderCodec). The per-stream goroutines that write responses do not touch the
 // table; they are handed their own stream, and they spend send-side flow control
 // through the *flow.Sender the table exposes, which is the one part of this package's
 // state that is shared and locked.
 //
-// The exception is Table.ReportSendEnd, and it is arranged so as not to be one. A
-// response finishes on its own goroutine, and the state change that fact causes has to
-// happen on the reader's, so the identifier is put on a list behind a mutex that guards
-// nothing else and the next frame the reader handles applies it. No stream, window or
-// map entry is reachable from another goroutine even there.
+// There are two exceptions, and both are arranged so as not to be ones.
+//
+// Table.ReportSendEnd is a response finishing on its own goroutine, whose state change
+// has to happen on the reader's: the identifier is put on a list behind a mutex and the
+// next frame the reader handles applies it.
+//
+// Table.ReportConsumed is a handler reading request content, which earns the peer's
+// receive-window credit back (§6.9). It works the same way with one difference that
+// cannot be avoided: the WINDOW_UPDATE is sent from the handler's goroutine rather than
+// waiting for the reader, because a peer that has spent its whole window sends no
+// further frame until it is told there is room — so there is no next frame to wait for.
+// The credit is recorded behind the same mutex and reaches the windows themselves in
+// the reader's goroutine, before the next frame is judged against them.
+//
+// The mutex guards those two lists of numbers and nothing else. No stream, window or map
+// entry is reachable from another goroutine even there, and it is never held across
+// anything that can block.
 package stream
 
 import (

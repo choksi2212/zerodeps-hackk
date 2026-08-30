@@ -46,10 +46,59 @@ func read(t *testing.T, b *Body) (string, error) {
 	}
 }
 
+// newTestBody is a body on stream 1 whose consumed-content reports are kept but not
+// looked at, for the tests here that are about the handover rather than about flow
+// control. The ones that are about flow control build their own and read it back.
+func newTestBody() *Body {
+	return newBody(1, &creditLog{})
+}
+
+// creditLog is a bodyCredit that remembers what a body reported.
+//
+// Locked, because the whole point of the reports is that they are made from the handler's
+// goroutine while the reader's is still filling the body, so a test reading them back is
+// a second goroutine by construction.
+type creditLog struct {
+	mu  sync.Mutex
+	got []consumed
+}
+
+// consumed is one call to ReportConsumed.
+type consumed struct {
+	id   uint32
+	n    int
+	more bool
+}
+
+func (c *creditLog) ReportConsumed(id uint32, n int, more bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.got = append(c.got, consumed{id: id, n: n, more: more})
+}
+
+// reports is a copy of what has been reported so far.
+func (c *creditLog) reports() []consumed {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]consumed(nil), c.got...)
+}
+
+// total is how many octets have been reported.
+func (c *creditLog) total() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	var n int
+	for _, r := range c.got {
+		n += r.n
+	}
+	return n
+}
+
 // TestAnEndedBodyWithNothingInItIsEOF is the common case: a GET, whose Body exists
 // only so that a handler needs no special case for it.
 func TestAnEndedBodyWithNothingInItIsEOF(t *testing.T) {
-	b := newBody()
+	b := newTestBody()
 	b.end(nil)
 
 	if got, err := read(t, b); got != "" || err != nil {
@@ -60,7 +109,7 @@ func TestAnEndedBodyWithNothingInItIsEOF(t *testing.T) {
 // TestABodyReadsBackWhatArrived pins the ordering: chunks come out in the order the
 // DATA frames went in, concatenated, with no boundary visible in the result.
 func TestABodyReadsBackWhatArrived(t *testing.T) {
-	b := newBody()
+	b := newTestBody()
 	b.add([]byte("one "))
 	b.add([]byte("two "))
 	b.add([]byte("three"))
@@ -76,7 +125,7 @@ func TestABodyReadsBackWhatArrived(t *testing.T) {
 // because the alternative is to block waiting for a frame that would fill it and a peer
 // is entitled never to send one.
 func TestOneReadNeverCrossesAChunk(t *testing.T) {
-	b := newBody()
+	b := newTestBody()
 	b.add([]byte("abc"))
 	b.add([]byte("de"))
 	b.end(nil)
@@ -98,7 +147,7 @@ func TestOneReadNeverCrossesAChunk(t *testing.T) {
 // TestAPartiallyReadChunkResumesWhereItStopped covers the offset. A handler reading a
 // byte at a time is a handler this must not lose track of.
 func TestAPartiallyReadChunkResumesWhereItStopped(t *testing.T) {
-	b := newBody()
+	b := newTestBody()
 	b.add([]byte("hello"))
 	b.end(nil)
 
@@ -124,7 +173,7 @@ func TestAPartiallyReadChunkResumesWhereItStopped(t *testing.T) {
 // held every chunk it had already handed over would keep a whole request body alive
 // until the response finished, per stream, and look correct doing it.
 func TestAReadChunkIsDroppedRatherThanKept(t *testing.T) {
-	b := newBody()
+	b := newTestBody()
 	b.add([]byte("abc"))
 	b.add([]byte("def"))
 	b.end(nil)
@@ -148,7 +197,7 @@ func TestAReadChunkIsDroppedRatherThanKept(t *testing.T) {
 // probes with an empty buffer, and a Read that waited for content before noticing there
 // was nowhere to put it would park the handler for the life of the connection.
 func TestAZeroLengthReadDoesNotBlock(t *testing.T) {
-	b := newBody()
+	b := newTestBody()
 
 	done := make(chan struct{})
 	go func() {
@@ -174,7 +223,7 @@ func TestAZeroLengthReadDoesNotBlock(t *testing.T) {
 // that could not schedule a goroutine in a tenth of a second, which is not a failure
 // mode worth designing around, and the positive half is what the test is for.
 func TestReadBlocksUntilContentArrives(t *testing.T) {
-	b := newBody()
+	b := newTestBody()
 	got := make(chan string, 1)
 
 	go func() {
@@ -206,7 +255,7 @@ func TestReadBlocksUntilContentArrives(t *testing.T) {
 // TestEndWakesAParkedRead is the other way a parked read finishes: the peer sent
 // END_STREAM and there is nothing more to wait for.
 func TestEndWakesAParkedRead(t *testing.T) {
-	b := newBody()
+	b := newTestBody()
 	done := make(chan error, 1)
 	go func() {
 		_, err := b.Read(make([]byte, 16))
@@ -229,7 +278,7 @@ func TestEndWakesAParkedRead(t *testing.T) {
 // TestFailWakesAParkedRead is the third way, and the one a peer causes: RST_STREAM, or
 // the connection ending underneath the request.
 func TestFailWakesAParkedRead(t *testing.T) {
-	b := newBody()
+	b := newTestBody()
 	gone := errors.New("the stream is gone")
 
 	done := make(chan error, 1)
@@ -260,7 +309,7 @@ func TestFailWakesAParkedRead(t *testing.T) {
 // filler outruns the readers, so by the time end is called the body still holds content
 // and nobody is waiting to be woken.
 func TestEndWakesEveryParkedRead(t *testing.T) {
-	b := newBody()
+	b := newTestBody()
 
 	const readers = 8
 	woken := make(chan error, readers)
@@ -291,7 +340,7 @@ func TestEndWakesEveryParkedRead(t *testing.T) {
 // TestFailWakesEveryParkedRead is the same difference in fail, and the reason a stream
 // the peer reset does not leave a fanned-out handler parked on it.
 func TestFailWakesEveryParkedRead(t *testing.T) {
-	b := newBody()
+	b := newTestBody()
 	gone := errors.New("the stream is gone")
 
 	const readers = 8
@@ -325,7 +374,7 @@ func TestFailWakesEveryParkedRead(t *testing.T) {
 // server must not act on, and a handler handed the front of a body whose end will never
 // come is invited to parse what it has, answer, and be wrong.
 func TestAFailedBodyReportsItsErrorAheadOfWhatArrived(t *testing.T) {
-	b := newBody()
+	b := newTestBody()
 	b.add([]byte("half an upload"))
 	gone := errors.New("the stream is gone")
 	b.fail(gone)
@@ -339,7 +388,7 @@ func TestAFailedBodyReportsItsErrorAheadOfWhatArrived(t *testing.T) {
 // peer resets it and then the connection ends under it — and the first reason is the one
 // that explains the second.
 func TestTheFirstFailureIsTheOneReported(t *testing.T) {
-	b := newBody()
+	b := newTestBody()
 	first := errors.New("the peer reset the stream")
 	b.fail(first)
 	b.fail(errors.New("the connection ended"))
@@ -352,7 +401,7 @@ func TestTheFirstFailureIsTheOneReported(t *testing.T) {
 // TestContentThatArrivedBeforeEndStreamIsStillRead is the ordinary complete upload, and
 // the assertion is that END_STREAM does not discard what it ends.
 func TestContentThatArrivedBeforeEndStreamIsStillRead(t *testing.T) {
-	b := newBody()
+	b := newTestBody()
 	b.add([]byte("complete"))
 	b.end([]h2.Field{{Name: "checksum", Value: "1"}})
 
@@ -369,7 +418,7 @@ func TestContentThatArrivedBeforeEndStreamIsStillRead(t *testing.T) {
 // trailer section is after the content, so one that could be read before the content was
 // finished would be one that had not arrived.
 func TestTrailersAreNilUntilTheBodyEnds(t *testing.T) {
-	b := newBody()
+	b := newTestBody()
 	b.add([]byte("x"))
 
 	if fs := b.Trailers(); fs != nil {
@@ -391,7 +440,7 @@ func TestTrailersAreNilUntilTheBodyEnds(t *testing.T) {
 // left parked shows up here first, and without it the symptom is a test that never
 // finishes rather than one that says how many readers never came back.
 func TestManyGoroutinesReadingOneBody(t *testing.T) {
-	b := newBody()
+	b := newTestBody()
 
 	const chunks = 200
 	go func() {
@@ -456,7 +505,7 @@ func TestManyGoroutinesReadingOneBody(t *testing.T) {
 // peer's PING frames and notices its GOAWAY, for every stream at once, so a handler that
 // stopped reading its body must not be able to stall it.
 func TestAddNeverBlocks(t *testing.T) {
-	b := newBody()
+	b := newTestBody()
 
 	done := make(chan struct{})
 	go func() {
@@ -511,3 +560,202 @@ func (s *safeBuf) String() string {
 }
 
 func (s *safeBuf) contains(sub string) bool { return strings.Contains(s.String(), sub) }
+
+// --- reporting consumed content ---------------------------------------------
+
+// TestReadingABodyReportsEveryOctetItConsumed.
+//
+// The report is what returns the peer's flow-control window, so an octet read and not
+// reported is an octet of window this connection never gets back — a stall that arrives
+// after a body's worth of traffic rather than at the read that caused it.
+func TestReadingABodyReportsEveryOctetItConsumed(t *testing.T) {
+	c := &creditLog{}
+	b := newBody(7, c)
+
+	b.add([]byte("hello "))
+	b.add([]byte("world"))
+	b.end(nil)
+
+	if got, err := read(t, b); got != "hello world" || err != nil {
+		t.Fatalf("reading the body gave (%q, %v), want (\"hello world\", nil)", got, err)
+	}
+	if got, want := c.total(), len("hello world"); got != want {
+		t.Errorf("the body reported %d octets consumed, want %d", got, want)
+	}
+	for _, r := range c.reports() {
+		if r.id != 7 {
+			t.Errorf("a report named stream %d, want 7", r.id)
+		}
+	}
+}
+
+// TestOnlyTheLastReadOfABodyReportsThatThereIsNoMore.
+//
+// The flag decides whether the stream gets a WINDOW_UPDATE of its own alongside the
+// connection's, so getting it wrong in one direction sends a frame naming a stream that
+// is finished with and in the other stalls a peer that is not.
+func TestOnlyTheLastReadOfABodyReportsThatThereIsNoMore(t *testing.T) {
+	c := &creditLog{}
+	b := newBody(1, c)
+
+	b.add([]byte("aa"))
+	b.add([]byte("bb"))
+	b.end(nil)
+
+	if got, err := read(t, b); got != "aabb" || err != nil {
+		t.Fatalf("reading the body gave (%q, %v), want (\"aabb\", nil)", got, err)
+	}
+
+	got := c.reports()
+	if len(got) != 2 {
+		t.Fatalf("two payloads produced %d reports, want 2: %v", len(got), got)
+	}
+	if !got[0].more {
+		t.Error("the first of two payloads reported that no more content was coming")
+	}
+	if got[1].more {
+		t.Error("the last payload of an ended body reported that more content was coming")
+	}
+}
+
+// TestReadingAnUnendedBodyReportsThatMoreIsComing, even having emptied the buffer.
+//
+// This is the case the whole mechanism exists for: a peer that has spent its window is
+// waiting to be told there is room, and the handler has read everything that arrived. If
+// the last read before the buffer empties said there was no more content, the stream's
+// window would never be replenished and the upload would stop there.
+func TestReadingAnUnendedBodyReportsThatMoreIsComing(t *testing.T) {
+	c := &creditLog{}
+	b := newBody(1, c)
+	b.add([]byte("aa"))
+
+	if n, err := b.Read(make([]byte, 8)); n != 2 || err != nil {
+		t.Fatalf("reading the one payload that arrived gave (%d, %v), want (2, nil)", n, err)
+	}
+
+	got := c.reports()
+	if len(got) != 1 {
+		t.Fatalf("one read produced %d reports, want 1: %v", len(got), got)
+	}
+	if !got[0].more {
+		t.Error("emptying the buffer of a body the peer has not ended reported that no more content was coming")
+	}
+}
+
+// TestAShortReadReportsOnlyWhatItTook.
+//
+// A Read smaller than the payload in front of it leaves the rest for the next call, and
+// the credit has to follow the octets rather than the frame: reporting the payload would
+// return window for content the handler has not looked at, which is the one direction
+// flow control must not err in.
+func TestAShortReadReportsOnlyWhatItTook(t *testing.T) {
+	c := &creditLog{}
+	b := newBody(1, c)
+	b.add([]byte("abcdef"))
+
+	if n, err := b.Read(make([]byte, 2)); n != 2 || err != nil {
+		t.Fatalf("a 2-octet read of a 6-octet payload gave (%d, %v), want (2, nil)", n, err)
+	}
+
+	got := c.reports()
+	if len(got) != 1 || got[0].n != 2 {
+		t.Fatalf("a 2-octet read reported %v, want one report of 2 octets", got)
+	}
+}
+
+// TestReadsThatConsumeNothingReportNothing.
+//
+// §6.9.1 makes a WINDOW_UPDATE with an increment of 0 a PROTOCOL_ERROR, so a read that
+// took no octets must not become one. All three ways of taking none are here: io.Copy's
+// habit of probing with an empty buffer, a read at the end of a body, and a read of a
+// body the peer reset.
+func TestReadsThatConsumeNothingReportNothing(t *testing.T) {
+	c := &creditLog{}
+	b := newBody(1, c)
+
+	if n, err := b.Read(nil); n != 0 || err != nil {
+		t.Fatalf("a zero-length read gave (%d, %v), want (0, nil)", n, err)
+	}
+
+	b.end(nil)
+	if n, err := b.Read(make([]byte, 8)); n != 0 || err != io.EOF {
+		t.Fatalf("a read at the end of a body gave (%d, %v), want (0, io.EOF)", n, err)
+	}
+
+	failed := newBody(1, c)
+	failed.fail(errors.New("the peer reset the stream"))
+	if n, _ := failed.Read(make([]byte, 8)); n != 0 {
+		t.Fatalf("a read of a failed body took %d octets, want 0", n)
+	}
+
+	if got := c.reports(); len(got) != 0 {
+		t.Errorf("reads that consumed nothing produced %d reports, want none: %v", len(got), got)
+	}
+}
+
+// TestContentIsReportedWithTheLockReleased is the deadlock this file's design is arranged
+// around, and the reason Read is split in two.
+//
+// Reporting puts a WINDOW_UPDATE on the connection's write queue, which a peer that has
+// stopped reading its socket can block. b.mu is the lock the connection's reader
+// goroutine takes to hand over the next payload, and that goroutine is also the one
+// answering PING on every other stream of the connection. So a report made under this
+// lock would let one stalled peer stop the connection it is stalling on — and the shape
+// of that bug is a test that hangs, which is why the assertion is a deadline.
+func TestContentIsReportedWithTheLockReleased(t *testing.T) {
+	c := &blockingCredit{entered: make(chan struct{}), release: make(chan struct{})}
+	b := newBody(1, c)
+	b.add([]byte("aa"))
+
+	go b.Read(make([]byte, 8))
+
+	select {
+	case <-c.entered:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the read never reported the content it consumed")
+	}
+	defer close(c.release)
+
+	// The reader goroutine's two calls, both of which must complete while the report is
+	// still in progress.
+	done := make(chan struct{})
+	go func() {
+		b.add([]byte("bb"))
+		b.end(nil)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the connection's reader goroutine is blocked behind a report of consumed content")
+	}
+}
+
+// blockingCredit is a bodyCredit that stops inside ReportConsumed until it is released,
+// which is what a frame writer behind a peer that has stopped reading looks like.
+type blockingCredit struct {
+	once    sync.Once
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (c *blockingCredit) ReportConsumed(uint32, int, bool) {
+	c.once.Do(func() { close(c.entered) })
+	<-c.release
+}
+
+// TestNewBodyRefusesToBeBuiltWithNowhereToReportTo.
+//
+// At construction, because the alternative is a nil dereference on the first read of the
+// first upload large enough to need credit returned — a panic in a handler's goroutine,
+// on whichever deployment happens to receive one.
+func TestNewBodyRefusesToBeBuiltWithNowhereToReportTo(t *testing.T) {
+	const want = "exchange: newBody requires somewhere to report consumed content"
+	defer func() {
+		if got := recover(); got != want {
+			t.Errorf("newBody with a nil credit panicked with %v, want %q", got, want)
+		}
+	}()
+	newBody(1, nil)
+}

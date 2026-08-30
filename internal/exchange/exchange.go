@@ -22,11 +22,18 @@
 //
 // # What crosses between them
 //
-// Two things, in opposite directions, and both are arranged so that nothing else has
-// to. The request body crosses forwards, through Body, which is a buffer behind a
-// mutex and a condition variable. The fact that a response has finished crosses back,
-// through Table.ReportSendEnd, which is a list of identifiers behind a mutex the
-// stream table applies on its own goroutine at the next frame.
+// Three things, and all of them are arranged so that nothing else has to. The request
+// body crosses forwards, through Body, which is a buffer behind a mutex and a condition
+// variable. Two facts cross back: that a response has finished, through
+// Table.ReportSendEnd, and how much request content a handler has read, through
+// Table.ReportConsumed — both lists of numbers behind a mutex the stream table applies
+// on its own goroutine at the next frame.
+//
+// The second of those is what lets a request body exceed one flow-control window. The
+// peer may only send what its window allows and this server has to give that credit
+// back as its handler consumes it (§6.9), so the octets a Read took have to reach the
+// reader goroutine, and a Read is a handler's goroutine by definition. See Body.Read for
+// why the report is made with Body's own lock released.
 //
 // Nothing else is shared. The stream table, its map, its windows and the HPACK
 // decoding context stay with the reader goroutine; the response encoder and the
@@ -95,14 +102,15 @@ type Request struct {
 	Body *Body
 }
 
-// Streams is the stream table as this package needs it: the one call back into it that
-// a finished response has to make.
+// Streams is the stream table as this package needs it: the two calls back into it that
+// a request in progress has to make.
 //
 // Declared here rather than imported so that the dependency is a method and not a
-// package — but mostly so that a test can watch the call happen. See stream.Table's
-// ReportSendEnd for why it is a report rather than a state change.
+// package — but mostly so that a test can watch the calls happen. See stream.Table's
+// ReportSendEnd and ReportConsumed for why they are reports rather than state changes.
 type Streams interface {
 	ReportSendEnd(id uint32)
+	ReportConsumed(id uint32, n int, more bool)
 }
 
 // Config is what running a request needs.
@@ -224,7 +232,7 @@ func (r *Requests) Headers(s *stream.Stream, fields []h2.Field, endStream bool) 
 		return err
 	}
 
-	body := newBody()
+	body := newBody(s.ID(), r.streams)
 	if endStream {
 		body.end(nil)
 	} else {

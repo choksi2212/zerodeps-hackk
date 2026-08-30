@@ -610,3 +610,136 @@ func TestPeerHangingUpMidUploadWakesTheHandler(t *testing.T) {
 		t.Fatal("the handler is still parked reading a body from a connection that is gone")
 	}
 }
+
+// drainer is a handler that reads its whole request body and reports how many
+// bytes it saw.
+type drainer struct{ got chan int64 }
+
+func (d drainer) Serve(w *response.Writer, r *exchange.Request) {
+	n, err := io.Copy(io.Discard, r.Body)
+	if err != nil {
+		d.got <- -1
+		return
+	}
+	_ = w.WriteBodylessHeader([]h2.Field{{Name: ":status", Value: "204"}})
+	d.got <- n
+}
+
+// A body larger than one receive window, which is the case that cannot work
+// without the server returning credit for what its handler has consumed.
+//
+// §6.9.2 starts every receive window at 65535 octets, and §6.9 says a peer must
+// not send more than it has been granted. So a client that obeys flow control —
+// which is every real one — can upload exactly 65535 bytes and then must wait.
+// A server that never sends WINDOW_UPDATE does not refuse the rest of that
+// upload: it stalls, holding a handler and a stream, until one side gives up.
+// That is worse than a 413, because nothing on either end says what happened.
+func TestServeReplenishesTheReceiveWindow(t *testing.T) {
+	const (
+		window = 65535           // §6.9.2's initial value, and what the peer may send
+		body   = window + 40_000 // enough that the rest needs credit that has to be returned
+	)
+
+	d := drainer{got: make(chan int64, 1)}
+	_, addr := serveHandler(t, d)
+
+	c := dial(t, addr)
+	c.write(frame.HeadersFrame{
+		StreamID:   1,
+		EndHeaders: true,
+		Fragment: c.enc.Encode([]h2.Field{
+			{Name: ":method", Value: "POST"},
+			{Name: ":scheme", Value: "http"},
+			{Name: ":authority", Value: "127.0.0.1"},
+			{Name: ":path", Value: "/"},
+		}),
+	})
+
+	// Exactly the window, and not one octet more: sending past it would be this
+	// client's protocol violation and the server would be right to end the
+	// connection, which would hide the thing being tested.
+	sent := c.sendData(1, window, false)
+
+	// The credit has to come back on both windows. A server that replenished only
+	// the stream would stall the next upload on the connection instead of this one,
+	// which is the same bug one connection later.
+	c.awaitCredit(1, window)
+
+	c.sendData(1, body-sent, true)
+
+	select {
+	case n := <-d.got:
+		if n != body {
+			t.Errorf("the handler read %d bytes, want %d", n, body)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatalf("the handler is still reading after %d of %d bytes were sent", sent, body)
+	}
+}
+
+// sendData writes n bytes of content as DATA frames no larger than the peer is
+// obliged to accept (§4.2's 16384 default), and returns how many it sent.
+func (c *client) sendData(id uint32, n int, endStream bool) int {
+	c.t.Helper()
+
+	const max = 1 << 14
+	chunk := make([]byte, max)
+	for i := range chunk {
+		chunk[i] = byte('a' + i%26)
+	}
+
+	for sent := 0; sent < n; {
+		size := min(max, n-sent)
+		sent += size
+		c.write(frame.DataFrame{
+			StreamID:  id,
+			EndStream: endStream && sent == n,
+			Data:      chunk[:size],
+		})
+	}
+	return n
+}
+
+// awaitCredit reads frames until the peer has returned at least want octets of
+// credit on both the stream and the connection.
+//
+// Under a deadline, because the failure it guards against is credit that never
+// arrives: a test that waited for ever would report this as the package timing
+// out rather than as the one window that was not replenished.
+func (c *client) awaitCredit(id uint32, want uint32) {
+	c.t.Helper()
+
+	if err := c.nc.SetReadDeadline(time.Now().Add(15 * time.Second)); err != nil {
+		c.t.Fatalf("setting a read deadline: %v", err)
+	}
+	defer c.nc.SetReadDeadline(time.Time{})
+
+	var conn, stream uint32
+	for conn < want || stream < want {
+		f, err := c.rd.ReadFrame()
+		if err != nil {
+			c.t.Fatalf("waiting for credit (connection %d, stream %d of %d octets): %v",
+				conn, stream, want, err)
+		}
+		switch v := f.(type) {
+		case frame.SettingsFrame:
+			if !v.Ack {
+				c.write(frame.SettingsFrame{Ack: true})
+			}
+		case frame.PingFrame:
+			if !v.Ack {
+				c.write(frame.PingFrame{Ack: true, Data: v.Data})
+			}
+		case frame.WindowUpdateFrame:
+			if v.StreamID == 0 {
+				conn += v.Increment
+			} else if v.StreamID == id {
+				stream += v.Increment
+			}
+		case frame.GoAwayFrame:
+			c.t.Fatalf("the server sent GOAWAY(%v) instead of credit: %q", v.ErrCode, v.Debug)
+		case frame.RSTStreamFrame:
+			c.t.Fatalf("the server reset stream %d instead of sending credit: %v", v.StreamID, v.ErrCode)
+		}
+	}
+}

@@ -100,6 +100,7 @@ func newConn(h exchange.Handler, errLog *log.Logger) func(server.ConnWriter) ser
 			Requests: reqs,
 			Encoder:  enc,
 			Sender:   sender,
+			Writer:   w,
 		})
 		reqs.Attach(tab)
 

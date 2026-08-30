@@ -20,15 +20,24 @@ import (
 //
 // How much can accumulate here is not this type's decision and is not unbounded: the
 // peer may only send what its stream flow-control window allows, and Table.HandleFrame
-// debits that window before this ever sees the payload. This server does not replenish
-// a stream's receive window, so a request body is bounded by the initial window of
-// 65535 octets (§6.5.2) — a receiver policy §6.9 leaves to "the receiver's discretion",
-// and this receiver's discretion is to serve files rather than uploads.
+// debits that window before this ever sees the payload. What keeps a body larger than
+// one window moving is the other direction of the same arithmetic — every read reports
+// the octets it consumed, and the table returns that credit to the peer as a
+// WINDOW_UPDATE (§6.9) once enough has accrued. So the bound is not the size of the
+// body: it is how far ahead of the handler the peer may get, which is one window.
+//
+// That is also why the report is made outside the lock. See Read.
 //
 // A zero Body is not usable; see newBody. It is not safe to copy one.
 type Body struct {
 	mu   sync.Mutex
 	wake *sync.Cond
+
+	// id is the stream this content arrived on, and credit is where the octets a
+	// handler has read are reported so the peer gets its window back. Both are fixed
+	// at construction and read without the lock.
+	id     uint32
+	credit bodyCredit
 
 	// chunks are the payloads that have arrived and not been fully read, oldest
 	// first. Each aliases the frame it came in, which internal/frame has already
@@ -52,9 +61,29 @@ type Body struct {
 	trailers []h2.Field
 }
 
+// bodyCredit is the stream table as one body needs it: somewhere to say how much
+// content a handler has read, so the flow-control credit those octets occupied can go
+// back to the peer.
+//
+// The one method of Streams that a Body uses, named separately so that this file's own
+// dependency is legible and so a test here can supply it without a stream table. A
+// Streams satisfies it structurally.
+type bodyCredit interface {
+	ReportConsumed(id uint32, n int, more bool)
+}
+
 // newBody returns an empty body, ready for the reader goroutine to add to.
-func newBody() *Body {
-	b := &Body{}
+//
+// A nil credit panics, at construction. Without it a body larger than one flow-control
+// window stops halfway through with no error on either end — the peer waiting to be
+// told there is room and the handler waiting for content — and a hang that arrives only
+// on large uploads is the worst failure in this file to go looking for later.
+func newBody(id uint32, credit bodyCredit) *Body {
+	if credit == nil {
+		panic("exchange: newBody requires somewhere to report consumed content")
+	}
+
+	b := &Body{id: id, credit: credit}
 	b.wake = sync.NewCond(&b.mu)
 	return b
 }
@@ -75,28 +104,52 @@ func newBody() *Body {
 // answer, and be wrong. §8.1.1 puts it as "Clients MUST NOT accept a malformed
 // response", and the symmetry holds — the octets are still there, and they are not a
 // request.
+//
+// Every read that produced content reports it, which is what returns the peer's
+// flow-control window and so what lets a body exceed one window at all. The report is
+// made after the lock has been released, and that is not tidiness: it puts a
+// WINDOW_UPDATE on the connection's write queue, which a peer that has stopped reading
+// its socket can block. b.mu is the lock the connection's reader goroutine takes to hand
+// over the next payload, and that goroutine is also the one answering PING on every
+// other stream — so a report made under this lock would let one stalled peer stop the
+// connection it is stalling on.
 func (b *Body) Read(p []byte) (int, error) {
 	if len(p) == 0 {
 		return 0, nil
 	}
 
+	n, more, err := b.take(p)
+	if n > 0 {
+		b.credit.ReportConsumed(b.id, n, more)
+	}
+	return n, err
+}
+
+// take is Read without the reporting: everything that happens under the lock, and
+// nothing that can block on anything but the peer's next payload.
+//
+// more is whether this body may yet receive content. It is decided here because here is
+// the only place it can be: it is false from the moment the last buffered payload of an
+// ended body has been taken, and a caller that asked afterwards would be asking about a
+// body two payloads later.
+func (b *Body) take(p []byte) (n int, more bool, err error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
 	for {
 		if b.err != nil {
-			return 0, b.err
+			return 0, false, b.err
 		}
 		if len(b.chunks) > 0 {
 			break
 		}
 		if b.ended {
-			return 0, io.EOF
+			return 0, false, io.EOF
 		}
 		b.wake.Wait()
 	}
 
-	n := copy(p, b.chunks[0][b.off:])
+	n = copy(p, b.chunks[0][b.off:])
 	b.off += n
 	if b.off == len(b.chunks[0]) {
 		// Dropped rather than left behind the slice header, so the frame's octets
@@ -106,7 +159,7 @@ func (b *Body) Read(p []byte) (int, error) {
 		b.chunks = b.chunks[1:]
 		b.off = 0
 	}
-	return n, nil
+	return n, !b.ended || len(b.chunks) > 0, nil
 }
 
 // Trailers is the request's trailer section, or nil if it had none.
