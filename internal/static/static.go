@@ -19,6 +19,13 @@
 // §13.2.2 of RFC 9110 sets, and is answered with a 304 or a 412 where they fail. All of that
 // is in conditional.go, including the three date formats a peer may send one in.
 //
+// A request carrying a range field is answered with a 206 and the octets it named — one part, or
+// a multipart/byteranges body where several ranges were satisfiable — and every response that
+// carries a representation advertises the feature with an accept-ranges field. That is ranges.go,
+// which is also where the two independent bounds live that keep the denial of service §17.15 of
+// RFC 9110 describes off this server: a range request cannot cost it more than one read of the
+// file it names.
+//
 // # What it does not do
 //
 // Listed here because a handler's scope is the part of it a reader cannot infer, and
@@ -27,12 +34,12 @@
 //   - No directory listings. A listing discloses every name in a directory to anyone who
 //     guesses the directory. A server whose root is a build output should not be the
 //     thing that publishes the file nobody meant to copy there.
-//   - No range requests, and so no accept-ranges field. §14 of RFC 9110: "Range requests
-//     are an OPTIONAL feature of HTTP, designed so that recipients not implementing this
-//     feature (or not supporting it for the target resource) can respond as if it is a
-//     normal GET request without impacting interoperability" — and §14.2 of RFC 9110 says
-//     what that looks like from here: "A server MAY ignore the Range header field." A
-//     browser seeking in a video re-fetches it from the start.
+//   - No if-range, in the sense that the condition it asks about can never be true. The field is
+//     read, and reading it is all that happens: its presence cancels the range, so a client
+//     resuming an interrupted download is sent the whole representation instead of the tail it
+//     asked for. That is a consequence of the entry below rather than a second decision — a
+//     server with no strong validator has nothing an if-range could match — and ifRangeIsFalse
+//     derives it from §8.8.2.2 of RFC 9110.
 //   - No entity tags, and so no strong validator. §8.8.1 of RFC 9110 defines one as metadata
 //     that "changes value whenever a change occurs to the representation data that would be
 //     observable in the content of a 200 (OK) response to GET", and a size with a modification
@@ -123,19 +130,28 @@ const (
 // have one, because a 412 is a failure a person may well be reading in a terminal — a
 // conditional request that failed against a file whose modification time is not what they
 // expected.
+//
+// The 206 has none either, for the opposite reason: its content is the representation, or the
+// parts of it the peer asked for, so there is no room in it for a sentence about itself. The 416
+// beside it does have one, and it is the only body in this list a peer is likely to read
+// programmatically rather than in a terminal — which is why the useful half of that answer is a
+// field and not the sentence. See unsatisfiedRange.
 const (
 	status200 = "200"
+	status206 = "206"
 	status301 = "301"
 	status304 = "304"
 	status404 = "404"
 	status405 = "405"
 	status412 = "412"
 	status414 = "414"
+	status416 = "416"
 
 	body404 = "404 not found\n"
 	body405 = "405 method not allowed\n"
 	body412 = "412 precondition failed\n"
 	body414 = "414 URI too long\n"
+	body416 = "416 range not satisfiable\n"
 )
 
 // serverName is the server field's value.
@@ -325,7 +341,20 @@ func (h *Handler) serve(w *response.Writer, r *exchange.Request) error {
 	case verdictFailed:
 		return h.answer(w, r, status412, textPlain, body412)
 	}
-	return h.file(w, r, f, info.Size(), mediaType(name), now, mod)
+
+	// The range field last, which is where §14.2 of RFC 9110 puts it: after the preconditions,
+	// and only on the path they left a 200 on. The two returns above are what make the rule in
+	// the same paragraph — that a range is ignored where a conditional GET would have answered
+	// 304 — true here without being restated. evaluateRange has the rest of the argument.
+	kind := mediaType(name)
+	switch spans, verdict := evaluateRange(r, info.Size()); verdict {
+	case rangeNotSatisfiable:
+		return h.answer(w, r, status416, textPlain, body416,
+			h2.Field{Name: "content-range", Value: unsatisfiedRange(info.Size())})
+	case rangePartial:
+		return h.partial(w, f, spans, info.Size(), kind, now, mod)
+	}
+	return h.file(w, r, f, info.Size(), kind, now, mod)
 }
 
 // open opens a name inside the served directory and stats the handle.
@@ -352,6 +381,10 @@ func (h *Handler) open(name string) (*os.File, fs.FileInfo, error) {
 // now is the response's origination date and mod its last-modified, both from serve; the zero
 // time means the file has no modification date and the field is left out. See modTime.
 //
+// The accept-ranges field is added here rather than in fields, which is why it appears on this
+// response and on the field set of a HEAD but on nothing answer builds. withRanges says why that
+// is the right set.
+//
 // size comes from the same handle the content does, so the content-length and the content
 // agree unless the file changes underneath the response — a build writing into the served
 // directory while a browser reads from it. A file that grew is sent as it was, which is
@@ -360,7 +393,7 @@ func (h *Handler) open(name string) (*os.File, fs.FileInfo, error) {
 // is the truth about what happened. RST_STREAM would say it in the protocol instead, and
 // internal/exchange explains at finish why this server does not have one to send.
 func (h *Handler) file(w *response.Writer, r *exchange.Request, f *os.File, size int64, kind string, now, mod time.Time) error {
-	fields := withValidator(h.fields(now, status200, kind, size), mod)
+	fields := withRanges(withValidator(h.fields(now, status200, kind, size), mod))
 
 	// §9.3.2 of RFC 9110: "The server SHOULD send the same header fields in response to a
 	// HEAD request as it would have sent if the request method had been GET." Including the
@@ -424,8 +457,9 @@ func (h *Handler) notModified(w *response.Writer, now, mod time.Time) error {
 //
 // Its own clock reading rather than serve's, and it can be: no response built here carries a
 // validator. The 404, the 405, the 414 and the redirect are among the statuses §13.2.1 of RFC
-// 9110 puts ahead of the preconditions, and the 412 is a refusal to describe the representation
-// at all — so in none of them is there a second value the date has to agree with.
+// 9110 puts ahead of the preconditions; the 412 is a refusal to describe the representation at
+// all; and the 416 does describe one, but describes its length rather than its age. So in none of
+// them is there a second value the date has to agree with.
 func (h *Handler) answer(w *response.Writer, r *exchange.Request, status, kind, body string, extra ...h2.Field) error {
 	fields := append(h.fields(h.now().UTC(), status, kind, int64(len(body))), extra...)
 
@@ -452,9 +486,10 @@ func (h *Handler) answer(w *response.Writer, r *exchange.Request, status, kind, 
 // pseudo-header comes first, because §8.3 requires it before any field line. The rest is in no
 // particular order and is written in the order it is easiest to read.
 func (h *Handler) fields(now time.Time, status, kind string, length int64) []h2.Field {
-	// Room for the five this can build, plus one more without a second allocation — every
-	// caller adds at most one, either an extra field line or the validator.
-	fields := make([]h2.Field, 0, 6)
+	// Room for the five this can build, plus three more without a second allocation — which is
+	// the longest field set in this package: a single-part 206 adds the validator, the
+	// accept-ranges field and a content-range on top of the five.
+	fields := make([]h2.Field, 0, 8)
 
 	fields = append(fields, h2.Field{Name: ":status", Value: status})
 	if length != noContentLength {

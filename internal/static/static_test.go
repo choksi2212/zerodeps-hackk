@@ -325,8 +325,8 @@ func assertFields(t *testing.T, a *answer, want []h2.Field) {
 	}
 }
 
-// ok is the header section of a 200 on a file tree wrote: five fields and the validator,
-// in the order the encoder receives them.
+// ok is the header section of a 200 on a file tree wrote: five fields, the validator and the
+// accept-ranges, in the order the encoder receives them.
 func ok(kind string, length int) []h2.Field {
 	return []h2.Field{
 		{Name: ":status", Value: status200},
@@ -335,6 +335,7 @@ func ok(kind string, length int) []h2.Field {
 		{Name: "date", Value: clockField},
 		{Name: "server", Value: serverName},
 		{Name: "last-modified", Value: fileTimeField},
+		{Name: "accept-ranges", Value: bytesUnit},
 	}
 }
 
@@ -1107,18 +1108,21 @@ func TestDateFromTheRealClock(t *testing.T) {
 	}
 }
 
-// TestNoEntityTagAndNoRanges is the scope in the package documentation, asserted as the
-// absence it is. Each of these fields is a promise this handler does not keep: an ETag
-// invites the comparison against a strong validator it does not have, and an accept-ranges
-// invites the range request it ignores.
+// TestFieldsThisHandlerNeverSends is the scope in the package documentation, asserted as the
+// absence it is. Each of these fields is a promise this handler does not keep: an ETag invites
+// the comparison against a strong validator it does not have, and a cache-control invites a
+// deployment to believe this program has an opinion about freshness.
 //
-// last-modified is not in the list any more — it is the one validator this handler does
-// send — and TestValidatorOnlyWhereThereIsARepresentation is where it belongs instead.
-func TestNoEntityTagAndNoRanges(t *testing.T) {
+// last-modified is not in the list — it is the one validator this handler does send — and
+// TestValidatorOnlyWhereThereIsARepresentation is where it belongs instead. accept-ranges is not
+// in it either, since ranges.go shipped; TestAcceptRangesOnlyWhereThereIsARepresentation is that
+// field's own test. content-range stays, because none of the targets below can produce the 206 or
+// the 416 that carry one, so its absence here is still the assertion it was.
+func TestFieldsThisHandlerNeverSends(t *testing.T) {
 	h := newHandler(t, map[string]string{"index.html": page, "docs/index.html": page})
 
 	unsent := []string{
-		"etag", "accept-ranges", "content-range",
+		"etag", "content-range",
 		"cache-control", "expires", "age", "vary", "content-encoding",
 		"transfer-encoding", "connection", "keep-alive", "upgrade",
 	}

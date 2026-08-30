@@ -172,10 +172,13 @@ func evaluate(r *exchange.Request, mod, now time.Time) verdict {
 		return verdictNotModified
 	}
 
-	// Step 5 is a range request, and this server has none. §13.2.2 of RFC 9110 reaches it only
-	// "When the method is GET and both Range and If-Range are present", and a server that
-	// ignores Range — as §14.2 of RFC 9110 permits, see the package comment — never gets past
-	// the first clause of that. Step 6 is the file.
+	// Step 5 is the range request, and it is not evaluated here. §13.2.2 of RFC 9110 reaches it
+	// only "When the method is GET and both Range and If-Range are present", and for this server
+	// that pair has a fixed answer: ifRangeIsFalse gives the derivation, and the outcome is the
+	// second of the two §13.2.2 of RFC 9110 offers — "otherwise, ignore the Range header field and
+	// respond 200 (OK)". Which is a decision about the range field rather than about the
+	// preconditions, so serve makes it after this function has returned verdictSend, by calling
+	// evaluateRange. Step 6 is the file.
 	return verdictSend
 }
 
