@@ -8,8 +8,11 @@ import (
 	"sync"
 	"testing"
 
+	"zerodeps/zdh/internal/exchange"
+	"zerodeps/zdh/internal/flow"
 	"zerodeps/zdh/internal/h2"
 	"zerodeps/zdh/internal/hpack"
+	"zerodeps/zdh/internal/response"
 	"zerodeps/zdh/internal/server"
 	"zerodeps/zdh/internal/stream"
 )
@@ -42,23 +45,38 @@ func (l *serverLog) String() string {
 	return l.buf.String()
 }
 
-// noopRequests is the minimal stream.Requests: request semantics (RFC 9113
-// §8, static file handler) are the other half of this project and not built
-// yet, but the two CVEs below live entirely below that layer — in the
-// dynamic table's rate limiting and the frame reader's block limits — so a
-// handler that does nothing is sufficient to prove they fire.
-type noopRequests struct{}
+// minimalHandler answers every request with a bare 200 and no body. The two
+// CVEs this package tests both live below the request/response layer — in
+// the dynamic table's rate limiting and the frame reader's block limits —
+// so a handler only has to be correct enough not to get in the way.
+type minimalHandler struct{}
 
-func (noopRequests) Headers(s *stream.Stream, fields []h2.Field, endStream bool) error {
-	return nil
+func (minimalHandler) Serve(w *response.Writer, r *exchange.Request) {
+	w.WriteHeader([]h2.Field{{Name: ":status", Value: "200"}})
 }
-func (noopRequests) Data(s *stream.Stream, b []byte, endStream bool) error { return nil }
-func (noopRequests) Trailers(s *stream.Stream, fields []h2.Field) error    { return nil }
-func (noopRequests) Canceled(s *stream.Stream, code h2.ErrCode)            {}
 
-// startTestServer starts a real zdh server (Manas's internal/server, driving
-// internal/stream against this package's own internal/hpack.Codec) on a
-// loopback port and returns its address and its captured error log. The
+// streamHandler adapts internal/stream and internal/exchange to
+// server.StreamHandler, mirroring cmd/zdh/serve.go's newConn: the stream
+// table is embedded so its methods satisfy the interface directly, and
+// Close is overridden to end both the table and the request layer, since
+// internal/server holds only one Closer per connection but this stack has
+// two things that park goroutines.
+type streamHandler struct {
+	*stream.Table
+	reqs *exchange.Requests
+}
+
+var _ server.StreamHandler = streamHandler{}
+
+func (h streamHandler) Close(err error) {
+	h.Table.Close(err)
+	h.reqs.Close(err)
+}
+
+// startTestServer starts a real zdh server — internal/server driving
+// internal/stream, internal/exchange and internal/response exactly as
+// cmd/zdh wires them, against this package's own internal/hpack.Codec — on
+// a loopback port. It returns the address and the captured error log. The
 // server is closed when the test ends.
 func startTestServer(t *testing.T) (addr string, logs *serverLog) {
 	t.Helper()
@@ -69,11 +87,26 @@ func startTestServer(t *testing.T) (addr string, logs *serverLog) {
 	}
 
 	logs = &serverLog{}
-	srv := server.New(func(server.FrameEnqueuer) server.StreamHandler {
-		return stream.New(stream.Config{
-			Codec:    hpack.New(),
-			Requests: noopRequests{},
+	srv := server.New(func(w server.ConnWriter) server.StreamHandler {
+		enc := response.NewEncoder(hpack.New(), w)
+		sender := flow.NewSender()
+
+		reqs := exchange.New(exchange.Config{
+			Handler: minimalHandler{},
+			Encoder: enc,
+			Credit:  sender,
 		})
+
+		tab := stream.New(stream.Config{
+			Codec:    hpack.New(),
+			Requests: reqs,
+			Encoder:  enc,
+			Writer:   w,
+			Sender:   sender,
+		})
+		reqs.Attach(tab)
+
+		return streamHandler{Table: tab, reqs: reqs}
 	}, server.Config{
 		ErrorLog: log.New(logs, "", 0),
 	})
