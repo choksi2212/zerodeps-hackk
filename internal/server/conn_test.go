@@ -593,6 +593,12 @@ func TestInitialSettingsAdvertiseTheServersLimits(t *testing.T) {
 		// §8.4 already makes a client's PUSH_PROMISE a connection error, so this
 		// exists to tell the client it need not reserve anything for a push from us.
 		frame.SettingEnablePush: 0,
+
+		// One, because this server ignores RFC 9113's priority signals and implements
+		// RFC 9218's instead. §2.1.1 of RFC 9218 has a client that does not see this
+		// stop sending PRIORITY_UPDATE frames, so the value is what keeps the
+		// replacement signal arriving.
+		frame.SettingNoRFC7540Priorities: 1,
 	}
 	for id, value := range want {
 		got, ok := f.Get(id)
@@ -664,6 +670,65 @@ func TestInitialSettingsDoesNotSetTheInitialWindowSize(t *testing.T) {
 		t.Errorf("the server's SETTINGS advertises INITIAL_WINDOW_SIZE = %d; internal/stream sizes "+
 			"every stream receive window at %d and has no way to learn otherwise, so the two would "+
 			"disagree by %d octets per stream", v, flow.InitialWindowSize, int64(v)-flow.InitialWindowSize)
+	}
+}
+
+// TestNoRFC7540PrioritiesIsInTheFirstSettingsFrameOnly is §2.1 of RFC 9218's placement
+// rule, checked on the wire rather than on the value initialSettings returns.
+//
+// §2.1 of RFC 9218: "If endpoints use SETTINGS_NO_RFC7540_PRIORITIES, they MUST send it
+// in the first SETTINGS frame.  Senders MUST NOT change the
+// SETTINGS_NO_RFC7540_PRIORITIES value after the first SETTINGS frame."
+//
+// Both halves are one assertion here, because this server sends exactly one SETTINGS
+// frame carrying parameters: the preface. Every later one is an acknowledgement, and an
+// acknowledgement carries no parameters — §6.5 of RFC 9113 requires an empty payload —
+// so there is no second value to differ from the first. That is what this test pins: not
+// that the value never changes, but that there is no frame in which it could.
+func TestNoRFC7540PrioritiesIsInTheFirstSettingsFrameOnly(t *testing.T) {
+	ts := newTestSocket(&testTarget{}).
+		script(clientHello(t)).
+		script(encodeFrames(t, frame.SettingsFrame{Ack: true}, ping(1))).
+		atEOF()
+
+	if err := serve(t, ts, rejectingHandler(t), testTimeouts()); err != nil {
+		t.Fatalf("Serve: %v", err)
+	}
+
+	got := peerSaw(t, ts)
+	var settings []frame.SettingsFrame
+	for _, f := range got {
+		if sf, ok := f.(frame.SettingsFrame); ok {
+			settings = append(settings, sf)
+		}
+	}
+	if len(settings) < 2 {
+		t.Fatalf("the peer received %d SETTINGS frames, want the preface and at least one "+
+			"acknowledgement; it received %s", len(settings), describe(got))
+	}
+
+	v, ok := settings[0].Get(frame.SettingNoRFC7540Priorities)
+	if !ok {
+		t.Error("the first SETTINGS frame does not carry SETTINGS_NO_RFC7540_PRIORITIES, " +
+			"which is the only frame RFC 9218 §2.1 allows it in")
+	}
+	if v != 1 {
+		t.Errorf("the first SETTINGS frame says SETTINGS_NO_RFC7540_PRIORITIES = %d, want 1", v)
+	}
+	if settings[0].Ack {
+		t.Error("the server's first SETTINGS frame carries the ACK flag")
+	}
+
+	for i, sf := range settings[1:] {
+		if !sf.Ack {
+			t.Errorf("SETTINGS frame %d after the preface is not an acknowledgement; a second "+
+				"SETTINGS carrying parameters is where RFC 9218 §2.1's no-change rule could be "+
+				"broken", i+1)
+		}
+		if len(sf.Settings) != 0 {
+			t.Errorf("the acknowledgement carries %d parameters, want none (RFC 9113 §6.5)",
+				len(sf.Settings))
+		}
 	}
 }
 

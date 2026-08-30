@@ -348,6 +348,25 @@ func initialSettings() frame.SettingsFrame {
 		// statement that no promise from us will ever arrive, which lets a client
 		// stop reserving anything for one.
 		{ID: frame.SettingEnablePush, Value: 0},
+
+		// RFC 9218 §2.1: "Servers can send SETTINGS_NO_RFC7540_PRIORITIES with a
+		// value of 1 to indicate that they will ignore HTTP/2 priority signals sent
+		// by clients." This server does ignore them — frame.PriorityFrame is parsed
+		// and discarded, because §5.3 of RFC 9113 deprecated the scheme it belongs to
+		// — so saying so is the honest half of what this parameter is for.
+		//
+		// The other half is that it is not optional if the replacement is to work.
+		// §2.1.1 of RFC 9218: "Similarly, if the client receives
+		// SETTINGS_NO_RFC7540_PRIORITIES with a value of 0 or if the settings
+		// parameter was absent, it SHOULD stop sending PRIORITY_UPDATE frames
+		// (Section 7.1), since those frames are likely to be ignored." A server that
+		// implements extensible priorities and does not advertise this is asking its
+		// clients to stop sending the frames it implemented.
+		//
+		// It goes here rather than in a later SETTINGS because it cannot go anywhere
+		// else. §2.1 of RFC 9218: "If endpoints use SETTINGS_NO_RFC7540_PRIORITIES,
+		// they MUST send it in the first SETTINGS frame."
+		{ID: frame.SettingNoRFC7540Priorities, Value: 1},
 	}}
 }
 
