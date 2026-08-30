@@ -19,6 +19,31 @@ func mustParse(t *testing.T, field string) Params {
 	return p
 }
 
+// TestTheConstantsAreTheDocumentsNumbers pins the two numbers §4.1 of RFC 9218 gives,
+// because nothing else in this file can. Every other test reads DefaultUrgency rather
+// than 3, which is the right way to write them — a table that hard-coded the default
+// would have to be edited if this package ever renamed it — and the consequence is that
+// the constant's own value is asserted nowhere else. A DefaultUrgency of 0 would make
+// every unprioritized request the most urgent thing on the connection, and the whole
+// suite would stay green.
+//
+// §4.1 of RFC 9218: "between 0 and 7 inclusive, in descending order of priority"
+func TestTheConstantsAreTheDocumentsNumbers(t *testing.T) {
+	if DefaultUrgency != 3 {
+		t.Errorf("DefaultUrgency = %d, want 3", DefaultUrgency)
+	}
+	if MaxUrgency != 7 {
+		t.Errorf("MaxUrgency = %d, want 7", MaxUrgency)
+	}
+	// And the two have to be consistent with each other, because Urgency() returns the
+	// default for an absent parameter and its callers index a table of MaxUrgency+1
+	// entries with the result.
+	if DefaultUrgency < 0 || DefaultUrgency > MaxUrgency {
+		t.Errorf("DefaultUrgency %d is outside 0..%d, so Urgency() can return a value that "+
+			"WithUrgency would panic on", DefaultUrgency, MaxUrgency)
+	}
+}
+
 // TestParseDefaults is the shape of the field values that say nothing. Each of these has
 // to arrive as the zero Params — not as urgency 3 with the parameter marked present —
 // because §8 of RFC 9218 gives those two different answers when a response merges over
