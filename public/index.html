@@ -3,257 +3,249 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>zdh — HTTP/2 on the Go standard library alone</title>
+<title>zdh — we wrote HTTP/2 by hand because we have no self-control</title>
+<meta name="description" content="An HTTP/2 server written against the Go standard library alone. Zero dependencies. 147/147 h2spec. 1218 deliberate self-inflicted wounds.">
 <link rel="stylesheet" href="/assets/zdh.css">
 <link rel="icon" href="/assets/logo.svg" type="image/svg+xml">
 </head>
 <body>
+
+<!-- the moving aurora, the grid, the scanline. all CSS. no, we did not import a
+     particle library. we don't import anything. that's the entire bit. -->
+<div class="bg" aria-hidden="true">
+  <div class="aurora a1"></div>
+  <div class="aurora a2"></div>
+  <div class="aurora a3"></div>
+  <div class="grid-lines"></div>
+</div>
+
 <div class="wrap">
 
-<header>
-  <img src="/assets/logo.svg" alt="" width="56" height="56">
-  <div>
-    <h1>zdh</h1>
-    <p class="sub">An HTTP/2 server written against the Go standard library alone.
-       Every frame on this connection was encoded by hand.</p>
+<!-- ═══════════════════════ ACT 0 — COLD OPEN ═══════════════════════ -->
+<header class="hero reveal">
+  <div class="badge-row">
+    <span class="badge live"><i class="dot"></i> this page is alive right now</span>
+    <span class="badge">Zero Dependency Hackathon 2026 · Track C</span>
   </div>
+
+  <h1 class="title">
+    <span class="glitch" data-text="zdh">zdh</span>
+  </h1>
+
+  <p class="tagline">
+    You are looking at a webpage. Groundbreaking.<br>
+    The thing that sent it, however, <em>does not know what a webpage is.</em>
+  </p>
+
+  <p class="lede">
+    It knows <strong>frames</strong>. It knows <strong>streams</strong>. It knows
+    <strong>flow-control windows</strong> and <strong>Huffman tables</strong> and
+    the exact wording of <strong>RFC 9113 §5.1</strong> at 4am. It does
+    <em>not</em> know <code>net/http</code>, because we never introduced them.
+  </p>
+
+  <div class="hero-stats">
+    <div class="stat"><b data-count="0">0</b><span>dependencies. zero. none. nada.</span></div>
+    <div class="stat"><b data-count="147">0</b><span>/147 h2spec tests passed</span></div>
+    <div class="stat"><b data-count="1218">0</b><span>times we broke it on purpose</span></div>
+    <div class="stat"><b id="hero-proto">…</b><span>protocol your browser used</span></div>
+  </div>
+
+  <p class="scroll-cue">scroll. it gets worse. <span class="arrow">↓</span></p>
 </header>
 
-<!-- The hero band: the four claims a judge should leave with, each a number
-     rather than an adjective. The protocol and connection chips are filled in
-     from this page's own navigation timing, so even the headline is the
-     browser's word and not the server's. -->
-<section class="hero">
-  <div class="chip"><span class="chip-n" id="hero-deps">0</span><span class="chip-l">dependencies</span></div>
-  <div class="chip"><span class="chip-n" id="hero-proto">h2</span><span class="chip-l">this page's protocol</span></div>
-  <div class="chip"><span class="chip-n">147<span class="chip-sub">/147</span></span><span class="chip-l">h2spec --strict</span></div>
-  <div class="chip"><span class="chip-n">1218</span><span class="chip-l">guards each proven to fire</span></div>
-</section>
+<!-- ═══════════════════════ ACT I — THE CRIME ═══════════════════════ -->
+<section class="act reveal">
+  <p class="act-label">Act I</p>
+  <h2>We deleted the good one on purpose</h2>
 
-<main class="grid">
+  <div class="two-col">
+    <div>
+      <p class="big-text">
+        Go ships a perfectly excellent HTTP/2 implementation. Battle-tested.
+        Maintained by people with actual credentials. Free. Right there.
+        <code>import "net/http"</code>. Done in one line.
+      </p>
+      <p class="big-text">
+        We looked at it. We said <em>"no thank you."</em>
+      </p>
+      <p>
+        Then we spent 72 hours reimplementing the entire protocol by hand from
+        the RFCs, because the rules of this hackathon said <strong>zero
+        dependencies</strong> and we are the kind of people who read that as a
+        <em>dare</em>.
+      </p>
+      <p class="whisper">
+        Our build gate physically refuses to compile if <code>net/http</code>
+        appears anywhere in the dependency graph. We didn't trust ourselves. Correctly.
+      </p>
+    </div>
 
-<section class="card span">
-  <h2>What you are looking at</h2>
-  <p>This page arrived over HTTP/2 from a server that does not import
-     <code>net/http</code>. The connection preface, the SETTINGS exchange, the
-     HEADERS and DATA frames and the HPACK compression of every field below were
-     all written from scratch against RFC 9113 and RFC 7541.</p>
-  <p>Do not take that on trust. Everything on this page is read out of your own
-     browser's <a href="https://www.w3.org/TR/resource-timing/">Resource
-     Timing</a> entries, which your browser fills in from its own network stack
-     and not from anything the server can claim.</p>
-</section>
-
-<!-- System design: the package stack. Drawn as inline SVG rather than an image
-     so it is crisp at any size and carries no dependency of its own. The arrows
-     point one way, which is the point: nothing lower knows about anything
-     higher. -->
-<section class="card span">
-  <h2>System design — one directory, one way down</h2>
-  <p class="sub">Each box is one Go package. Arrows are imports, and they only
-     point down: the frame layer has never heard of a request.</p>
-  <div class="diagram" id="d-layers">
-    <svg viewBox="0 0 720 430" role="img" aria-label="Package layer diagram" preserveAspectRatio="xMidYMid meet">
-      <defs>
-        <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
-          <path d="M0,0 L10,5 L0,10 z" class="arrowhead"/>
-        </marker>
-      </defs>
-
-      <!-- edges first, so the boxes sit on top -->
-      <g class="edge">
-        <line x1="360" y1="70"  x2="360" y2="104" marker-end="url(#arr)"/>
-        <line x1="360" y1="150" x2="360" y2="184" marker-end="url(#arr)"/>
-        <line x1="250" y1="230" x2="250" y2="264" marker-end="url(#arr)"/>
-        <line x1="470" y1="230" x2="470" y2="264" marker-end="url(#arr)"/>
-        <line x1="250" y1="310" x2="250" y2="344" marker-end="url(#arr)"/>
-        <line x1="470" y1="310" x2="470" y2="344" marker-end="url(#arr)"/>
-      </g>
-
-      <g class="node accent">
-        <rect x="250" y="20" width="220" height="50" rx="8"/>
-        <text x="360" y="41">cmd/zdh</text>
-        <text x="360" y="59" class="node-sub">wires the two ports together</text>
-      </g>
-
-      <g class="node">
-        <rect x="250" y="104" width="220" height="46" rx="8"/>
-        <text x="360" y="123">internal/server</text>
-        <text x="360" y="140" class="node-sub">accept · TLS · lifecycle</text>
-      </g>
-
-      <g class="node">
-        <rect x="250" y="184" width="220" height="46" rx="8"/>
-        <text x="360" y="203">internal/stream</text>
-        <text x="360" y="220" class="node-sub">§5.1 state · flow control</text>
-      </g>
-
-      <g class="node">
-        <rect x="150" y="264" width="200" height="46" rx="8"/>
-        <text x="250" y="283">internal/request</text>
-        <text x="250" y="300" class="node-sub">§8 pseudo-headers</text>
-      </g>
-      <g class="node">
-        <rect x="370" y="264" width="200" height="46" rx="8"/>
-        <text x="470" y="283">internal/response</text>
-        <text x="470" y="300" class="node-sub">§8.3 · §6.5.2 encode</text>
-      </g>
-
-      <g class="node">
-        <rect x="150" y="344" width="200" height="46" rx="8"/>
-        <text x="250" y="363">internal/static</text>
-        <text x="250" y="380" class="node-sub">files · ranges · ETags</text>
-      </g>
-      <g class="node good">
-        <rect x="370" y="344" width="200" height="46" rx="8"/>
-        <text x="470" y="363">internal/hpack</text>
-        <text x="470" y="380" class="node-sub">RFC 7541 · Huffman</text>
-      </g>
-
-      <!-- the foundation, sitting under everything -->
-      <g class="node dim">
-        <rect x="20" y="184" width="150" height="46" rx="8"/>
-        <text x="95" y="203">internal/frame</text>
-        <text x="95" y="220" class="node-sub">RFC 9113 §4, §6</text>
-      </g>
-      <g class="edge dashed">
-        <line x1="95" y1="230" x2="95" y2="367" x2-hint="down"/>
-        <line x1="95" y1="367" x2="146" y2="367" marker-end="url(#arr)"/>
-      </g>
-    </svg>
+    <div class="terminal">
+      <div class="term-bar"><span></span><span></span><span></span><em>the receipts</em></div>
+      <pre id="term-type"></pre>
+    </div>
   </div>
-  <p class="legend"><span class="key accent"></span>entry point
-     <span class="key"></span>this half is Manas
-     <span class="key good"></span>this half is Mihir
-     <span class="key dim"></span>the frame layer everything rests on</p>
-</section>
 
-<!-- Control architecture: the concurrency model of one connection. This is the
-     invariant the whole server is built on, and it is exactly one sentence:
-     one reader, one writer that alone owns the socket, N stream goroutines that
-     never touch it. -->
-<section class="card span">
-  <h2>Control architecture — who is allowed to write</h2>
-  <p class="sub">One connection, three kinds of goroutine. Only one of them ever
-     touches the socket's write half; everyone else hands it a frame and walks
-     away. That is what keeps a multiplexed frame stream from interleaving into
-     nonsense.</p>
-  <div class="diagram" id="d-control">
-    <svg viewBox="0 0 720 360" role="img" aria-label="Concurrency model diagram" preserveAspectRatio="xMidYMid meet">
-      <defs>
-        <marker id="arr2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
-          <path d="M0,0 L10,5 L0,10 z" class="arrowhead"/>
-        </marker>
-      </defs>
-
-      <!-- the socket -->
-      <g class="node dim">
-        <rect x="290" y="20" width="140" height="46" rx="8"/>
-        <text x="360" y="39">TCP socket</text>
-        <text x="360" y="56" class="node-sub">one connection</text>
-      </g>
-
-      <!-- reader -->
-      <g class="node accent">
-        <rect x="40" y="140" width="200" height="60" rx="8"/>
-        <text x="140" y="163">reader goroutine</text>
-        <text x="140" y="181" class="node-sub">reads frames, never writes</text>
-      </g>
-
-      <!-- writer -->
-      <g class="node good">
-        <rect x="480" y="140" width="200" height="60" rx="8"/>
-        <text x="580" y="163">writer goroutine</text>
-        <text x="580" y="181" class="node-sub">SOLE owner of the write half</text>
-      </g>
-
-      <!-- stream goroutines -->
-      <g class="node">
-        <rect x="255" y="270" width="210" height="60" rx="8"/>
-        <text x="360" y="293">N stream goroutines</text>
-        <text x="360" y="311" class="node-sub">build responses, enqueue frames</text>
-      </g>
-
-      <g class="edge">
-        <!-- socket read -> reader -->
-        <path d="M300,55 C220,90 160,105 140,138" marker-end="url(#arr2)"/>
-        <!-- writer -> socket write -->
-        <path d="M580,138 C600,105 500,88 422,58" marker-end="url(#arr2)"/>
-        <!-- reader dispatches to streams -->
-        <path d="M160,200 C210,245 250,255 300,268" marker-end="url(#arr2)"/>
-        <!-- streams enqueue to writer -->
-        <path d="M430,270 C500,240 540,225 560,202" marker-end="url(#arr2)"/>
-      </g>
-      <text x="245" y="238" class="edge-label">dispatch</text>
-      <text x="470" y="238" class="edge-label">Enqueue()</text>
-    </svg>
+  <div class="callout">
+    <b>What "zero dependencies" actually means here:</b> <code>go.mod</code> is
+    three lines and lists nothing. <code>go.sum</code> <em>does not exist</em> —
+    that file only exists when you've let someone else's code in. The compiled
+    binary reports its own dependency count as <code>0</code>, read out of its
+    embedded build info, so you don't have to take our word for any of it.
   </div>
 </section>
 
-<!-- Data flow: one request, left to right, from octets on the wire to octets
-     back. The dot animates along the path so a reader watches a request move
-     through the layers rather than reading a list of them. -->
-<section class="card span">
-  <h2>Data flow — one request, end to end</h2>
-  <p class="sub">Follow the dot: this is a GET for a file, from the first octet
-     the kernel hands us to the DATA frames going back out.</p>
-  <div class="diagram" id="d-flow">
-    <svg viewBox="0 0 720 220" role="img" aria-label="Request data flow diagram" preserveAspectRatio="xMidYMid meet">
-      <path id="flow-path" d="M40,110 H680" class="flow-track"/>
-      <circle r="7" class="flow-dot">
-        <animateMotion dur="6s" repeatCount="indefinite" rotate="auto">
-          <mpath href="#flow-path"/>
-        </animateMotion>
-      </circle>
-
-      <!-- stops along the way -->
-      <g class="flow-stops">
-        <g transform="translate(40,110)">
-          <circle r="6"/><text y="-16">TCP</text><text y="26" class="node-sub">accept</text>
-        </g>
-        <g transform="translate(147,110)">
-          <circle r="6"/><text y="-16">TLS + ALPN</text><text y="26" class="node-sub">"h2"</text>
-        </g>
-        <g transform="translate(254,110)">
-          <circle r="6"/><text y="-16">preface</text><text y="26" class="node-sub">§3.4 SETTINGS</text>
-        </g>
-        <g transform="translate(360,110)">
-          <circle r="6"/><text y="-16">HEADERS</text><text y="26" class="node-sub">→ HPACK decode</text>
-        </g>
-        <g transform="translate(467,110)">
-          <circle r="6"/><text y="-16">stream table</text><text y="26" class="node-sub">§5.1 open</text>
-        </g>
-        <g transform="translate(573,110)">
-          <circle r="6"/><text y="-16">static</text><text y="26" class="node-sub">open · range · ETag</text>
-        </g>
-        <g transform="translate(680,110)">
-          <circle r="6"/><text y="-16">response</text><text y="26" class="node-sub">HEADERS + DATA out</text>
-        </g>
-      </g>
-    </svg>
-  </div>
-</section>
-
-<!-- The live view. The visualiser is the multiplexing card's summary made
-     visible: each request is a bar on one lane, drawn from its own Resource
-     Timing entry, so you watch dozens of streams overlap on a single
-     connection in real time. The frame ticker beside it names the frame types
-     the exchange is made of. -->
-<section class="card span">
-  <h2>Live — watch the streams multiplex</h2>
-  <p>HTTP/1.1 needs one connection per request in flight; a browser opens six to
-     one host and queues the rest. HTTP/2 interleaves them all on one. The button
-     below asks for <output id="count">64</output> resources at once, on the
-     single connection this page arrived on, and draws each one as it lands.</p>
-  <p class="controls">
-    <button id="run">Request 64 at once</button>
-    <button id="more" class="ghost">Ask for 256</button>
+<!-- ═══════════════════════ ACT II — THE JOURNEY ═══════════════════════ -->
+<section class="act reveal" id="journey">
+  <p class="act-label">Act II · the main event</p>
+  <h2>Follow one request. All the way there and all the way back.</h2>
+  <p class="big-text">
+    Press the button. A <em>real</em> request leaves your browser, crawls through
+    every layer we wrote by hand, and comes back with a file. The dot below is
+    the dramatization. The numbers at the bottom are the actual measurements from
+    the actual request. We are narrating our own crime scene.
   </p>
-  <p class="sub">Or link straight to the result: <code>/?run=64</code> runs it on load.</p>
+
+  <div class="journey-controls">
+    <button id="j-play" class="btn-big">▶ Send a real request</button>
+    <button id="j-replay" class="btn-ghost">↻ Again, slower</button>
+    <span class="j-status" id="j-status">idle · nothing has happened yet · disappointing</span>
+  </div>
+
+  <!-- the stage: browser on the left, our server stack on the right -->
+  <div class="stage" id="stage">
+    <div class="scanline" aria-hidden="true"></div>
+
+    <div class="side browser-side">
+      <p class="side-label">YOUR BROWSER</p>
+      <div class="node-b" id="b-click">
+        <b>the click</b>
+        <small>"give me that file"</small>
+      </div>
+      <div class="node-b" id="b-render">
+        <b>rendered</b>
+        <small>pixels. finally.</small>
+      </div>
+    </div>
+
+    <div class="wire" aria-hidden="true">
+      <span class="wire-label">one TCP connection · the whole time</span>
+    </div>
+
+    <div class="side server-side">
+      <p class="side-label">zdh · EVERY BOX IS OURS</p>
+      <div class="node-s" id="s-tcp"><b>net.Listener</b><small>accept</small></div>
+      <div class="node-s" id="s-tls"><b>crypto/tls + ALPN</b><small>negotiate "h2"</small></div>
+      <div class="node-s" id="s-preface"><b>connection preface</b><small>§3.4 · SETTINGS</small></div>
+      <div class="node-s" id="s-headers"><b>internal/frame</b><small>parse HEADERS</small></div>
+      <div class="node-s" id="s-hpack"><b>internal/hpack</b><small>RFC 7541 · Huffman</small></div>
+      <div class="node-s" id="s-stream"><b>internal/stream</b><small>§5.1 open stream 1</small></div>
+      <div class="node-s" id="s-request"><b>internal/request</b><small>§8 pseudo-headers</small></div>
+      <div class="node-s" id="s-static"><b>internal/static</b><small>open · ETag · range</small></div>
+      <div class="node-s" id="s-encode"><b>internal/response</b><small>encode + compress</small></div>
+      <div class="node-s" id="s-data"><b>DATA frames</b><small>flow-controlled</small></div>
+    </div>
+
+    <div class="packet" id="packet" aria-hidden="true"></div>
+  </div>
+
+  <!-- narration, swapped per station -->
+  <div class="narration" id="narration">
+    <div class="narr-step"><span id="narr-n">0</span><small>/ 12</small></div>
+    <div class="narr-body">
+      <h3 id="narr-title">Nothing is happening</h3>
+      <p class="quip" id="narr-quip">Press the button. I'm not going to beg.</p>
+      <p class="tech" id="narr-tech">Every step below is a real layer in this
+        server, and every citation is a real sentence in a real RFC that we have
+        read more times than is healthy.</p>
+    </div>
+  </div>
+
+  <div class="real-numbers" id="j-real" hidden>
+    <p class="rn-title">↑ that was a cartoon. <b>these are your real numbers</b>, straight out of your browser's own network stack:</p>
+    <dl>
+      <dt>protocol</dt><dd id="rn-proto">—</dd>
+      <dt>new connections opened</dt><dd id="rn-conn">—</dd>
+      <dt>time to first byte</dt><dd id="rn-ttfb">—</dd>
+      <dt>total round trip</dt><dd id="rn-total">—</dd>
+      <dt>bytes over the wire</dt><dd id="rn-bytes">—</dd>
+    </dl>
+  </div>
+</section>
+
+<!-- ═══════════════════════ ACT III — ARCHITECTURE ═══════════════════════ -->
+<section class="act reveal">
+  <p class="act-label">Act III</p>
+  <h2>Exactly one goroutine is allowed to touch the socket</h2>
+  <p class="big-text">
+    If two goroutines write frames to the same socket, their bytes interleave and
+    the entire connection becomes cursed nonsense forever. The peer reads a
+    header, takes the next N bytes as payload, and every frame after that is
+    misaligned until the heat death of the connection.
+  </p>
+  <p class="big-text">So we made it structurally impossible. One writer. It owns the pen.</p>
+
+  <div class="arch">
+    <div class="arch-node reader">
+      <span class="tag-mini">1 per connection</span>
+      <b>reader goroutine</b>
+      <p>Reads frames. Dispatches them. <em>Never writes.</em> Not allowed. Doesn't have the pen.</p>
+    </div>
+    <div class="arch-arrow">dispatch →</div>
+    <div class="arch-node streams">
+      <span class="tag-mini">N per connection</span>
+      <b>stream goroutines</b>
+      <p>Build responses in parallel. When they want to send something they
+         politely <code>Enqueue()</code> it and go away.</p>
+    </div>
+    <div class="arch-arrow">Enqueue() →</div>
+    <div class="arch-node writer">
+      <span class="tag-mini">exactly 1. ever.</span>
+      <b>writer goroutine</b>
+      <p><strong>SOLE OWNER of the write half.</strong> The only one with the pen.
+         Everything on the wire went through here, in order, alone.</p>
+    </div>
+  </div>
+
+  <div class="pkg-grid">
+    <div class="pkg"><b>internal/frame</b><span>All 10 frame types. RFC 9113 §4, §6. 211 tests, 5 fuzz targets.</span></div>
+    <div class="pkg"><b>internal/hpack</b><span>RFC 7541 header compression + Huffman, hand-built tables.</span></div>
+    <div class="pkg"><b>internal/stream</b><span>§5.1 state machine, §5.1.2 concurrency, CONTINUATION reassembly.</span></div>
+    <div class="pkg"><b>internal/flow</b><span>Both flow-control windows. Negative windows are legal. Ask us why.</span></div>
+    <div class="pkg"><b>internal/request</b><span>§8 semantics, pseudo-header validation, malformed-request rules.</span></div>
+    <div class="pkg"><b>internal/static</b><span>Conditional requests, byte ranges, strong ETags (RFC 9110).</span></div>
+    <div class="pkg"><b>internal/priority</b><span>RFC 9218 extensible priorities + a real write scheduler.</span></div>
+    <div class="pkg"><b>internal/sfv</b><span>RFC 9651 structured fields. Replaces a third-party library. Package killed.</span></div>
+  </div>
+</section>
+
+<!-- ═══════════════════════ ACT IV — MULTIPLEXING ═══════════════════════ -->
+<section class="act reveal">
+  <p class="act-label">Act IV</p>
+  <h2>HTTP/1.1 stands in a queue. HTTP/2 does not.</h2>
+  <p class="big-text">
+    HTTP/1.1 needs one connection per request in flight. Your browser opens six
+    and makes everything else <em>wait in line like it's 1997</em>. HTTP/2
+    interleaves all of them on a single connection.
+  </p>
+  <p class="big-text">
+    Don't take our word for it. Fire <output id="count">64</output> requests and
+    watch. Every bar is one real request. Count the new connections.
+    We'll wait.
+  </p>
+
+  <div class="journey-controls">
+    <button id="run" class="btn-big">⚡ Fire 64 requests at once</button>
+    <button id="more" class="btn-ghost">😈 No. 256.</button>
+  </div>
 
   <div class="live" id="live" hidden>
     <div class="live-viz">
-      <div class="lane-head"><span>one connection</span><span id="viz-clock">0 ms</span></div>
+      <div class="lane-head">
+        <span>one connection · <b id="viz-count">0</b> streams</span>
+        <span id="viz-clock">0 ms</span>
+      </div>
       <div class="lanes" id="lanes" aria-label="stream timeline"></div>
     </div>
     <div class="ticker" id="ticker" aria-label="frames on the wire"></div>
@@ -261,39 +253,147 @@
 
   <div id="result" class="result" hidden>
     <dl>
-      <dt>requests</dt><dd id="r-total">—</dd>
-      <dt>all on protocol</dt><dd id="r-proto">—</dd>
-      <dt>connections opened</dt><dd id="r-conns">—</dd>
+      <dt>requests fired</dt><dd id="r-total">—</dd>
+      <dt>protocol</dt><dd id="r-proto">—</dd>
+      <dt>new connections opened</dt><dd id="r-conns">—</dd>
       <dt>wall clock</dt><dd id="r-wall">—</dd>
-      <dt>slowest single request</dt><dd id="r-max">—</dd>
+      <dt>slowest single one</dt><dd id="r-max">—</dd>
     </dl>
-    <p class="sub" id="r-note"></p>
+    <p class="verdict" id="r-note"></p>
   </div>
 </section>
 
-<section class="card">
-  <h2>This page's own resources</h2>
-  <p class="sub">Protocol as your browser reports it. <code>h2</code> is HTTP/2.</p>
-  <table id="resources"><thead>
-    <tr><th>resource</th><th>protocol</th><th>type</th><th class="n">bytes</th><th class="n">ms</th></tr>
-  </thead><tbody></tbody></table>
+<!-- ═══════════════════════ ACT V — THE BOUNCER ═══════════════════════ -->
+<section class="act reveal">
+  <p class="act-label">Act V</p>
+  <h2>Things this server will refuse to your face</h2>
+  <p class="big-text">
+    A file server that serves any path you ask for is not a file server, it's a
+    <em>data breach with extra steps</em>. Each row below is a real request going
+    out right now. The first one is the control — proof the file is really there
+    and really servable. Every other row is the same file, asked for in a way
+    that deserves a 404.
+  </p>
+  <div class="table-wrap">
+    <table id="refusals"><thead>
+      <tr><th>what we asked for</th><th>got</th><th>why it deserved that</th></tr>
+    </thead><tbody></tbody></table>
+  </div>
 </section>
 
-<section class="card span">
-  <h2>What this server refuses</h2>
-  <p class="sub">Each of these is one request. The status is what came back.</p>
-  <table id="refusals"><thead>
-    <tr><th>request</th><th>status</th><th>why</th></tr>
-  </thead><tbody></tbody></table>
+<!-- ═══════════════════════ ACT VI — THE PARANOIA ═══════════════════════ -->
+<section class="act reveal">
+  <p class="act-label">Act VI</p>
+  <h2>We broke our own code 1,218 times to check the tests were awake</h2>
+
+  <p class="big-text">
+    A green test suite proves your code passes your tests. It says
+    <em>absolutely nothing</em> about whether your tests would notice if the code
+    stopped working. That thought kept us up. So we did something about it.
+  </p>
+  <p class="big-text">
+    For <strong>every single guard</strong> in this server — every deadline,
+    every bound, every protocol rule — there is a script that <em>deletes that
+    guard</em> and demands that a specific named test fail as a result. If the
+    test doesn't fail, we don't get to say the guard is tested. That's
+    <strong>1,218 deliberate self-inflicted wounds across 18 campaigns</strong>,
+    and every single one of them is caught.
+  </p>
+
+  <div class="paranoia">
+    <div class="para-card">
+      <b>147<span>/147</span></b>
+      <p><code>h2spec --strict</code></p>
+      <small>Somebody else's conformance suite. Not ours. You can run it against
+      this exact server yourself, and you should.</small>
+    </div>
+    <div class="para-card">
+      <b>1218</b>
+      <p>guards, each observed failing</p>
+      <small>If a guard has never been seen failing, nobody has tested it. It's
+      decoration. We don't ship decoration.</small>
+    </div>
+    <div class="para-card">
+      <b>327</b>
+      <p>RFC quotations, verified</p>
+      <small>A script checks every quoted sentence in our comments actually
+      appears in the RFC we credited. We caught ourselves misquoting nine times.
+      From memory. Confidently.</small>
+    </div>
+    <div class="para-card">
+      <b>2</b>
+      <p>real CVEs defended</p>
+      <small>Rapid reset (CVE-2023-44487) and the CONTINUATION flood
+      (CVE-2023-45288). Both attacks are in our own test suite, both bounce.</small>
+    </div>
+  </div>
+
+  <div class="callout alt">
+    <b>Our favourite catch:</b> returning a refused stream's verdict <em>before</em>
+    decoding its header block passes every test a normal person would write —
+    and silently desynchronises the HPACK dynamic table, so every later request
+    on that connection decodes into header fields <em>nobody ever sent</em>.
+    No crash. No error. Just quiet, confident nonsense forever. A green suite
+    would never have told us. The break did.
+  </div>
 </section>
 
-</main>
+<!-- ═══════════════════════ ACT VII — RECEIPTS ═══════════════════════ -->
+<section class="act reveal">
+  <p class="act-label">Act VII</p>
+  <h2>This page is also evidence</h2>
+  <p class="big-text">
+    Everything you just read was delivered by the thing it's describing. Here is
+    every asset this page loaded, with the protocol <em>your browser</em> reports
+    for each one — not what we claim, what it observed.
+  </p>
+  <div class="table-wrap">
+    <table id="resources"><thead>
+      <tr><th>resource</th><th>protocol</th><th>how</th><th class="n">bytes</th><th class="n">ms</th></tr>
+    </thead><tbody></tbody></table>
+  </div>
+  <p class="whisper">
+    And no, this page has no dependencies either. No React. No Tailwind. No
+    charting library. No font from a CDN. Every diagram is hand-written SVG and
+    every animation is CSS. It would have been <em>deeply</em> embarrassing to
+    ship a zero-dependency server with a demo page that dragged in three
+    megabytes of somebody else's JavaScript.
+  </p>
+</section>
 
-<footer>
-  <p>zdh — Zero Dependency Hackathon 2026, Track C. Served from a directory by
-     <code>internal/static</code>; framed by <code>internal/frame</code>;
-     compressed by <code>internal/hpack</code>. This page has no dependency
-     either: no framework, no CDN, every diagram is inline SVG.</p>
+<!-- ═══════════════════════ OUTRO ═══════════════════════ -->
+<footer class="reveal">
+  <h2 class="outro-title">Go on then. Verify it.</h2>
+  <div class="verify">
+    <div class="verify-item">
+      <span class="vnum">1</span>
+      <code>curl --http2 -sI https://zdh-hack-demo.duckdns.org/</code>
+      <small>should say <b>HTTP/2 200</b> and <b>server: zdh</b></small>
+    </div>
+    <div class="verify-item">
+      <span class="vnum">2</span>
+      <code>h2spec -h zdh-hack-demo.duckdns.org -p 80 --strict</code>
+      <small>the official suite, against this live box → <b>147/147</b></small>
+    </div>
+    <div class="verify-item">
+      <span class="vnum">3</span>
+      <code>go version -m bin/zdh</code>
+      <small>read the dependencies out of the compiled binary. there are <b>none</b></small>
+    </div>
+  </div>
+
+  <p class="credits">
+    <b>zdh</b> — Zero Dependency Hackathon 2026, Track C (Web &amp; Network).<br>
+    <b>Manas Choksi</b> — framing, connection lifecycle, streams, flow control,
+    request/response semantics, TLS &amp; ALPN, static serving, priorities,
+    structured fields, and the 18 break campaigns.<br>
+    <b>Mihir</b> — HPACK (RFC 7541), Huffman coding, and the attack harness that
+    tries to kill it.
+  </p>
+  <p class="sign-off">
+    Written against <code>net</code>, <code>crypto/tls</code> and the Go standard
+    library. Nothing else. We're going to go lie down now.
+  </p>
 </footer>
 
 </div><!-- /.wrap -->
