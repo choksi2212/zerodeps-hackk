@@ -1388,6 +1388,22 @@ BREAKS = [
         ],
     ),
 
+    (
+        "retire keeps the closed stream's priority, so the writer's table grows with the connection",
+        """		t.w.Forget(s.id)
+""",
+        "",
+        ["TestClosingAStreamForgetsItsPriority"],
+    ),
+
+    # --- Live: the predicate internal/server asks about PRIORITY_UPDATE ------
+    (
+        "Live answers for open streams only, so a half-closed stream cannot be reprioritized",
+        """func (t *Table) Live(id uint32) bool { return t.streams[id] != nil }""",
+        """func (t *Table) Live(id uint32) bool { return t.StateOf(id) == StateOpen }""",
+        ["TestLiveIsTheStreamsThatAreInTheTable"],
+    ),
+
     # --- what the log says ---------------------------------------------------
     #
     # Every one of these leaves a working server and an undiagnosable one. These

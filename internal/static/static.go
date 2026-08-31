@@ -8,16 +8,24 @@
 // # What it answers
 //
 // GET and HEAD, from a single directory tree. A target names a file, which is sent with a
-// content-length, a content-type and a last-modified; a target naming a directory is answered
-// with that directory's index.html, and one naming a directory without a trailing slash is
+// content-length, a content-type, an etag and a last-modified; a target naming a directory is
+// answered with that directory's index.html, and one naming a directory without a trailing slash is
 // redirected to the same target with one, so that the relative links inside the index
 // resolve against the directory rather than against its parent. Anything else — a missing
 // file, a directory with no index, a device, a socket, a name that could not be a file —
 // is a 404. Any other method is a 405 with an allow field.
 //
-// A request carrying preconditions is evaluated against that last-modified, in the order
+// A request carrying preconditions is evaluated against those two validators, in the order
 // §13.2.2 of RFC 9110 sets, and is answered with a 304 or a 412 where they fail. All of that
-// is in conditional.go, including the three date formats a peer may send one in.
+// is in conditional.go, including the three date formats a peer may send one in and the two
+// comparison functions the entity-tag fields are held to.
+//
+// A request carrying a range field is answered with a 206 and the octets it named — one part, or
+// a multipart/byteranges body where several ranges were satisfiable — and every response that
+// carries a representation advertises the feature with an accept-ranges field. That is ranges.go,
+// which is also where the two independent bounds live that keep the denial of service §17.15 of
+// RFC 9110 describes off this server: a range request cannot cost it more than one read of the
+// file it names.
 //
 // # What it does not do
 //
@@ -27,28 +35,39 @@
 //   - No directory listings. A listing discloses every name in a directory to anyone who
 //     guesses the directory. A server whose root is a build output should not be the
 //     thing that publishes the file nobody meant to copy there.
-//   - No range requests, and so no accept-ranges field. §14 of RFC 9110: "Range requests
-//     are an OPTIONAL feature of HTTP, designed so that recipients not implementing this
-//     feature (or not supporting it for the target resource) can respond as if it is a
-//     normal GET request without impacting interoperability" — and §14.2 of RFC 9110 says
-//     what that looks like from here: "A server MAY ignore the Range header field." A
-//     browser seeking in a video re-fetches it from the start.
-//   - No entity tags, and so no strong validator. §8.8.1 of RFC 9110 defines one as metadata
-//     that "changes value whenever a change occurs to the representation data that would be
-//     observable in the content of a 200 (OK) response to GET", and a size with a modification
-//     time cannot honour that — a file rewritten twice inside one second to the same length is
-//     a different representation with the same validator. The alternative offered by §8.8.1 of
-//     RFC 9110 — "A collision-resistant hash function applied to the representation data is
-//     also sufficient if the data is available prior to the response header fields being sent"
-//     — is a second full read of every file on every request, spent on a field no cache needs
-//     in order to revalidate a response that already carries a date. So last-modified is the
-//     only validator here, it is the weak one, and conditional.go uses it as one.
 //   - No content codings. Nothing is compressed on the way out and no .gz beside a file
 //     is served in its place, so §8.4's content-encoding field is never sent and every
 //     response carries its representation data as the file holds it.
 //   - No caching fields. No cache-control, no expires, no age. A response with none of
 //     them is heuristically cacheable per §4.2.2 of [CACHING], which for a static file is
 //     the behaviour a deployment wants and would otherwise have to ask for.
+//
+// # Validators
+//
+// Two, and both are sent on every response that describes a representation: an entity tag and a
+// last-modified date. That pair is what makes every conditional field in §13.1 of RFC 9110
+// answerable rather than three of the five.
+//
+// The tag is a SHA-256 of the file's content, which is the one construction §8.8.1 of RFC 9110's
+// definition of a strong validator survives — a size and a timestamp do not, because a file
+// rewritten twice inside one second to the same length is a different representation with the same
+// metadata. The cost that used to rule a hash out, a second full read of every file on every
+// request, is paid once per version of each file instead: etag.go holds the cache that does it, and
+// tagCall is why two requests for the same cold file still only read it once.
+//
+// That cache is keyed on the size and the timestamp the tag itself refuses to trust, which would
+// give back the weakness at the back door if it were left there. tagSettleWindow is the answer and
+// the argument for it: the pair is used as a key only once the filesystem could no longer record it
+// for a second write, and a file too recently written for that is hashed on every request instead.
+//
+// The date is the weak one and is used as one. modTime derives that from §8.8.2.2 of RFC 9110 and
+// conditional.go's date comparisons are orderings rather than equalities because of it.
+//
+// What the strong tag buys, beyond a more accurate 304, is if-range: a client resuming an
+// interrupted download names the tag it already has, this server compares it under the strong
+// comparison function, and an unchanged file is answered with the tail that was asked for rather
+// than with the whole thing. ifRangeIsFalse is where that comparison is, and it is also where the
+// date form of the same field is still refused — a weak validator cannot satisfy §13.1.5.
 //
 // # Confinement
 //
@@ -123,19 +142,28 @@ const (
 // have one, because a 412 is a failure a person may well be reading in a terminal — a
 // conditional request that failed against a file whose modification time is not what they
 // expected.
+//
+// The 206 has none either, for the opposite reason: its content is the representation, or the
+// parts of it the peer asked for, so there is no room in it for a sentence about itself. The 416
+// beside it does have one, and it is the only body in this list a peer is likely to read
+// programmatically rather than in a terminal — which is why the useful half of that answer is a
+// field and not the sentence. See unsatisfiedRange.
 const (
 	status200 = "200"
+	status206 = "206"
 	status301 = "301"
 	status304 = "304"
 	status404 = "404"
 	status405 = "405"
 	status412 = "412"
 	status414 = "414"
+	status416 = "416"
 
 	body404 = "404 not found\n"
 	body405 = "405 method not allowed\n"
 	body412 = "412 precondition failed\n"
 	body414 = "414 URI too long\n"
+	body416 = "416 range not satisfiable\n"
 )
 
 // serverName is the server field's value.
@@ -194,7 +222,16 @@ type Handler struct {
 	// gets 16 KiB frames anyway, which §4.2 permits — "Endpoints are not obligated to use
 	// all available space in a frame". The alternative is a buffer sized by whatever the
 	// peer asked for, which is memory per response that the peer is choosing.
+	//
+	// It is also the buffer a file's content is hashed through, which is why the pool is
+	// sized by responses in flight rather than by responses sending content: an entity tag
+	// is computed before the preconditions are evaluated, so a 304 borrows one too.
 	bufs sync.Pool
+
+	// tags is the entity-tag cache, which is what makes a strong validator affordable. It
+	// is the one piece of mutable state here that two requests can both reach, and the only
+	// one with a lock. See tagCache.
+	tags *tagCache
 }
 
 // New opens dir and returns a handler serving it.
@@ -230,6 +267,7 @@ func New(cfg Config) (*Handler, error) {
 			b := make([]byte, limits.MaxFrameSize)
 			return &b
 		}},
+		tags: newTagCache(maxTagCacheEntries),
 	}, nil
 }
 
@@ -319,13 +357,34 @@ func (h *Handler) serve(w *response.Writer, r *exchange.Request) error {
 	now := h.now().UTC()
 	mod := modTime(info, now)
 
-	switch evaluate(r, mod, now) {
+	// The entity tag before the preconditions, because three of them are questions about it and
+	// because §8.8.3 of RFC 9110 says when the answer is fixed: "The ETag field in a response
+	// provides the current entity tag for the selected representation, as determined at the
+	// conclusion of handling the request." A representation has been selected and nothing below
+	// changes which one, so this is that conclusion. The empty string is a file whose content could
+	// not be read a second time, and every reader of it treats that as no validator at all.
+	tag := h.etag(name, f, info, now)
+
+	switch evaluate(r, tag, mod, now) {
 	case verdictNotModified:
-		return h.notModified(w, now, mod)
+		return h.notModified(w, now, tag, mod)
 	case verdictFailed:
 		return h.answer(w, r, status412, textPlain, body412)
 	}
-	return h.file(w, r, f, info.Size(), mediaType(name), now, mod)
+
+	// The range field last, which is where §14.2 of RFC 9110 puts it: after the preconditions,
+	// and only on the path they left a 200 on. The two returns above are what make the rule in
+	// the same paragraph — that a range is ignored where a conditional GET would have answered
+	// 304 — true here without being restated. evaluateRange has the rest of the argument.
+	kind := mediaType(name)
+	switch spans, verdict := evaluateRange(r, tag, info.Size()); verdict {
+	case rangeNotSatisfiable:
+		return h.answer(w, r, status416, textPlain, body416,
+			h2.Field{Name: "content-range", Value: unsatisfiedRange(info.Size())})
+	case rangePartial:
+		return h.partial(w, f, spans, info.Size(), kind, tag, now, mod)
+	}
+	return h.file(w, r, f, info.Size(), kind, tag, now, mod)
 }
 
 // open opens a name inside the served directory and stats the handle.
@@ -352,6 +411,10 @@ func (h *Handler) open(name string) (*os.File, fs.FileInfo, error) {
 // now is the response's origination date and mod its last-modified, both from serve; the zero
 // time means the file has no modification date and the field is left out. See modTime.
 //
+// The accept-ranges field is added here rather than in fields, which is why it appears on this
+// response and on the field set of a HEAD but on nothing answer builds. withRanges says why that
+// is the right set.
+//
 // size comes from the same handle the content does, so the content-length and the content
 // agree unless the file changes underneath the response — a build writing into the served
 // directory while a browser reads from it. A file that grew is sent as it was, which is
@@ -359,8 +422,8 @@ func (h *Handler) open(name string) (*os.File, fs.FileInfo, error) {
 // from here. §8.6 of RFC 9110 makes the short body malformed and a peer will say so, which
 // is the truth about what happened. RST_STREAM would say it in the protocol instead, and
 // internal/exchange explains at finish why this server does not have one to send.
-func (h *Handler) file(w *response.Writer, r *exchange.Request, f *os.File, size int64, kind string, now, mod time.Time) error {
-	fields := withValidator(h.fields(now, status200, kind, size), mod)
+func (h *Handler) file(w *response.Writer, r *exchange.Request, f *os.File, size int64, kind, tag string, now, mod time.Time) error {
+	fields := withRanges(withValidator(h.fields(now, status200, kind, size), tag, mod))
 
 	// §9.3.2 of RFC 9110: "The server SHOULD send the same header fields in response to a
 	// HEAD request as it would have sent if the request method had been GET." Including the
@@ -405,27 +468,34 @@ func (h *Handler) file(w *response.Writer, r *exchange.Request, f *os.File, size
 // The field set is the whole of the decision, and §15.4.5 of RFC 9110 fixes half of it: "The
 // server generating a 304 response MUST generate any of the following header fields that would
 // have been sent in a 200 (OK) response to the same request". Of the four it then lists,
-// Content-Location, ETag and Vary are fields this server never sends and Date is one it always
-// sends, so the MUST is satisfied by the field set fields already builds. Last-Modified is not
-// on that list and is sent anyway, for the reason noContentLength gives: it is the metadata a
-// cache updates its stored entry from, and it is this server's only validator. content-length
-// and content-type are left out by that same argument read the other way.
+// Content-Location and Vary are fields this server never sends, Date is one it always sends, and
+// ETag is now one of the two it has — so on this response the MUST has something to do rather than
+// being satisfied by an absence. Last-Modified is not on that list and is sent anyway, for the
+// reason noContentLength gives: it is the metadata a cache updates its stored entry from.
+// content-length and content-type are left out by that same argument read the other way.
+//
+// The tag is the one computed from the file this 304 is about, not one echoed back out of the
+// request. A server that returned the peer's own if-none-match value would be agreeing with
+// whatever the peer said under weak comparison, where a W/ tag matches a strong one — so a client
+// holding a weak copy would be told its weak tag was the current one, and would go on revalidating
+// against a validator this server had never generated.
 //
 // Bodyless, and that is not a choice either — §15.4.5 of RFC 9110: "A 304 response is terminated
 // by the end of the header section; it cannot contain content or trailers." So the header
 // section carries END_STREAM, which is what WriteBodylessHeader means. A zero-length DATA frame
 // would be legal framing for an empty body and would still be a frame this response is not
 // allowed to have sent.
-func (h *Handler) notModified(w *response.Writer, now, mod time.Time) error {
-	return w.WriteBodylessHeader(withValidator(h.fields(now, status304, "", noContentLength), mod))
+func (h *Handler) notModified(w *response.Writer, now time.Time, tag string, mod time.Time) error {
+	return w.WriteBodylessHeader(withValidator(h.fields(now, status304, "", noContentLength), tag, mod))
 }
 
 // answer sends a complete response whose content is body, which may be empty.
 //
 // Its own clock reading rather than serve's, and it can be: no response built here carries a
 // validator. The 404, the 405, the 414 and the redirect are among the statuses §13.2.1 of RFC
-// 9110 puts ahead of the preconditions, and the 412 is a refusal to describe the representation
-// at all — so in none of them is there a second value the date has to agree with.
+// 9110 puts ahead of the preconditions; the 412 is a refusal to describe the representation at
+// all; and the 416 does describe one, but describes its length rather than its age. So in none of
+// them is there a second value the date has to agree with.
 func (h *Handler) answer(w *response.Writer, r *exchange.Request, status, kind, body string, extra ...h2.Field) error {
 	fields := append(h.fields(h.now().UTC(), status, kind, int64(len(body))), extra...)
 
@@ -452,9 +522,10 @@ func (h *Handler) answer(w *response.Writer, r *exchange.Request, status, kind, 
 // pseudo-header comes first, because §8.3 requires it before any field line. The rest is in no
 // particular order and is written in the order it is easiest to read.
 func (h *Handler) fields(now time.Time, status, kind string, length int64) []h2.Field {
-	// Room for the five this can build, plus one more without a second allocation — every
-	// caller adds at most one, either an extra field line or the validator.
-	fields := make([]h2.Field, 0, 6)
+	// Room for the five this can build, plus four more without a second allocation — which is
+	// the longest field set in this package: a single-part 206 adds both validators, the
+	// accept-ranges field and a content-range on top of the five.
+	fields := make([]h2.Field, 0, 9)
 
 	fields = append(fields, h2.Field{Name: ":status", Value: status})
 	if length != noContentLength {
@@ -483,22 +554,40 @@ func (h *Handler) fields(now time.Time, status, kind string, length int64) []h2.
 	return fields
 }
 
-// withValidator appends the last-modified field to fields, if there is a validator to send.
+// withValidator appends this representation's validators to fields: the entity tag, then the
+// last-modified date, each if there is one to send.
 //
-// The field is wanted wherever it can be had, and §8.8.2.1 of RFC 9110 says why: "An origin
+// Both, rather than a choice between them, because they answer different requests and a cache is
+// better off holding the pair. §8.8.1 of RFC 9110 is where the difference comes from and §8.8.3 of
+// RFC 9110 gives the practical half of it: "An entity tag can be more reliable for validation than
+// a modification date in situations where it is inconvenient to store modification dates, where the
+// one-second resolution of HTTP-date values is not sufficient, or where modification dates are not
+// consistently maintained." All three describe this server, which is why the tag is the validator
+// the preconditions prefer — but a client that only knows how to send if-modified-since is still
+// served by the date, and §13.2.2's ordering means the two never disagree about an answer.
+//
+// The date is wanted wherever it can be had, and §8.8.2.1 of RFC 9110 says why: "An origin
 // server SHOULD send Last-Modified for any selected representation for which a last
 // modification date can be reasonably and consistently determined, since its use in conditional
 // requests and evaluating cache freshness ([CACHING]) can substantially reduce unnecessary
 // transfers and significantly improve service availability and scalability." A file's
 // modification time is exactly such a date. modTime is where it is determined and where it is
 // clamped, and the zero time it returns is the filesystem saying there is none — the one case
-// this leaves the field out rather than sending a date it invented.
+// this leaves the field out rather than sending a date it invented. The empty tag is the same
+// thing for the other field, and etag says when it happens.
+//
+// The tag arrives already quoted, from hashContent, and no weakness indicator is ever added to it:
+// every tag this server sends is strong, which is what §8.8.3 of RFC 9110's default means and what
+// makes if-range answerable.
 //
 // Appended after the date and the server fields, which is where answer already puts its extra
 // field line. The order of distinct field lines carries no meaning; grouping the representation
-// metadata with the fields that fields builds would mean threading the validator through it, and
-// then every caller would pass a value all but two of them have nothing to say about.
-func withValidator(fields []h2.Field, mod time.Time) []h2.Field {
+// metadata with the fields that fields builds would mean threading both validators through it, and
+// then every caller would pass two values all but two of them have nothing to say about.
+func withValidator(fields []h2.Field, tag string, mod time.Time) []h2.Field {
+	if tag != "" {
+		fields = append(fields, h2.Field{Name: "etag", Value: tag})
+	}
 	if mod.IsZero() {
 		return fields
 	}

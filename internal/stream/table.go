@@ -105,17 +105,30 @@ type Encoder interface {
 }
 
 // Writer is the connection's frame writer as this table needs it: somewhere to put a
-// WINDOW_UPDATE, and nothing else.
+// WINDOW_UPDATE, and somewhere to report that a stream is over.
 //
 // Declared here rather than imported, for the reason every interface in this package
 // is. *server.frameWriter satisfies this by construction — internal/server declares
-// its own ConnWriter over the same method for the response side — and neither package
+// its own ConnWriter over the same methods for the response side — and neither package
 // imports the other.
 //
 // Enqueue may block, briefly, behind a peer that has stopped reading its socket, so
 // nothing here calls it while holding a lock. See ReportConsumed.
 type Writer interface {
 	Enqueue(f frame.Frame) error
+
+	// Forget says stream id is over and nothing further will be sent on it.
+	//
+	// This table calls it where a stream leaves the map, and the method is on this
+	// interface rather than being the write side's own business because the write side
+	// cannot see a stream close. What it drops is whatever it remembers per stream —
+	// today the stream's priority — and without the call that memory grows once per
+	// request for the life of the connection.
+	//
+	// It cancels nothing. Frames already queued for the stream are still written,
+	// which is required and not merely tolerated: the frame that closed the stream is
+	// one of them.
+	Forget(id uint32)
 }
 
 // Table is the stream table for one connection.
@@ -380,6 +393,19 @@ func (t *Table) StateOf(id uint32) State {
 
 // Stream is the live stream with identifier id, or nil if it is idle or closed.
 func (t *Table) Stream(id uint32) *Stream { return t.streams[id] }
+
+// Live reports whether stream id exists: open, or half-closed in either direction.
+//
+// The same question as StateOf without the three-way answer, and it is separate
+// because internal/server asks it about PRIORITY_UPDATE and would otherwise have to
+// import this package for a State constant. A predicate crosses that boundary; an
+// enumeration would drag the state machine over with it.
+//
+// It is separate from Stream for the same reason: a caller outside this package has no
+// business holding a *Stream, which belongs to the reader goroutine and carries the
+// state machine on it. This and Len are the two things the connection asks about the
+// set of live streams, and both are answered by the one map that defines that set.
+func (t *Table) Live(id uint32) bool { return t.streams[id] != nil }
 
 // SendEnd records that this server has sent END_STREAM on s, which is the other
 // half of §5.1's two-sided close.
@@ -1128,9 +1154,19 @@ func (t *Table) absent(kind string, id uint32) error {
 // response, if the stream closed underneath it: a writer parked for credit on a
 // stream the peer has just reset would otherwise wait for a WINDOW_UPDATE the peer
 // has no reason to send.
+//
+// The writer is told too, and for the same kind of reason: it remembers the stream's
+// priority for as long as the stream might still produce DATA, and this is where that
+// stops being true. Three maps keyed by identifier are emptied by these three lines —
+// this one, the Sender's send windows, and the writer's priority table — and there is
+// one place they are emptied from, which is what makes "one entry per live stream"
+// checkable rather than hopeful. The fourth, streamCredit, is the exception that
+// proves the rule: it belongs to handler goroutines rather than to this one, so it is
+// swept in drainCredit where its own lock is held.
 func (t *Table) retire(s *Stream) {
 	if s.state == StateClosed {
 		delete(t.streams, s.id)
 		t.sender.Retire(s.id)
+		t.w.Forget(s.id)
 	}
 }

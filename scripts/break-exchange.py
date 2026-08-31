@@ -39,7 +39,7 @@ payload and a peer's RST_STREAM turn into on the way to that handler and back.
   test that counts what is left in arriving rather than against one that checks a
   response.
 
-Two guards are not in this campaign, and both absences are deliberate.
+Three guards are not in this campaign, and all three absences are deliberate.
 
   `b.chunks[0] = nil`, the line that drops a consumed payload's slice header before the
   slice advances past it, has no test and cannot have one. What it changes is whether the
@@ -54,6 +54,21 @@ Two guards are not in this campaign, and both absences are deliberate.
   that is a bug -- Broadcast narrowed to Signal in end and in fail -- is broken, once
   each, and the two need different tests because one body with several readers is the
   only shape either can go wrong in.
+
+  The ordering inside Headers -- the priority signal made before r.start rather than after
+  it -- is the third, and it is missing because moving it is a mutation no test can be
+  trusted to catch. Both statements run on the connection's reader goroutine, and swapping
+  them leaves that goroutine one line from returning while the handler's goroutine still
+  has a scheduler hand-off and an entire handler in front of it, so the reader wins the
+  race it is supposed to lose: fifty runs of the two ordering tests, under -race, at
+  GOMAXPROCS 1 and 4, caught the swap zero times. A break that comes back a pass is a hole,
+  and one that comes back a pass almost always is a worse hole than an admitted gap,
+  because it reads as coverage. What
+  TestThePrioritySignalIsMadeBeforeTheHandlerCanEnqueueAnything does catch is the refactor
+  that actually threatens the line -- the signal moved onto the handler's goroutine, where
+  it races the PRIORITY_UPDATE that is meant to override it -- and that is a change in two
+  places, which no single entry here can express. The entry below that repeats the signal
+  from inside start is the closest one break gets to it.
 
 Run from the repository root. Restores both files on the way out, including on error.
 """
@@ -336,6 +351,60 @@ BREAKS = [
         [
             "TestAGetsBodyIsEmptyRatherThanAbsent",
             "TestAnUploadArrivesAsItWasFramed",
+        ],
+    ),
+
+    # --- exchange.go: the client's own priority signal (§5 of RFC 9218) ------
+    (
+        "New accepts a place to send priority signals and drops it on the floor",
+        """		credit:   cfg.Credit,
+		prios:    cfg.Priorities,""",
+        """		credit:   cfg.Credit,""",
+        [
+            "TestARequestsPriorityFieldReachesTheWriteSide",
+            "TestAPriorityFieldWithOneParameterResolvesTheOther",
+        ],
+    ),
+    (
+        "Headers reads the Priority field and never passes it on",
+        """	if r.prios != nil && req.Priority != (priority.Params{}) {
+		r.prios.Prioritize(s.ID(), req.Priority)
+	}
+
+	r.start(s.ID(), &Request{Request: req, Body: body})""",
+        """	r.start(s.ID(), &Request{Request: req, Body: body})""",
+        [
+            "TestARequestsPriorityFieldReachesTheWriteSide",
+            "TestThePrioritySignalIsMadeOnTheGoroutineThatDeliveredTheFrame",
+            "TestThePrioritySignalIsMadeBeforeTheHandlerCanEnqueueAnything",
+        ],
+    ),
+    (
+        "Headers signals the defaults for every request that named no priority at all",
+        """	if r.prios != nil && req.Priority != (priority.Params{}) {""",
+        """	if r.prios != nil {""",
+        ["TestARequestThatCarriesNoPriorityIsNotSignalled"],
+    ),
+    (
+        "Headers signals through a Priorities nobody supplied",
+        """	if r.prios != nil && req.Priority != (priority.Params{}) {""",
+        """	if req.Priority != (priority.Params{}) {""",
+        ["TestARequestIsAnsweredWithNowhereToSendItsPriority"],
+    ),
+    (
+        "start signals again from the handler's goroutine, so the write side hears it twice",
+        """	go func() {
+		defer func() {
+			if v := recover(); v != nil {""",
+        """	go func() {
+		if r.prios != nil && req.Priority != (priority.Params{}) {
+			r.prios.Prioritize(id, req.Priority)
+		}
+		defer func() {
+			if v := recover(); v != nil {""",
+        [
+            "TestARequestsPriorityFieldReachesTheWriteSide",
+            "TestAPriorityFieldWithOneParameterResolvesTheOther",
         ],
     ),
 

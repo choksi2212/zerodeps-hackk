@@ -1,6 +1,8 @@
 package static
 
 import (
+	"crypto/sha256"
+	"encoding/base64"
 	"errors"
 	"os"
 	"path/filepath"
@@ -325,20 +327,37 @@ func assertFields(t *testing.T, a *answer, want []h2.Field) {
 	}
 }
 
-// ok is the header section of a 200 on a file tree wrote: five fields and the validator,
-// in the order the encoder receives them.
-func ok(kind string, length int) []h2.Field {
+// ok is the header section of a 200 on a file tree wrote: five fields, the two validators and
+// the accept-ranges, in the order the encoder receives them.
+func ok(kind, tag string, length int) []h2.Field {
 	return []h2.Field{
 		{Name: ":status", Value: status200},
 		{Name: "content-length", Value: strconv.Itoa(length)},
 		{Name: "content-type", Value: kind},
 		{Name: "date", Value: clockField},
 		{Name: "server", Value: serverName},
+		{Name: "etag", Value: tag},
 		{Name: "last-modified", Value: fileTimeField},
+		{Name: "accept-ranges", Value: bytesUnit},
 	}
 }
 
 const page = "<!doctype html><title>zdh</title><h1>it works</h1>\n"
+
+// The entity tags of the three fixtures every exact field set below is asserted against,
+// written out rather than computed.
+//
+// A test that hashed the fixture itself would agree with any hash the handler happened to
+// implement, including one that hashed the file's name. These are literals, so the algorithm is
+// under test too: base64url of the SHA-256 of the content, unpadded, between two DQUOTEs, and
+// no weakness indicator. emptyTag is the one a reader can check without running anything — the
+// SHA-256 of the empty input is a published constant, e3b0c442… in hex, and 47DEQ… is that same
+// digest in the alphabet §5 of RFC 4648 defines.
+const (
+	pageTag   = `"OXECrR57fKPMyd98UqF6nkDKJ2f71sq6Ag71phW2dYs"`
+	moduleTag = `"o7E1vP6qvaXWeAZCzyVgWYia1GScm6T3pNXW6DpotAI"`
+	emptyTag  = `"47DEQpj8HBSa-_TImW-5JCeuQeRkm5NMpJWZG3hSuFU"`
+)
 
 // --- the ordinary answers ---------------------------------------------------
 
@@ -350,7 +369,7 @@ func TestServeFile(t *testing.T) {
 	if a.err != nil {
 		t.Fatalf("serve: %v", a.err)
 	}
-	assertFields(t, a, ok("text/html; charset=utf-8", len(page)))
+	assertFields(t, a, ok("text/html; charset=utf-8", pageTag, len(page)))
 	if a.body != page {
 		t.Errorf("content = %q, want %q", a.body, page)
 	}
@@ -384,7 +403,7 @@ func TestServeNestedFile(t *testing.T) {
 	h := newHandler(t, map[string]string{"assets/app.js": "export const a = 1\n"})
 	a := serve(t, h, methodGet, "/assets/app.js")
 
-	assertFields(t, a, ok("text/javascript; charset=utf-8", len("export const a = 1\n")))
+	assertFields(t, a, ok("text/javascript; charset=utf-8", moduleTag, len("export const a = 1\n")))
 	if a.body != "export const a = 1\n" {
 		t.Errorf("content = %q", a.body)
 	}
@@ -410,7 +429,7 @@ func TestServeEmptyFile(t *testing.T) {
 	h := newHandler(t, map[string]string{"empty.css": ""})
 	a := serve(t, h, methodGet, "/empty.css")
 
-	assertFields(t, a, ok("text/css; charset=utf-8", 0))
+	assertFields(t, a, ok("text/css; charset=utf-8", emptyTag, 0))
 	if a.body != "" {
 		t.Errorf("content = %q, want none", a.body)
 	}
@@ -432,7 +451,7 @@ func TestServeUnknownTypeIsOctetStream(t *testing.T) {
 		{"/README", "read me"},
 	} {
 		a := serve(t, h, methodGet, c.target)
-		assertFields(t, a, ok(octetStream, len(c.body)))
+		assertFields(t, a, ok(octetStream, tagOf(c.body), len(c.body)))
 		if a.body != c.body {
 			t.Errorf("GET %q content = %q, want %q", c.target, a.body, c.body)
 		}
@@ -892,6 +911,18 @@ func content(size int) string {
 	return string(b)
 }
 
+// tagOf is the entity tag a body of these octets gets, for the tests whose fixture is
+// generated rather than written out and for which a literal would say nothing.
+//
+// Built out of the standard library directly rather than by calling hashContent, so that it is
+// an independent statement of the format and not the same code checking itself. The three
+// literal tags above are the ones that hold the algorithm to its definition; this holds the
+// generated fixtures to those literals' format.
+func tagOf(body string) string {
+	sum := sha256.Sum256([]byte(body))
+	return `"` + base64.RawURLEncoding.EncodeToString(sum[:]) + `"`
+}
+
 // TestServeLargeFileIsSplitByFrameSize is the body arriving in the peer's shape: a file
 // larger than SETTINGS_MAX_FRAME_SIZE becomes as many DATA frames as that number requires,
 // and every octet is still in the right place.
@@ -900,7 +931,7 @@ func TestServeLargeFileIsSplitByFrameSize(t *testing.T) {
 	h := newHandler(t, map[string]string{"big.bin": body})
 
 	a := serve(t, h, methodGet, "/big.bin")
-	assertFields(t, a, ok(octetStream, len(body)))
+	assertFields(t, a, ok(octetStream, tagOf(body), len(body)))
 	if a.body != body {
 		t.Errorf("the content differs from the file: %d octets against %d", len(a.body), len(body))
 	}
@@ -997,7 +1028,7 @@ func TestFileGrewIsSentAsDeclared(t *testing.T) {
 
 	out := &collector{max: limits.MaxFrameSize}
 	w := response.NewWriter(response.NewEncoder(hpack.New(), out), &grants{}, 1)
-	err = h.file(w, req(t, methodGet, "/a.txt"), f, info.Size(), textPlain, clock.UTC(), fileTime)
+	err = h.file(w, req(t, methodGet, "/a.txt"), f, info.Size(), textPlain, theEntityTag, clock.UTC(), fileTime)
 	a := read(t, out, err)
 
 	if a.err != nil {
@@ -1032,7 +1063,7 @@ func TestFileShrankEndsTheStreamFirst(t *testing.T) {
 
 	out := &collector{max: limits.MaxFrameSize}
 	w := response.NewWriter(response.NewEncoder(hpack.New(), out), &grants{}, 1)
-	err = h.file(w, req(t, methodGet, "/a.txt"), f, int64(len(body))+10, textPlain, clock.UTC(), fileTime)
+	err = h.file(w, req(t, methodGet, "/a.txt"), f, int64(len(body))+10, textPlain, theEntityTag, clock.UTC(), fileTime)
 	a := read(t, out, err)
 
 	if !errors.Is(a.err, errFileChanged) {
@@ -1107,18 +1138,21 @@ func TestDateFromTheRealClock(t *testing.T) {
 	}
 }
 
-// TestNoEntityTagAndNoRanges is the scope in the package documentation, asserted as the
-// absence it is. Each of these fields is a promise this handler does not keep: an ETag
-// invites the comparison against a strong validator it does not have, and an accept-ranges
-// invites the range request it ignores.
+// TestFieldsThisHandlerNeverSends is the scope in the package documentation, asserted as the
+// absence it is. Each of these fields is a promise this handler does not keep: a cache-control
+// invites a deployment to believe this program has an opinion about freshness, and a
+// content-encoding claims a transformation nothing here performs.
 //
-// last-modified is not in the list any more — it is the one validator this handler does
-// send — and TestValidatorOnlyWhereThereIsARepresentation is where it belongs instead.
-func TestNoEntityTagAndNoRanges(t *testing.T) {
+// Neither validator is in the list. last-modified and etag are both sent, and each has its own
+// test of which responses carry it: TestValidatorOnlyWhereThereIsARepresentation. accept-ranges
+// is not in it either, since ranges.go shipped; TestAcceptRangesOnlyWhereThereIsARepresentation
+// is that field's own test. content-range stays, because none of the targets below can produce
+// the 206 or the 416 that carry one, so its absence here is still the assertion it was.
+func TestFieldsThisHandlerNeverSends(t *testing.T) {
 	h := newHandler(t, map[string]string{"index.html": page, "docs/index.html": page})
 
 	unsent := []string{
-		"etag", "accept-ranges", "content-range",
+		"content-range",
 		"cache-control", "expires", "age", "vary", "content-encoding",
 		"transfer-encoding", "connection", "keep-alive", "upgrade",
 	}
@@ -1139,14 +1173,17 @@ func TestNoEntityTagAndNoRanges(t *testing.T) {
 	}
 }
 
-// TestValidatorOnlyWhereThereIsARepresentation is which responses carry the last-modified and
+// TestValidatorOnlyWhereThereIsARepresentation is which responses carry the two validators and
 // which do not. §8.8.2.1 of RFC 9110: "An origin server SHOULD send Last-Modified for any
 // selected representation for which a last modification date can be reasonably and consistently
-// determined".
+// determined", and §8.8.3.1 of RFC 9110 the same for the other one: "An origin server SHOULD
+// send an ETag for any selected representation for which detection of changes can be reasonably
+// and consistently determined".
 //
-// On the answers below there is no selected representation: a 404 and a 405 describe no file at
-// all, a 301 describes where one would be found, a 414 refused to look, and a 412 is the refusal
-// §15.5.13 of RFC 9110 defines. A validator on any of them would be a modification time for a
+// Both fields are asserted together because the condition on them is the same phrase in both
+// sections, and on the answers below there is no selected representation: a 404 and a 405
+// describe no file at all, a 301 describes where one would be found, a 414 refused to look, and
+// a 412 is the refusal §15.5.13 of RFC 9110 defines. A validator on any of them would describe a
 // representation the peer was not given.
 func TestValidatorOnlyWhereThereIsARepresentation(t *testing.T) {
 	h := newHandler(t, map[string]string{"index.html": page, "docs/index.html": page})
@@ -1169,23 +1206,32 @@ func TestValidatorOnlyWhereThereIsARepresentation(t *testing.T) {
 			t.Errorf("%s %q answered %s, want %s", c.method, c.target, a.status(), c.status)
 			continue
 		}
-		got := a.get("last-modified")
-		switch {
-		case c.want && got != fileTimeField:
-			t.Errorf("%s %q last-modified = %q, want %q", c.method, c.target, got, fileTimeField)
-		case !c.want && got != "":
-			t.Errorf("%s %q sent last-modified %q on a %s", c.method, c.target, got, c.status)
+		for _, v := range []struct{ name, want string }{
+			{"last-modified", fileTimeField},
+			{"etag", pageTag},
+		} {
+			got := a.get(v.name)
+			switch {
+			case c.want && got != v.want:
+				t.Errorf("%s %q %s = %q, want %q", c.method, c.target, v.name, got, v.want)
+			case !c.want && got != "":
+				t.Errorf("%s %q sent %s %q on a %s", c.method, c.target, v.name, got, c.status)
+			}
 		}
 	}
 
 	// The 412 separately, because it is the one status here that needs a request to
-	// produce and the only one that is reached with a representation in hand.
+	// produce and the only one that is reached with a representation in hand. Which makes it the
+	// case worth having: the tag was computed before the precondition was evaluated, and it still
+	// does not go out.
 	a := serveCond(t, h, methodGet, "/index.html", h2.Field{Name: fieldIfMatch, Value: `"x"`})
 	if a.status() != status412 {
 		t.Fatalf("a failed if-match answered %s, want %s", a.status(), status412)
 	}
-	if got := a.get("last-modified"); got != "" {
-		t.Errorf("the 412 sent last-modified %q", got)
+	for _, name := range []string{"last-modified", "etag"} {
+		if got := a.get(name); got != "" {
+			t.Errorf("the 412 sent %s %q", name, got)
+		}
 	}
 }
 

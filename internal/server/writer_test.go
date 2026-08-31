@@ -13,6 +13,7 @@ import (
 
 	"zerodeps/zdh/internal/frame"
 	"zerodeps/zdh/internal/h2"
+	"zerodeps/zdh/internal/priority"
 )
 
 // gateWait bounds every wait in this file. A test that hangs tells you nothing
@@ -411,6 +412,542 @@ func TestCoalesceHighWaterCannotExceedATLSRecord(t *testing.T) {
 	}
 }
 
+// --- field blocks ------------------------------------------------------------
+
+// block is a field block spread over one HEADERS frame and len(rest) CONTINUATION
+// frames, with END_HEADERS on the last of them.
+func block(id uint32, first int, rest ...int) []frame.Frame {
+	frames := []frame.Frame{frame.HeadersFrame{
+		StreamID:   id,
+		EndHeaders: len(rest) == 0,
+		Fragment:   bytes.Repeat([]byte{0xaa}, first),
+	}}
+	for i, n := range rest {
+		frames = append(frames, frame.ContinuationFrame{
+			StreamID:   id,
+			EndHeaders: i == len(rest)-1,
+			Fragment:   bytes.Repeat([]byte{byte(i)}, n),
+		})
+	}
+	return frames
+}
+
+// TestFrameWriterKeepsAFieldBlockContiguous is §4.3 of RFC 9113 observed on the
+// wire, and the defect that replacing the channel was for.
+//
+// A response's header section is enqueued by internal/response from a stream
+// goroutine. A PING acknowledgement is enqueued by the connection's reader
+// goroutine, which is not holding internal/response's mutex and has no reason to.
+// Nothing in the two goroutines' timing keeps the second out of the middle of the
+// first, and a channel wrote them in the order they arrived — which §6.10 of
+// RFC 9113 entitles the peer to treat as a connection error of type PROTOCOL_ERROR.
+//
+// The decode is half the assertion on its own: frame.Reader enforces the same rule,
+// so an interleaved stream does not merely read back in the wrong order, it fails
+// to read back at all.
+func TestFrameWriterKeepsAFieldBlockContiguous(t *testing.T) {
+	tt := newGatedTarget()
+	w := startFrameWriter(tt, time.Second)
+
+	if err := w.Enqueue(ping(0)); err != nil {
+		t.Fatalf("Enqueue priming frame: %v", err)
+	}
+	letPriming := tt.awaitWrite(t)
+
+	// Exactly what the reader goroutine does when a peer pings twice during a
+	// header section, which is the arrival order a channel would have written out.
+	fields := block(1, 8, 8, 8)
+	interleaved := []frame.Frame{fields[0], ping(1), fields[1], ping(2), fields[2]}
+	for i, f := range interleaved {
+		if err := w.Enqueue(f); err != nil {
+			t.Fatalf("Enqueue frame %d (%s): %v", i, f.Type(), err)
+		}
+	}
+	letPriming(nil)
+
+	letBurst := tt.awaitWrite(t)
+	letBurst(nil)
+
+	w.Shutdown()
+	if err := waitStopped(t, w, tt); err != nil {
+		t.Fatalf("Wait: %v", err)
+	}
+
+	// The two acknowledgements overtake the block rather than being held behind
+	// it: they are nine and seventeen octets whose purpose is to keep the peer
+	// moving, and holding them behind a header section would be the same mistake
+	// in the other direction.
+	want := []frame.Frame{ping(0), ping(1), ping(2), fields[0], fields[1], fields[2]}
+	got := framesWritten(t, tt, frame.ReaderConfig{})
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("wrote\n got %#v\nwant %#v", got, want)
+	}
+}
+
+// TestFrameWriterCloseCannotTruncateAFieldBlock is the hazard the burst's own
+// stopping rule exists for, and it is reachable only through the high water.
+//
+// A block whose frames do not all fit under coalesceHighWater would, by the plain
+// reading of the coalescing rule, be flushed part-way through — putting a HEADERS
+// frame on the wire whose CONTINUATION frames are still queued. That is legal for
+// as long as the rest follows, and a Close arriving in the meantime is what makes
+// it permanent: the peer is left holding an unterminated field block and, by §6.10
+// of RFC 9113, a connection error. So the burst continues past the high water while
+// the scheduler is part-way through a block.
+//
+// The Close lands while the writer is inside the write, which is the only moment
+// that can distinguish the two behaviours.
+func TestFrameWriterCloseCannotTruncateAFieldBlock(t *testing.T) {
+	tt := newGatedTarget()
+	w := startFrameWriter(tt, time.Second)
+
+	if err := w.Enqueue(ping(0)); err != nil {
+		t.Fatalf("Enqueue priming frame: %v", err)
+	}
+	letPriming := tt.awaitWrite(t)
+
+	// The first frame alone crosses the high water, so every frame after it is
+	// buffered only because the block is unfinished.
+	fields := block(1, coalesceHighWater-4, 500, 500)
+	for i, f := range fields {
+		if err := w.Enqueue(f); err != nil {
+			t.Fatalf("Enqueue block frame %d: %v", i, err)
+		}
+	}
+	letPriming(nil)
+
+	letBlock := tt.awaitWrite(t)
+	w.Close()
+	letBlock(nil)
+
+	if err := waitStopped(t, w, tt); err != nil {
+		t.Fatalf("Wait: %v", err)
+	}
+
+	if got := tt.writeCount(); got != 2 {
+		t.Errorf("%d writes, want 2: the whole block belongs to the write the Close "+
+			"could not interrupt", got)
+	}
+	want := append([]frame.Frame{ping(0)}, fields...)
+	got := framesWritten(t, tt, frame.ReaderConfig{})
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("wrote %d frames, want %d: a Close must not leave a field block "+
+			"unterminated on the wire\n got %#v\nwant %#v", len(got), len(want), got, want)
+	}
+}
+
+// TestFrameWriterDropsAnIncompleteFieldBlockOnShutdown is the same rule from the
+// other side. A block whose CONTINUATION frames were never enqueued cannot be
+// completed by anyone, so a shutdown drops it rather than sending a HEADERS frame
+// that promises a continuation nobody will send.
+//
+// This is why await checks the graceful flag only with the queue empty and not with
+// the scheduler empty: an unfinished block is not in the queue.
+func TestFrameWriterDropsAnIncompleteFieldBlockOnShutdown(t *testing.T) {
+	tt := &testTarget{}
+	w := startFrameWriter(tt, time.Second)
+
+	opening := frame.HeadersFrame{StreamID: 1, Fragment: []byte("half a header section")}
+	if err := w.Enqueue(opening); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	w.Shutdown()
+	if err := waitStopped(t, w, tt); err != nil {
+		t.Fatalf("Wait: %v", err)
+	}
+
+	if got := tt.writeCount(); got != 0 {
+		t.Errorf("%d writes, want 0: a HEADERS frame without its continuation must not "+
+			"be sent", got)
+	}
+}
+
+// TestFrameWriterAdmitsAContinuationForAFullQueue is the one exception to the depth
+// bound, and it is a deadlock rather than a nicety.
+//
+// The bound is backpressure against a peer that has stopped reading. A CONTINUATION
+// frame for a block already begun is the opposite case: refusing it leaves a block
+// that can never be completed, which can never be written, so the queue never
+// drains and the connection stalls with the depth bound holding it shut. The frames
+// are bounded by the one block, which internal/response has already encoded in full
+// before it enqueues the first of them, so admitting them costs no memory that has
+// not already been spent.
+func TestFrameWriterAdmitsAContinuationForAFullQueue(t *testing.T) {
+	tt := newGatedTarget()
+	w := startFrameWriter(tt, time.Second)
+
+	if err := w.Enqueue(ping(0)); err != nil {
+		t.Fatalf("Enqueue priming frame: %v", err)
+	}
+	letPriming := tt.awaitWrite(t)
+
+	fields := block(1, 8, 8)
+	if err := w.Enqueue(fields[0]); err != nil {
+		t.Fatalf("Enqueue the HEADERS that opens the block: %v", err)
+	}
+	// An unfinished block does not count towards the depth, because it is not a
+	// frame that can be written; the queue is filled with frames that are.
+	for i := 1; i <= defaultQueueDepth; i++ {
+		if err := w.Enqueue(ping(uint64(i))); err != nil {
+			t.Fatalf("Enqueue frame %d, filling the queue: %v", i, err)
+		}
+	}
+
+	admitted := make(chan error, 1)
+	go func() { admitted <- w.Enqueue(fields[1]) }()
+	select {
+	case err := <-admitted:
+		if err != nil {
+			t.Errorf("the CONTINUATION completing an open block was refused: %v", err)
+		}
+	case <-time.After(gateWait):
+		t.Fatalf("the CONTINUATION completing an open block blocked on a full queue for %v; "+
+			"the block can never complete and the queue can never drain", gateWait)
+	}
+
+	w.Close()
+	letPriming(nil)
+	if err := waitStopped(t, w, tt); err != nil {
+		t.Errorf("Wait: %v", err)
+	}
+}
+
+// --- the two wakeups ---------------------------------------------------------
+//
+// One condition variable carries two different waits: the writer goroutine waiting
+// for a frame, and a stream goroutine waiting for room. Each side broadcasts for the
+// other, and neither broadcast is visible in a test that only checks what reaches the
+// peer in the end — Shutdown and Close broadcast too, so every test that stops the
+// writer is handed the missing wakeup for free. These two are what make the writer
+// live rather than merely correct, and both were holes in this file until a break
+// campaign asked for them.
+
+// TestFrameWriterWakesForAFrameEnqueuedWhileItWaits is Enqueue's broadcast.
+//
+// A writer parked on an empty queue is the ordinary state of an idle connection, and
+// the next frame to arrive is a response someone is waiting for. Without the broadcast
+// it sits in the queue until something else happens to wake the loop — the next
+// Enqueue, or the connection shutting down — so a lone response is delivered late or
+// not at all, on a server whose every other test still passes.
+func TestFrameWriterWakesForAFrameEnqueuedWhileItWaits(t *testing.T) {
+	tt := newGatedTarget()
+	w := startFrameWriter(tt, time.Second)
+
+	// The priming frame is what puts the loop through a full round: it cannot reach
+	// the write without having taken a frame, and it cannot leave the write without
+	// coming back to a queue that is now empty.
+	if err := w.Enqueue(ping(0)); err != nil {
+		t.Fatalf("Enqueue priming frame: %v", err)
+	}
+	letPriming := tt.awaitWrite(t)
+	letPriming(nil)
+
+	// Given time to park rather than assumed to have parked. If it has not, the
+	// Enqueue below is seen by a loop still on its way round to the wait, which is a
+	// weaker version of this assertion rather than a wrong one — so this cannot make
+	// the test flaky in the direction of passing.
+	time.Sleep(50 * time.Millisecond)
+	if got := tt.writeCount(); got != 1 {
+		t.Fatalf("%d writes with an empty queue, want the priming write alone", got)
+	}
+
+	if err := w.Enqueue(ping(1)); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	letSecond := tt.awaitWrite(t)
+	letSecond(nil)
+
+	w.Shutdown()
+	if err := waitStopped(t, w, tt); err != nil {
+		t.Fatalf("Wait: %v", err)
+	}
+	want := []frame.Frame{ping(0), ping(1)}
+	if got := framesWritten(t, tt, frame.ReaderConfig{}); !reflect.DeepEqual(got, want) {
+		t.Errorf("wrote\n got %#v\nwant %#v", got, want)
+	}
+}
+
+// TestFrameWriterAdmitsAWaitingEnqueueWhenTheWriterMakesRoom is await's broadcast,
+// and it is the other half of the depth bound: a bound that blocks is only
+// backpressure if something unblocks it.
+//
+// The frame sizes are the whole setup, and they are what makes this await's broadcast
+// rather than takeIf's. takeIf broadcasts for every frame it adds to a burst, so a
+// queue of small frames is drained by a run of wakeups and this assertion would hold
+// with await's removed. A first frame that fills the buffer on its own ends the burst
+// immediately — takeIf takes nothing, broadcasts nothing — so the one frame this
+// round removes from the queue is the one await took, and await's broadcast is the
+// only thing that can tell the caller waiting for that room about it.
+//
+// Which is not a contrived shape. It is a stream writing full-size DATA frames to a
+// peer that is reading slowly, or in other words a download on a slow connection:
+// every burst is one frame, and every frame's room has to be handed back through this
+// broadcast.
+//
+// Nothing else here is signalled — no Shutdown, no Close, no second Enqueue — and the
+// writer is left parked inside the write that followed, so the second round of the
+// loop cannot cover for the first.
+func TestFrameWriterAdmitsAWaitingEnqueueWhenTheWriterMakesRoom(t *testing.T) {
+	tt := newGatedTarget()
+	w := startFrameWriter(tt, time.Second)
+
+	if err := w.Enqueue(ping(0)); err != nil {
+		t.Fatalf("Enqueue priming frame: %v", err)
+	}
+	letPriming := tt.awaitWrite(t)
+
+	// All DATA on one stream, so the queue comes out in the order it went in: a PING
+	// would be served from the control lane ahead of the frame whose size this test
+	// depends on. The first alone crosses the high water.
+	queued := []frame.Frame{dataOn(1, string(make([]byte, coalesceHighWater)))}
+	for i := 1; i < defaultQueueDepth; i++ {
+		queued = append(queued, dataOn(1, "small"))
+	}
+	for i, f := range queued {
+		if err := w.Enqueue(f); err != nil {
+			t.Fatalf("Enqueue frame %d of %d, filling the queue: %v", i, len(queued), err)
+		}
+	}
+
+	admitted := make(chan error, 1)
+	go func() { admitted <- w.Enqueue(dataOn(1, "waiting")) }()
+	select {
+	case err := <-admitted:
+		t.Fatalf("Enqueue on a full queue returned %v before the writer had taken anything", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	// The writer comes back from the priming write, takes exactly one frame, and
+	// parks inside the write of it. One frame's worth of room now exists and the
+	// broadcast that says so is the only one this round produced.
+	letPriming(nil)
+	letBurst := tt.awaitWrite(t)
+
+	select {
+	case err := <-admitted:
+		if err != nil {
+			t.Errorf("the waiting Enqueue was refused rather than admitted: %v", err)
+		}
+	case <-time.After(gateWait):
+		t.Fatalf("a waiting Enqueue was not admitted within %v of the writer taking a frame "+
+			"off the queue, and nothing else is coming to wake it", gateWait)
+	}
+
+	// Released before the Close, so waitStopped is not left reporting a write this
+	// test asked for.
+	w.Close()
+	letBurst(nil)
+	if err := waitStopped(t, w, tt); err != nil {
+		t.Errorf("Wait: %v", err)
+	}
+}
+
+// --- priority ----------------------------------------------------------------
+//
+// dataOn, urgency and incremental are in scheduler_test.go, where the ordering rules
+// they express are tested directly. This section is about the two methods that carry a
+// priority signal from the connection into that scheduler, so it asserts on the octets
+// the peer receives rather than on the structure.
+
+// dataStreams is the stream identifier of each DATA frame the target received, in
+// order, with everything else dropped.
+//
+// The order is the whole assertion in this section, and DATA is the only thing the
+// scheduler reorders — so a priming PING that would otherwise have to be filtered by
+// hand in each test is filtered here instead.
+func dataStreams(t *testing.T, tt *testTarget) []uint32 {
+	t.Helper()
+	var ids []uint32
+	for _, f := range framesWritten(t, tt, frame.ReaderConfig{}) {
+		if f.Type() == frame.TypeData {
+			ids = append(ids, f.Stream())
+		}
+	}
+	return ids
+}
+
+// TestFrameWriterPrioritizeReordersTheQueue is the path a PRIORITY_UPDATE frame
+// travels: the connection's reader goroutine parses one and calls this, and the effect
+// has to be visible in the octets a stream goroutine's frames leave in.
+//
+// The gate is what makes it deterministic rather than probable. While the writer is
+// parked inside the priming write the queue is known to hold both DATA frames, so the
+// order they come out in is the scheduler's decision and not a race between two
+// Enqueue calls and a drain.
+//
+// Stream 3 is enqueued second and written first, which is the reordering §10 of RFC
+// 9218 asks for: "It is RECOMMENDED that, when possible, servers respect the urgency
+// parameter (Section 4.1), sending higher-urgency responses before lower-urgency
+// responses."
+func TestFrameWriterPrioritizeReordersTheQueue(t *testing.T) {
+	tt := newGatedTarget()
+	w := startFrameWriter(tt, time.Second)
+
+	if err := w.Enqueue(ping(0)); err != nil {
+		t.Fatalf("Enqueue priming frame: %v", err)
+	}
+	letPriming := tt.awaitWrite(t)
+
+	w.Prioritize(3, urgency(0))
+	for _, f := range []frame.Frame{dataOn(1, "one"), dataOn(3, "three")} {
+		if err := w.Enqueue(f); err != nil {
+			t.Fatalf("Enqueue DATA on stream %d: %v", f.Stream(), err)
+		}
+	}
+	letPriming(nil)
+	tt.awaitWrite(t)(nil)
+
+	w.Shutdown()
+	if err := waitStopped(t, w, tt); err != nil {
+		t.Fatalf("Wait: %v", err)
+	}
+
+	want := []uint32{3, 1}
+	if got := dataStreams(t, tt); !reflect.DeepEqual(got, want) {
+		t.Errorf("DATA reached the peer on streams %v, want %v: stream 3 was prioritized "+
+			"at urgency 0 and stream 1 is at the default of %d",
+			got, want, priority.DefaultUrgency)
+	}
+}
+
+// TestFrameWriterForgetDropsThePriorityItWasGiven is the bound on the only per-stream
+// table the write half keeps. A Forget that dropped nothing would leak one entry per
+// request for the life of the connection, and nothing on the wire would say so — which
+// is why the assertion is made on the wire instead, through the next response on the
+// same identifier.
+//
+// The two rounds are what make that assertion mean something. Round one is the control:
+// the same two Enqueue calls in the same order come out reordered, so the signal is
+// demonstrably in effect. Round two repeats them after a Forget and they come out in
+// the order stream identifiers ask for, which they could only do if the entry were
+// gone. Without round one this test would pass on a writer whose Prioritize did nothing
+// at all.
+//
+// Identifiers are reused across the rounds on purpose. A real connection never does
+// that — §5.1.1 of RFC 9113 forbids it — but the scheduler is keyed by identifier and
+// reusing one is the only way to ask it about an entry that should not be there.
+func TestFrameWriterForgetDropsThePriorityItWasGiven(t *testing.T) {
+	tt := newGatedTarget()
+	w := startFrameWriter(tt, time.Second)
+
+	if err := w.Enqueue(ping(0)); err != nil {
+		t.Fatalf("Enqueue priming frame: %v", err)
+	}
+	letPriming := tt.awaitWrite(t)
+
+	w.Prioritize(3, urgency(0))
+	for _, f := range []frame.Frame{dataOn(1, "one"), dataOn(3, "three")} {
+		if err := w.Enqueue(f); err != nil {
+			t.Fatalf("round 1: Enqueue DATA on stream %d: %v", f.Stream(), err)
+		}
+	}
+	letPriming(nil)
+
+	// The burst carrying round one is in progress, so both streams' queues are empty
+	// again and the priority table is all that is left of them. This is where a stream
+	// closing lands: internal/stream retires it and the retirement reaches Forget.
+	letRound1 := tt.awaitWrite(t)
+	w.Forget(3)
+	for _, f := range []frame.Frame{dataOn(1, "four"), dataOn(3, "two")} {
+		if err := w.Enqueue(f); err != nil {
+			t.Fatalf("round 2: Enqueue DATA on stream %d: %v", f.Stream(), err)
+		}
+	}
+	letRound1(nil)
+	tt.awaitWrite(t)(nil)
+
+	w.Shutdown()
+	if err := waitStopped(t, w, tt); err != nil {
+		t.Fatalf("Wait: %v", err)
+	}
+
+	// Round two in ascending identifier order is §10 of RFC 9218's rule for one band:
+	// "Non-incremental responses of the same urgency SHOULD be served by prioritizing
+	// bandwidth allocation in ascending order of the stream ID, which corresponds to
+	// the order in which clients make requests."
+	want := []uint32{3, 1, 1, 3}
+	if got := dataStreams(t, tt); !reflect.DeepEqual(got, want) {
+		t.Errorf("DATA reached the peer on streams %v, want %v: the first two are the "+
+			"control and the last two are after Forget, where stream 3 is back at the "+
+			"default urgency of %d", got, want, priority.DefaultUrgency)
+	}
+}
+
+// TestFrameWriterForgetKeepsTheFramesAlreadyQueued is the property that makes Forget
+// safe to call from a stream's retirement rather than after it.
+//
+// A stream closes because this server sent END_STREAM or RST_STREAM, and at the moment
+// it closes that frame is in this queue. A Forget that dropped the stream's queued
+// frames would therefore truncate the very response that closed the stream — turning a
+// bound on a map into lost content, which is the worse of the two failures by a long
+// way.
+func TestFrameWriterForgetKeepsTheFramesAlreadyQueued(t *testing.T) {
+	tt := newGatedTarget()
+	w := startFrameWriter(tt, time.Second)
+
+	if err := w.Enqueue(ping(0)); err != nil {
+		t.Fatalf("Enqueue priming frame: %v", err)
+	}
+	letPriming := tt.awaitWrite(t)
+
+	body := frame.DataFrame{StreamID: 1, Data: []byte("content"), EndStream: true}
+	if err := w.Enqueue(body); err != nil {
+		t.Fatalf("Enqueue the closing DATA frame: %v", err)
+	}
+	w.Forget(1)
+	letPriming(nil)
+	tt.awaitWrite(t)(nil)
+
+	w.Shutdown()
+	if err := waitStopped(t, w, tt); err != nil {
+		t.Fatalf("Wait: %v", err)
+	}
+
+	want := []uint32{1}
+	if got := dataStreams(t, tt); !reflect.DeepEqual(got, want) {
+		t.Fatalf("DATA reached the peer on streams %v, want %v: Forget dropped the frame "+
+			"that closed the stream", got, want)
+	}
+	for _, f := range framesWritten(t, tt, frame.ReaderConfig{}) {
+		if d, ok := f.(frame.DataFrame); ok && !bytes.Equal(d.Data, body.Data) {
+			t.Errorf("the DATA frame carried %q, want %q", d.Data, body.Data)
+		}
+	}
+}
+
+// TestFrameWriterPrioritizeAfterTheLoopDiesIsHarmless covers the call this server
+// cannot avoid making. A connection whose socket has failed still runs its stream
+// table down, and retiring a stream calls Forget — so both of these are reached on a
+// writer that has already stopped, and neither may panic or wait for a loop that is
+// never coming back.
+//
+// The timeout is the assertion. A mutex the dead loop failed to release turns both
+// calls into a hang, and a hang here is a connection goroutine that never exits.
+func TestFrameWriterPrioritizeAfterTheLoopDiesIsHarmless(t *testing.T) {
+	errBoom := errors.New("connection reset by peer")
+	tt := &testTarget{writeErr: errBoom}
+	w := startFrameWriter(tt, time.Second)
+
+	if err := w.Enqueue(ping(0)); err != nil {
+		t.Fatalf("Enqueue the frame that kills the loop: %v", err)
+	}
+	if err := waitStopped(t, w, tt); !errors.Is(err, errBoom) {
+		t.Fatalf("Wait = %v, want %v", err, errBoom)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		w.Prioritize(1, urgency(0))
+		w.Forget(1)
+	}()
+	select {
+	case <-done:
+	case <-time.After(gateWait):
+		t.Fatalf("Prioritize and Forget did not return within %v on a stopped writer", gateWait)
+	}
+}
+
 // --- stopping ----------------------------------------------------------------
 
 // TestFrameWriterShutdownWritesWhatIsQueued is how a GOAWAY reaches the peer.
@@ -419,16 +956,14 @@ func TestCoalesceHighWaterCannotExceedATLSRecord(t *testing.T) {
 // explanation still in it, which is the difference between a failure someone can
 // diagnose from a packet capture and a bare reset.
 //
-// Which internal path carries the GOAWAY out is deliberately not asserted: with
-// the queue ready and graceful closed, the loop's select picks between them at
-// random. Both write it, and that is the property — not which branch ran.
-//
-// Which is exactly why this is repeated, and the repetition is not caution. A
-// single attempt was tried first and it passed with the graceful branch's flush
-// deleted, because the queue branch had written the GOAWAY on that run instead.
-// One attempt can only show that one of the two branches sends it; twenty leave a
-// one-in-a-million chance of never taking the graceful branch at all, so a pass
-// means both do.
+// This used to run twenty times, and the reason it no longer needs to is the
+// change worth recording. With a channel, the loop selected over the queue and a
+// closed graceful channel, both branches wrote the GOAWAY, and Go chose between
+// them uniformly — so a single attempt proved only that one of the two paths sent
+// it, and an early version of this test passed with the graceful branch's flush
+// deleted. There is now one path: await drains the queue before it looks at the
+// graceful flag, so a GOAWAY queued before Shutdown is written every time and once
+// is enough to say so.
 func TestFrameWriterShutdownWritesWhatIsQueued(t *testing.T) {
 	goaway := frame.GoAwayFrame{
 		LastStreamID: 7,
@@ -436,44 +971,94 @@ func TestFrameWriterShutdownWritesWhatIsQueued(t *testing.T) {
 		Debug:        []byte("too many resets"),
 	}
 
-	for attempt := 0; attempt < 20; attempt++ {
-		tt := newGatedTarget()
-		w := startFrameWriter(tt, time.Second)
+	tt := newGatedTarget()
+	w := startFrameWriter(tt, time.Second)
 
-		// The priming frame parks the writer inside a Write, and that is what
-		// makes the rest of the attempt deterministic: the GOAWAY is queued and
-		// graceful is closed while the loop is somewhere it cannot observe
-		// either, so when it comes back to its select both cases are ready and
-		// the branch is genuinely chosen at random rather than by timing.
-		if err := w.Enqueue(ping(0)); err != nil {
-			t.Fatalf("attempt %d: Enqueue priming frame: %v", attempt, err)
-		}
-		letPriming := tt.awaitWrite(t)
+	// The priming frame parks the writer inside a Write, so the GOAWAY is queued
+	// and Shutdown is called while the loop is somewhere it can observe neither.
+	// That is the case a shutdown which dropped the queue would fail.
+	if err := w.Enqueue(ping(0)); err != nil {
+		t.Fatalf("Enqueue priming frame: %v", err)
+	}
+	letPriming := tt.awaitWrite(t)
 
-		if err := w.Enqueue(goaway); err != nil {
-			t.Fatalf("attempt %d: Enqueue GOAWAY: %v", attempt, err)
-		}
-		w.Shutdown()
-		letPriming(nil)
+	if err := w.Enqueue(goaway); err != nil {
+		t.Fatalf("Enqueue GOAWAY: %v", err)
+	}
+	w.Shutdown()
+	letPriming(nil)
 
-		// The assertion that catches a shutdown which drops the queue: with no
-		// second write the writer never arrives here and this reports it by name
-		// within gateWait, rather than the test hanging on Wait.
-		letGoAway := tt.awaitWrite(t)
-		letGoAway(nil)
+	// The assertion that catches a shutdown which drops the queue: with no second
+	// write the writer never arrives here and this reports it by name within
+	// gateWait, rather than the test hanging on Wait.
+	letGoAway := tt.awaitWrite(t)
+	letGoAway(nil)
 
-		if err := waitStopped(t, w, tt); err != nil {
-			t.Fatalf("attempt %d: Wait: %v", attempt, err)
-		}
+	if err := waitStopped(t, w, tt); err != nil {
+		t.Fatalf("Wait: %v", err)
+	}
 
-		got := framesWritten(t, tt, frame.ReaderConfig{})
-		if len(got) != 2 {
-			t.Fatalf("attempt %d: read back %d frames, want the priming PING and the GOAWAY",
-				attempt, len(got))
+	got := framesWritten(t, tt, frame.ReaderConfig{})
+	if len(got) != 2 {
+		t.Fatalf("read back %d frames, want the priming PING and the GOAWAY", len(got))
+	}
+	if !reflect.DeepEqual(got[1], goaway) {
+		t.Fatalf("GOAWAY read back as %#v, want %#v", got[1], goaway)
+	}
+}
+
+// TestFrameWriterShutdownRefusesAWaitingEnqueue is the other half of Shutdown, and
+// a case the channel could not decide.
+//
+// A stream goroutine blocked on a full queue when the connection starts shutting
+// down has to be told something, and with a channel it was told whichever of two
+// ready select cases Go picked: sometimes the frame went onto a queue that was
+// about to stop being drained, sometimes it was refused. Enqueue now re-examines
+// the stop flags before every push, so a Shutdown always wins the race against a
+// waiting caller — and the frame that would have been silently dropped is instead
+// reported to the layer that built it.
+func TestFrameWriterShutdownRefusesAWaitingEnqueue(t *testing.T) {
+	tt := newGatedTarget()
+	w := startFrameWriter(tt, time.Second)
+
+	if err := w.Enqueue(ping(0)); err != nil {
+		t.Fatalf("Enqueue priming frame: %v", err)
+	}
+	letPriming := tt.awaitWrite(t)
+
+	for i := 1; i <= defaultQueueDepth; i++ {
+		if err := w.Enqueue(ping(uint64(i))); err != nil {
+			t.Fatalf("Enqueue frame %d, filling the queue: %v", i, err)
 		}
-		if !reflect.DeepEqual(got[1], goaway) {
-			t.Fatalf("attempt %d: GOAWAY read back as %#v, want %#v", attempt, got[1], goaway)
+	}
+
+	blocked := make(chan error, 1)
+	go func() { blocked <- w.Enqueue(ping(1 << 20)) }()
+
+	// Given time to reach the wait rather than assumed to have reached it. If it
+	// has not, the Shutdown below is observed by the pre-check instead of by the
+	// wait, which is a weaker version of the same assertion rather than a wrong
+	// one — so this cannot make the test flaky in the direction of passing.
+	select {
+	case err := <-blocked:
+		t.Fatalf("Enqueue on a full queue returned %v before the writer stopped", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	w.Shutdown()
+	select {
+	case err := <-blocked:
+		if !errors.Is(err, errWriterStopped) {
+			t.Errorf("a waiting Enqueue released by Shutdown returned %v, want errWriterStopped", err)
 		}
+	case <-time.After(gateWait):
+		t.Fatalf("a waiting Enqueue was not released by Shutdown within %v", gateWait)
+	}
+
+	w.Close()
+	letPriming(nil)
+	if err := waitStopped(t, w, tt); err != nil {
+		t.Errorf("Wait: %v", err)
 	}
 }
 
@@ -481,39 +1066,36 @@ func TestFrameWriterShutdownWritesWhatIsQueued(t *testing.T) {
 // written. It is for a connection that is already lost, where there is no peer
 // left to explain anything to.
 //
-// The scenario is repeated because it is a race the code has to win every time,
-// not on average. Without the abrupt check that run makes before its main select,
-// a ready queue and a closed abrupt channel are two ready cases and Go picks
-// uniformly — so a single attempt would pass about half the time and the guard
-// would look present when it was not.
+// With a channel this needed twenty attempts, because a ready queue and a closed
+// abrupt channel were two ready select cases and Go picked uniformly: the loop
+// carried a separate non-blocking pre-check to stop it writing one more burst
+// about half the time, and a single attempt could not tell whether that pre-check
+// was there. await checks the abrupt flag before it looks at the queue, so the
+// precedence is now the order of two statements and one attempt observes it.
 func TestFrameWriterCloseDropsTheQueue(t *testing.T) {
-	for attempt := 0; attempt < 20; attempt++ {
-		tt := newGatedTarget()
-		w := startFrameWriter(tt, time.Second)
+	tt := newGatedTarget()
+	w := startFrameWriter(tt, time.Second)
 
-		if err := w.Enqueue(ping(0)); err != nil {
-			t.Fatalf("attempt %d: Enqueue priming frame: %v", attempt, err)
-		}
-		letPriming := tt.awaitWrite(t)
+	if err := w.Enqueue(ping(0)); err != nil {
+		t.Fatalf("Enqueue priming frame: %v", err)
+	}
+	letPriming := tt.awaitWrite(t)
 
-		if err := w.Enqueue(ping(1)); err != nil {
-			t.Fatalf("attempt %d: Enqueue queued frame: %v", attempt, err)
-		}
-		w.Close()
-		letPriming(nil)
+	if err := w.Enqueue(ping(1)); err != nil {
+		t.Fatalf("Enqueue queued frame: %v", err)
+	}
+	w.Close()
+	letPriming(nil)
 
-		if err := waitStopped(t, w, tt); err != nil {
-			t.Fatalf("attempt %d: Wait: %v", attempt, err)
-		}
-		if got := tt.writeCount(); got != 1 {
-			t.Fatalf("attempt %d: %d writes after Close, want 1: the queued frame must "+
-				"not be written", attempt, got)
-		}
-		got := framesWritten(t, tt, frame.ReaderConfig{})
-		if len(got) != 1 || !reflect.DeepEqual(got[0], ping(0)) {
-			t.Fatalf("attempt %d: read back %#v, want only the frame already being written",
-				attempt, got)
-		}
+	if err := waitStopped(t, w, tt); err != nil {
+		t.Fatalf("Wait: %v", err)
+	}
+	if got := tt.writeCount(); got != 1 {
+		t.Fatalf("%d writes after Close, want 1: the queued frame must not be written", got)
+	}
+	got := framesWritten(t, tt, frame.ReaderConfig{})
+	if len(got) != 1 || !reflect.DeepEqual(got[0], ping(0)) {
+		t.Fatalf("read back %#v, want only the frame already being written", got)
 	}
 }
 
@@ -522,43 +1104,41 @@ func TestFrameWriterCloseDropsTheQueue(t *testing.T) {
 // drained onto, and a graceful flush that ran anyway would write to a dead socket
 // and wait out the write timeout doing it.
 //
-// It cannot interrupt a flush already in progress — a write that has reached the
+// It cannot interrupt a burst already being written — a write that has reached the
 // socket is out of our hands — so both signals are raised while the writer is
 // parked, which is the case that is actually decidable.
 func TestFrameWriterCloseBeatsShutdown(t *testing.T) {
-	for attempt := 0; attempt < 20; attempt++ {
-		tt := newGatedTarget()
-		w := startFrameWriter(tt, time.Second)
+	tt := newGatedTarget()
+	w := startFrameWriter(tt, time.Second)
 
-		if err := w.Enqueue(ping(0)); err != nil {
-			t.Fatalf("attempt %d: Enqueue priming frame: %v", attempt, err)
-		}
-		letPriming := tt.awaitWrite(t)
+	if err := w.Enqueue(ping(0)); err != nil {
+		t.Fatalf("Enqueue priming frame: %v", err)
+	}
+	letPriming := tt.awaitWrite(t)
 
-		if err := w.Enqueue(ping(1)); err != nil {
-			t.Fatalf("attempt %d: Enqueue queued frame: %v", attempt, err)
-		}
-		w.Shutdown()
-		w.Close()
-		letPriming(nil)
+	if err := w.Enqueue(ping(1)); err != nil {
+		t.Fatalf("Enqueue queued frame: %v", err)
+	}
+	w.Shutdown()
+	w.Close()
+	letPriming(nil)
 
-		if err := waitStopped(t, w, tt); err != nil {
-			t.Fatalf("attempt %d: Wait: %v", attempt, err)
-		}
-		if got := tt.writeCount(); got != 1 {
-			t.Fatalf("attempt %d: %d writes after Shutdown then Close, want 1: Close wins",
-				attempt, got)
-		}
+	if err := waitStopped(t, w, tt); err != nil {
+		t.Fatalf("Wait: %v", err)
+	}
+	if got := tt.writeCount(); got != 1 {
+		t.Fatalf("%d writes after Shutdown then Close, want 1: Close wins", got)
 	}
 }
 
-// TestFrameWriterRefusesEnqueueAfterStopping covers the pre-check in Enqueue, and
-// specifically the case with a queue slot free — which is the only case that can
-// go wrong. A select whose send is ready and whose stop signal is closed picks
-// between them at random, and a frame accepted onto a queue that will never be
-// drained is lost silently: the layer above is told the frame was handed over.
+// TestFrameWriterRefusesEnqueueAfterStopping covers the check Enqueue makes before
+// every push. A frame accepted onto a queue that will never be drained is lost
+// silently: the layer above is told the frame was handed over.
 //
-// Repeated for the same reason as the Close test: one attempt would pass by luck.
+// The case with room free is the one that used to be able to go wrong, when the
+// send and the stop signal were two ready select cases and the choice between them
+// was Go's. It is now the order of two statements, so this asserts it once per stop
+// signal rather than two hundred times each.
 func TestFrameWriterRefusesEnqueueAfterStopping(t *testing.T) {
 	stops := []struct {
 		name string
@@ -569,31 +1149,35 @@ func TestFrameWriterRefusesEnqueueAfterStopping(t *testing.T) {
 	}
 	for _, tc := range stops {
 		t.Run(tc.name, func(t *testing.T) {
-			for attempt := 0; attempt < 200; attempt++ {
-				tt := &testTarget{}
-				w := startFrameWriter(tt, time.Second)
-				tc.stop(w)
+			tt := &testTarget{}
+			w := startFrameWriter(tt, time.Second)
+			tc.stop(w)
 
-				err := w.Enqueue(ping(1))
-				if !errors.Is(err, errWriterStopped) {
-					t.Fatalf("attempt %d: Enqueue after %s = %v, want errWriterStopped "+
-						"with a queue slot free", attempt, tc.name, err)
-				}
-				if err := waitStopped(t, w, tt); err != nil {
-					t.Fatalf("attempt %d: Wait: %v", attempt, err)
-				}
-				if got := tt.writeCount(); got != 0 {
-					t.Fatalf("attempt %d: %d writes, want 0: the refused frame must not "+
-						"reach the peer", attempt, got)
-				}
+			err := w.Enqueue(ping(1))
+			if !errors.Is(err, errWriterStopped) {
+				t.Fatalf("Enqueue after %s = %v, want errWriterStopped with room free",
+					tc.name, err)
+			}
+			if err := waitStopped(t, w, tt); err != nil {
+				t.Fatalf("Wait: %v", err)
+			}
+			if got := tt.writeCount(); got != 0 {
+				t.Fatalf("%d writes, want 0: the refused frame must not reach the peer", got)
 			}
 		})
 	}
 }
 
-// TestFrameWriterStopSignalsAreIdempotent proves the sync.Once on each. Closing a
-// closed channel panics, and the connection layer has several reasons to stop a
-// writer that can arrive together — a read error and a shutdown, say.
+// TestFrameWriterStopSignalsAreIdempotent is a property the connection layer needs
+// and no longer has to be engineered: the stop signals are flags under a mutex, and
+// setting a flag that is already set does nothing. They were closed channels, and
+// closing a closed channel panics, so each carried a sync.Once — which is what this
+// test was originally for.
+//
+// Keeping it is not sentiment. The connection layer has several reasons to stop a
+// writer that can arrive together, a read error and a shutdown among them, and a
+// future change that reintroduced something with a once-only step would break here
+// rather than in production.
 func TestFrameWriterStopSignalsAreIdempotent(t *testing.T) {
 	tt := &testTarget{}
 	w := startFrameWriter(tt, time.Second)
@@ -682,6 +1266,45 @@ func TestFrameWriterLatchesAWriteError(t *testing.T) {
 	}
 }
 
+// TestFrameWriterReportsTheWriteErrorAfterAShutdown is the order of the two checks
+// inside stopped, which is the difference between a diagnosable connection failure and
+// a shrug.
+//
+// A write fails, and the connection layer then does what it does on every ending: it
+// stops the writer, without knowing it has already stopped. Both facts are now true —
+// the loop is gone and a stop flag is set — so a late Enqueue could be told either
+// one. The failure is the useful one. errWriterStopped says this server has stopped
+// writing; the write error says why, and the layer that gets it is the one holding a
+// response it now cannot send.
+func TestFrameWriterReportsTheWriteErrorAfterAShutdown(t *testing.T) {
+	wantErr := errors.New("connection reset by peer")
+	tt := &testTarget{writeErr: wantErr}
+	w := startFrameWriter(tt, time.Second)
+
+	if err := w.Enqueue(ping(1)); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	if err := waitStopped(t, w, tt); !errors.Is(err, wantErr) {
+		t.Fatalf("Wait = %v, want %v", err, wantErr)
+	}
+
+	w.Shutdown()
+	if err := w.Enqueue(ping(2)); !errors.Is(err, wantErr) {
+		t.Errorf("Enqueue after a failed write and a Shutdown = %v, want the write error: "+
+			"the shutdown is this server's own reaction to the failure and tells the "+
+			"caller nothing the failure does not", err)
+	}
+
+	// And with both flags set, which is the state a connection reaches when its read
+	// half and its write half fail together — the case that made the two stop signals
+	// idempotent in the first place.
+	w.Close()
+	if err := w.Enqueue(ping(3)); !errors.Is(err, wantErr) {
+		t.Errorf("Enqueue after a failed write, a Shutdown and a Close = %v, want the "+
+			"write error", err)
+	}
+}
+
 // TestFrameWriterReportsAShortWrite covers an io.Writer that breaks its contract:
 // fewer octets than it was given, and no error. Left alone that truncates a frame
 // mid-payload and every frame after it is read at the wrong offset, so it has to
@@ -753,13 +1376,15 @@ func TestFrameWriterSetsTheWriteDeadline(t *testing.T) {
 	}
 }
 
-// TestFrameWriterSetsNoDeadlineWithNothingToWrite covers the empty-flush check.
+// TestFrameWriterSetsNoDeadlineWithNothingToWrite is the syscall a shutdown on an
+// idle connection does not make, and most connections close idle.
 //
-// The octets were never at risk — frame.Writer.Flush returns without calling Write
-// when nothing is buffered — so what this check saves is the syscall to set the
-// deadline, and the deadline count is therefore the only way to observe it. The
-// graceful shutdown path reaches it on every connection that closes with an empty
-// queue, which is most of them.
+// It used to be a guard inside flush, which returned early with nothing buffered
+// because the graceful path flushed unconditionally. await removed the reason: the
+// loop takes a frame or it stops, so with nothing queued it never reaches a flush
+// at all and there is no empty case left to guard. The assertion is unchanged
+// because the observable behaviour is — the deadline count is still the only way to
+// see it, since frame.Writer.Flush never had octets at risk here.
 func TestFrameWriterSetsNoDeadlineWithNothingToWrite(t *testing.T) {
 	tt := &testTarget{}
 	w := startFrameWriter(tt, time.Second)
@@ -1023,6 +1648,162 @@ func TestFrameWriterSurvivesConcurrentEnqueue(t *testing.T) {
 	}
 }
 
+// TestFrameWriterSurvivesConcurrentPrioritize is the same invariant against the second
+// caller this type has. Prioritize and Forget are called from the connection's reader
+// goroutine while every stream goroutine is in Enqueue, so the scheduler — which holds
+// no lock of its own and says so — is being mutated from two directions at once.
+//
+// The assertion is a multiset rather than an order, which is the honest one: the order
+// is what the priority signals are asking to change, and a test that pinned it would be
+// asserting a schedule nobody promised. What must survive is every frame, exactly once
+// and decodable, because a lost frame is a truncated response and a torn one desynchronises
+// the peer for good. The rest is the race detector's, and it runs over this package in
+// the gate.
+//
+// The signals themselves are deliberately hostile: every urgency, both kinds of
+// participant, and a Forget arriving while the stream still has frames coming — which is
+// not a sequence a correct peer produces, and is exactly the sequence that moves a stream
+// between rings while another goroutine is appending to its queue.
+func TestFrameWriterSurvivesConcurrentPrioritize(t *testing.T) {
+	const senders, each = 8, 64
+	tt := &testTarget{}
+	w := startFrameWriter(tt, 10*time.Second)
+
+	// streamOf spreads the senders over odd identifiers, the way §5.1.1 of RFC 9113
+	// says a client's streams arrive.
+	streamOf := func(g int) uint32 { return uint32(2*g + 1) }
+
+	var wg sync.WaitGroup
+	for g := 0; g < senders; g++ {
+		wg.Add(1)
+		go func(g int) {
+			defer wg.Done()
+			for i := 0; i < each; i++ {
+				f := frame.DataFrame{StreamID: streamOf(g), Data: []byte{byte(g), byte(i)}}
+				if err := w.Enqueue(f); err != nil {
+					t.Errorf("sender %d frame %d: Enqueue: %v", g, i, err)
+					return
+				}
+			}
+		}(g)
+	}
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < senders*each; i++ {
+			id := streamOf(i % senders)
+			w.Prioritize(id, urgency(i%numBands).WithIncremental(i%2 == 0))
+			if i%16 == 0 {
+				w.Forget(id)
+			}
+		}
+	}()
+
+	// Every sender is finished before the shutdown, for the reason
+	// TestFrameWriterSurvivesConcurrentEnqueue gives: Enqueue after a Shutdown is
+	// refused by design, and a test that raced the two would be asserting that frames
+	// it never handed over went missing.
+	wg.Wait()
+
+	w.Shutdown()
+	if err := waitStopped(t, w, tt); err != nil {
+		t.Fatalf("Wait: %v", err)
+	}
+
+	got := framesWritten(t, tt, frame.ReaderConfig{})
+	if len(got) != senders*each {
+		t.Fatalf("read back %d frames, want %d", len(got), senders*each)
+	}
+	type payload struct {
+		id   uint32
+		body string
+	}
+	seen := make(map[payload]int, len(got))
+	for i, f := range got {
+		d, ok := f.(frame.DataFrame)
+		if !ok {
+			t.Fatalf("frame %d is a %s, want DATA", i, f.Type())
+		}
+		seen[payload{d.StreamID, string(d.Data)}]++
+	}
+	for g := 0; g < senders; g++ {
+		for i := 0; i < each; i++ {
+			want := payload{streamOf(g), string([]byte{byte(g), byte(i)})}
+			if n := seen[want]; n != 1 {
+				t.Errorf("frame from sender %d sequence %d arrived %d times, want once", g, i, n)
+			}
+		}
+	}
+}
+
+// TestFrameWriterReleasesEveryWaiterWhenTheLoopDies is the liveness property the
+// whole condition variable rests on: a stream goroutine blocked on a full queue
+// when the socket dies has to be released by something, and the only something is
+// what stop does.
+//
+// The rounds are for the omission — a missing broadcast leaves eight goroutines
+// blocked for ever and is reported by name within gateWait rather than as a package
+// timeout ten minutes later, with every goroutine in the binary attached.
+//
+// What the rounds are honestly not for is the ordering inside stop: the flag a
+// waiter wakes to read is set while the mutex is still held, and setting it after
+// releasing the mutex instead was measured to pass all two hundred rounds, because
+// the two statements are adjacent and the window is a few instructions wide. That
+// version is caught by the race detector instead — the flag becomes an unsynchronised
+// write against a read under the mutex — and the race detector runs over this
+// package in the gate. Worth writing down, because a test that looked like it
+// covered the ordering and did not would be worse than one that says so.
+func TestFrameWriterReleasesEveryWaiterWhenTheLoopDies(t *testing.T) {
+	baseline := goroutineBaseline()
+	errBoom := errors.New("connection reset by peer")
+
+	const rounds, waiters = 200, 8
+	for round := 0; round < rounds; round++ {
+		tt := newGatedTarget()
+		w := startFrameWriter(tt, time.Second)
+
+		// Parked inside the priming write, so the queue can be filled to the depth
+		// and the waiters below are genuinely waiting rather than racing a drain.
+		if err := w.Enqueue(ping(0)); err != nil {
+			t.Fatalf("round %d: Enqueue priming frame: %v", round, err)
+		}
+		letPriming := tt.awaitWrite(t)
+		for i := 1; i <= defaultQueueDepth; i++ {
+			if err := w.Enqueue(ping(uint64(i))); err != nil {
+				t.Fatalf("round %d: Enqueue frame %d, filling the queue: %v", round, i, err)
+			}
+		}
+
+		released := make(chan error, waiters)
+		for i := 0; i < waiters; i++ {
+			go func(i int) { released <- w.Enqueue(ping(uint64(1<<20 + i))) }(i)
+		}
+
+		// The write fails, which is the one way the loop ends with neither stop
+		// flag set — so the waiters can only be released by what stop does.
+		letPriming(errBoom)
+
+		for i := 0; i < waiters; i++ {
+			select {
+			case err := <-released:
+				if !errors.Is(err, errBoom) {
+					t.Fatalf("round %d: a released Enqueue returned %v, want the write error",
+						round, err)
+				}
+			case <-time.After(gateWait):
+				t.Fatalf("round %d: %d of %d waiters were still blocked %v after the writer "+
+					"died", round, waiters-i, waiters, gateWait)
+			}
+		}
+		if err := w.Wait(); !errors.Is(err, errBoom) {
+			t.Fatalf("round %d: Wait = %v, want the write error", round, err)
+		}
+	}
+
+	assertNoGoroutineLeak(t, baseline)
+}
+
 // TestFrameWriterDoesNotLeakItsGoroutine is the §12.4 check applied to the writer.
 // One goroutine that outlives its connection turns connect-and-disconnect into a
 // denial of service, so both stop paths are exercised.
@@ -1052,18 +1833,67 @@ func TestFrameWriterDoesNotLeakItsGoroutine(t *testing.T) {
 // TestFrameWriterQueueHasTheDocumentedDepth is a tripwire on the constant and on
 // the memory argument its comment makes. The depth is per connection, so it is
 // multiplied by every connection the server will hold open.
+//
+// It is asserted through Enqueue rather than by reading a field, which is the only
+// honest way to state it now that the frames wait in a scheduler rather than a
+// channel: what the constant means is how many frames a caller may hand over
+// before it has to wait, and the capacity of whatever holds them is a detail of
+// how that is arranged. The writer is parked inside its priming write throughout,
+// so the queue cannot be drained underneath the count.
 func TestFrameWriterQueueHasTheDocumentedDepth(t *testing.T) {
-	tt := &testTarget{}
+	tt := newGatedTarget()
 	w := startFrameWriter(tt, time.Second)
-	defer func() {
-		w.Close()
-		if err := waitStopped(t, w, tt); err != nil {
-			t.Errorf("Wait: %v", err)
+
+	if err := w.Enqueue(ping(0)); err != nil {
+		t.Fatalf("Enqueue priming frame: %v", err)
+	}
+	letPriming := tt.awaitWrite(t)
+
+	// One more frame than the depth. The last is expected to block, so the whole
+	// run is a goroutine that reports through channels — both buffered deeply
+	// enough that it can never be left blocked on a send once the test is over.
+	accepted := make(chan struct{}, defaultQueueDepth+1)
+	refused := make(chan error, 1)
+	go func() {
+		for i := 1; i <= defaultQueueDepth+1; i++ {
+			if err := w.Enqueue(ping(uint64(i))); err != nil {
+				refused <- err
+				return
+			}
+			accepted <- struct{}{}
 		}
 	}()
 
-	if got := cap(w.queue); got != defaultQueueDepth {
-		t.Errorf("queue capacity = %d, want defaultQueueDepth = %d", got, defaultQueueDepth)
+	for got := 0; got < defaultQueueDepth; got++ {
+		select {
+		case <-accepted:
+		case err := <-refused:
+			t.Fatalf("frame %d of %d was refused: %v", got+1, defaultQueueDepth, err)
+		case <-time.After(gateWait):
+			t.Fatalf("only %d frames accepted within %v, want the depth of %d",
+				got, gateWait, defaultQueueDepth)
+		}
+	}
+
+	// The depth is a bound, and the bound blocks rather than refuses. Refusing
+	// would lose a frame the layer above has been told was handed over; not
+	// bounding at all would let a peer that has stopped reading grow the queue.
+	select {
+	case <-accepted:
+		t.Errorf("frame %d was accepted with %d already queued: the depth is not a bound",
+			defaultQueueDepth+1, defaultQueueDepth)
+	case err := <-refused:
+		t.Errorf("Enqueue on a full queue returned %v, want it to wait for room", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	// Close rather than Shutdown: the writer is about to come back from the
+	// priming write with a full queue, and draining it would need a handshake per
+	// burst for frames this test has no interest in.
+	w.Close()
+	letPriming(nil)
+	if err := waitStopped(t, w, tt); err != nil {
+		t.Errorf("Wait: %v", err)
 	}
 
 	const megabyte = 1 << 20

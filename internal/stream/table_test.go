@@ -195,7 +195,8 @@ func (r *recorder) String() string {
 }
 
 // testWriter stands in for the connection's frame writer, which this table reaches for
-// exactly one thing: the WINDOW_UPDATE that returns receive-window credit (§6.9).
+// two things: the WINDOW_UPDATE that returns receive-window credit (§6.9), and the
+// notice that a stream is over.
 //
 // Locked, because that frame is enqueued from a handler's goroutine — that is the whole
 // reason Table.ReportConsumed exists — so a test reading the frames back is racing the
@@ -204,6 +205,12 @@ type testWriter struct {
 	mu     sync.Mutex
 	frames []frame.Frame
 	err    error
+
+	// forgotten is every identifier Forget was called with, in order and with
+	// repeats. Both halves matter to the tests here: the order says a stream was
+	// forgotten after its last frame was enqueued rather than before, and the repeats
+	// say whether retire ran twice for one stream.
+	forgotten []uint32
 }
 
 func (w *testWriter) Enqueue(f frame.Frame) error {
@@ -214,6 +221,19 @@ func (w *testWriter) Enqueue(f frame.Frame) error {
 	}
 	w.frames = append(w.frames, f)
 	return nil
+}
+
+func (w *testWriter) Forget(id uint32) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.forgotten = append(w.forgotten, id)
+}
+
+// forgets is every identifier Forget has been called with, in order.
+func (w *testWriter) forgets() []uint32 {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return append([]uint32(nil), w.forgotten...)
 }
 
 // fail makes every later Enqueue return err, which is what a connection whose write half
@@ -1846,20 +1866,26 @@ func TestARefusedStreamNeverGetsASendWindow(t *testing.T) {
 	h.assertState(3, StateClosed)
 }
 
-func TestClosingAStreamTakesAwayItsSendWindow(t *testing.T) {
-	// Every route to closed, because retire is called from four places — SendEnd, the
-	// trailers branch of completeBlock, data and rstStream — and a missing call in
-	// one of them is a leak the peer controls: a connection serving a million
-	// requests would hold a million send windows, which is the same shape of
-	// footprint the table itself refuses to have.
-	//
-	// Three of the four need our own END_STREAM as well as the peer's, because that
-	// is what closed means. Which of the two arrives last decides which site does the
-	// retiring, so both orders are here rather than one standing in for the other.
-	for _, tc := range []struct {
-		name  string
-		close func(h *harness)
-	}{
+// closeRoute is one way a stream reaches the closed state, named for what a failure
+// should say.
+type closeRoute struct {
+	name  string
+	close func(h *harness)
+}
+
+// routesToClosed is every way stream 1 can reach the closed state, which is every call
+// site of retire.
+//
+// Shared by the tests that assert what closing takes away, because "retire is called
+// from four places — SendEnd, the trailers branch of completeBlock, data and rstStream"
+// is one fact about that file: a route added to one test's list and not the other's
+// would be a leak that neither test reported.
+//
+// Three of the four need this server's own END_STREAM as well as the peer's, because
+// that is what closed means. Which of the two arrives last decides which site does the
+// retiring, so both orders are here rather than one standing in for the other.
+func routesToClosed() []closeRoute {
+	return []closeRoute{
 		{"RST_STREAM from the peer", func(h *harness) {
 			h.mustSend(frame.RSTStreamFrame{StreamID: 1, ErrCode: h2.Cancel})
 		}},
@@ -1878,7 +1904,15 @@ func TestClosingAStreamTakesAwayItsSendWindow(t *testing.T) {
 				Fragment: encodeFields(h2.Field{Name: "grpc-status", Value: "0"}),
 			})
 		}},
-	} {
+	}
+}
+
+func TestClosingAStreamTakesAwayItsSendWindow(t *testing.T) {
+	// Every route to closed, because a missing retire in one of them is a leak the
+	// peer controls: a connection serving a million requests would hold a million
+	// send windows, which is the same shape of footprint the table itself refuses to
+	// have.
+	for _, tc := range routesToClosed() {
 		t.Run(tc.name, func(t *testing.T) {
 			h := newHarness(t, Config{})
 			h.open(1, false)
@@ -1891,6 +1925,118 @@ func TestClosingAStreamTakesAwayItsSendWindow(t *testing.T) {
 				t.Errorf("stream 1 kept its send window after closing")
 			}
 		})
+	}
+}
+
+func TestClosingAStreamForgetsItsPriority(t *testing.T) {
+	// The same four routes, for the third map keyed by stream identifier. This one is
+	// not in this package: the write side remembers a stream's priority so it can
+	// schedule the stream's DATA, and Writer.Forget is the only thing that tells it to
+	// stop. A route that retires a stream without the call leaks one entry per request
+	// on the connection's write half, where nothing in this package's own bounds would
+	// ever show it.
+	for _, tc := range routesToClosed() {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t, Config{})
+			h.open(1, false)
+			if got := h.w.forgets(); len(got) != 0 {
+				t.Fatalf("stream 1 was forgotten before it closed: %v", got)
+			}
+			tc.close(h)
+			h.assertState(1, StateClosed)
+			if got := h.w.forgets(); len(got) != 1 || got[0] != 1 {
+				t.Errorf("Forget was called with %v, want exactly [1] (RFC 9218 §7)", got)
+			}
+		})
+	}
+}
+
+func TestAHalfClosedStreamKeepsItsPriority(t *testing.T) {
+	// The complement, and it is the one that would break a working server rather than
+	// leak on it. A stream the peer has finished sending on is exactly the stream this
+	// server still owes a response to, which is the response the priority was for —
+	// forgetting it there would reset the stream to the default urgency at the moment
+	// its body starts.
+	for _, tc := range []struct {
+		name string
+		done func(h *harness)
+	}{
+		{"END_STREAM on the request", func(h *harness) { h.open(1, true) }},
+		{"END_STREAM on a DATA frame", func(h *harness) {
+			h.open(1, false)
+			h.mustSend(data(1, "body", true))
+		}},
+		{"END_STREAM on a trailer section", func(h *harness) {
+			h.open(1, false)
+			h.mustSend(frame.HeadersFrame{
+				StreamID: 1, EndStream: true, EndHeaders: true,
+				Fragment: encodeFields(h2.Field{Name: "grpc-status", Value: "0"}),
+			})
+		}},
+		{"this server's own END_STREAM", func(h *harness) {
+			h.open(1, false)
+			h.tab.SendEnd(h.tab.Stream(1))
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t, Config{})
+			tc.done(h)
+			if h.tab.StateOf(1) == StateClosed {
+				t.Fatalf("stream 1 closed, so this case is not about a half-closed stream")
+			}
+			if got := h.w.forgets(); len(got) != 0 {
+				t.Errorf("Forget was called with %v for a half-closed stream, want nothing", got)
+			}
+		})
+	}
+}
+
+func TestARefusedStreamIsNeverRememberedToBeForgotten(t *testing.T) {
+	// A stream refused over SETTINGS_MAX_CONCURRENT_STREAMS never enters this table,
+	// so it is never retired and Forget is never called for it. That is the reason
+	// internal/server does not apply a buffered priority to a stream the table
+	// refused: nothing would ever take the entry away again. This test is what makes
+	// that reasoning a fact about this package rather than an assumption in the other
+	// one.
+	h := newHarness(t, Config{MaxConcurrent: 1})
+	h.open(1, false)
+	assertStreamError(t, h.send(request(3, false)), 3, h2.RefusedStream, "the refused stream")
+	h.assertState(3, StateClosed)
+	if got := h.w.forgets(); len(got) != 0 {
+		t.Errorf("Forget was called with %v for a stream that never entered the table, "+
+			"want nothing", got)
+	}
+}
+
+func TestLiveIsTheStreamsThatAreInTheTable(t *testing.T) {
+	// Live is what internal/server asks about a PRIORITY_UPDATE's prioritized stream,
+	// and the three answers it distinguishes are §5.1's three groups: not yet used,
+	// in use, over. Getting the middle one wrong in either direction is a routing
+	// error with no symptom on the wire — a signal applied to a stream that does not
+	// exist, or buffered for one that does and so never applied at all.
+	h := newHarness(t, Config{})
+	if h.tab.Live(1) {
+		t.Errorf("stream 1 is live before it has been opened")
+	}
+	h.open(1, false)
+	if !h.tab.Live(1) {
+		t.Errorf("stream 1 is not live while it is open")
+	}
+	h.tab.SendEnd(h.tab.Stream(1))
+	if !h.tab.Live(1) {
+		t.Errorf("stream 1 is not live while it is half-closed (local), the state a " +
+			"response is written in")
+	}
+	h.mustSend(data(1, "body", true))
+	h.assertState(1, StateClosed)
+	if h.tab.Live(1) {
+		t.Errorf("stream 1 is live after closing")
+	}
+	if h.tab.Live(2) || h.tab.Live(1<<31-1) {
+		t.Errorf("an identifier the peer has never used is live")
+	}
+	if got, want := h.tab.Len(), 0; got != want {
+		t.Errorf("Len is %d with an empty table, want %d", got, want)
 	}
 }
 

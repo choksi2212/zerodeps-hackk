@@ -11,6 +11,7 @@ import (
 	"zerodeps/zdh/internal/frame"
 	"zerodeps/zdh/internal/h2"
 	"zerodeps/zdh/internal/limits"
+	"zerodeps/zdh/internal/priority"
 )
 
 // connSocket is one connection: both halves, both deadlines, and the close.
@@ -28,22 +29,36 @@ type connSocket interface {
 	Close() error
 }
 
-// ConnWriter is the connection's write half as a stream sees it: two methods, one
-// that hands a frame to the writer goroutine and one that reports the largest
-// payload the peer is willing to receive.
+// halfCloser is a socket that can close its write half on its own, leaving the read
+// half open. *net.TCPConn does it with a FIN and *tls.Conn with a close_notify alert,
+// and both are what a connection needs to end without a reset: see gracefulClose.
+//
+// It is a separate, optional interface rather than a method on connSocket because not
+// every connSocket has a write half to close by itself — net.Pipe, which the tests
+// stand a connection up over, tears both halves down together and has no CloseWrite.
+// A socket that cannot half-close is closed the blunt way, which is the behaviour that
+// was here before this interface existed, so the assertion failing is a graceful
+// degradation and not a missing feature.
+type halfCloser interface {
+	CloseWrite() error
+}
+
+// ConnWriter is the connection's write half as everything above it sees it: four
+// methods, and not one of them about the connection's own lifetime.
 //
 // It is deliberately narrower than *frameWriter, which also flushes, shuts down and
 // waits. Those belong to the connection's own lifecycle — a stream goroutine
 // calling Shutdown mid-request would take every other stream's reply down with it —
-// and these two are the only methods on the writer that are safe to call from every
-// stream goroutine at once.
+// and these four are the ones that are safe to call from every stream goroutine at
+// once.
 //
-// Both are needed to write one response. §4.2 caps a frame's payload at the peer's
-// SETTINGS_MAX_FRAME_SIZE, so the layer that turns a header list into HEADERS and
-// CONTINUATION frames has to know the cap before it can decide where to split, and
-// the cap is the connection's rather than the stream's — a stream that read it from
-// its own copy would send an oversized frame the first time the peer raised or
-// lowered it mid-connection.
+// The first two are what writing one response takes. §4.2 caps a frame's payload at
+// the peer's SETTINGS_MAX_FRAME_SIZE, so the layer that turns a header list into
+// HEADERS and CONTINUATION frames has to know the cap before it can decide where to
+// split, and the cap is the connection's rather than the stream's — a stream that read
+// it from its own copy would send an oversized frame the first time the peer raised or
+// lowered it mid-connection. The other two are the write side's memory of what a stream
+// is worth: see Prioritize and Forget.
 type ConnWriter interface {
 	// Enqueue hands f to the writer goroutine. It returns when the frame is queued,
 	// not when it reaches the wire, and it fails only once the write half is
@@ -53,6 +68,34 @@ type ConnWriter interface {
 	// MaxFrameSize is the peer's SETTINGS_MAX_FRAME_SIZE, never below §6.5.2's
 	// 16384. It may change between two calls: see frameWriter.MaxFrameSize.
 	MaxFrameSize() uint32
+
+	// Forget says stream id is over and nothing further will be sent on it, so
+	// whatever the write side remembers about it may be dropped.
+	//
+	// It is here rather than inside this package because the write side remembers a
+	// stream's priority for as long as the stream might still produce DATA, and only
+	// the layer holding the stream table knows when that stops. Without this call
+	// that memory is unbounded: one entry per prioritized stream, for the life of a
+	// connection that may serve a million requests.
+	//
+	// It is not a cancellation. Frames already queued for the stream are still
+	// written, which is required rather than merely tolerated — the frame that closed
+	// the stream is one of them. See frameWriter.Forget.
+	Forget(id uint32)
+
+	// Prioritize is the client's priority signal for stream id: a complete set of
+	// parameters, replacing whatever the write side was told before.
+	//
+	// Here for the sake of the other carrier. RFC 9218 has two — the Priority field of
+	// the request (§5) and the PRIORITY_UPDATE frame (§7) — and only the frame belongs
+	// to this package. The field is part of a header section, which this package never
+	// decodes, so the layer that does decode one needs a way to reach the writer, and
+	// this is it. The frame reaches the same method directly.
+	//
+	// Together with Forget these are the two ends of the write side's per-stream
+	// priority memory: one call puts an entry in and one takes it out, and both are on
+	// this interface because neither moment is visible from inside this package.
+	Prioritize(id uint32, p priority.Params)
 }
 
 // StreamHandler receives the frames that belong to a stream rather than to the
@@ -76,6 +119,34 @@ type ConnWriter interface {
 // server to be constructible from outside it.
 type StreamHandler interface {
 	HandleFrame(f frame.Frame) error
+
+	// Live reports whether stream id exists: open, or half-closed in either
+	// direction. An identifier that is idle or closed is not live, and §5.1 of RFC
+	// 9113 makes those the only five states there are.
+	//
+	// Len is how many streams count towards SETTINGS_MAX_CONCURRENT_STREAMS
+	// (§5.1.2), which is the same set: this connection advertised a number, and this
+	// is what that number is measured against.
+	//
+	// Both are here for PRIORITY_UPDATE, and they are the smallest questions that
+	// frame's two rules can be asked in. §7.1 of RFC 9218 caps the streams that have
+	// been prioritized but remain idle plus the active streams at
+	// SETTINGS_MAX_CONCURRENT_STREAMS, which needs the second; and §7 makes a signal
+	// for a stream that does not exist yet something to buffer rather than apply,
+	// which needs the first. Neither can be answered from this file — a connection
+	// that kept its own count of open streams would be keeping a second copy of the
+	// stream table's most important number, and the copy would be the one that was
+	// wrong.
+	//
+	// Queries rather than notifications, and that is the direction that matters: this
+	// interface is what the connection asks the stream layer, so the stream layer
+	// needs to know nothing about priority at all.
+	//
+	// Called only from the connection's reader goroutine, which is the same goroutine
+	// HandleFrame is called from, so an implementation needs no more locking for these
+	// than it has already.
+	Live(id uint32) bool
+	Len() int
 
 	// ConnWindowUpdate applies a stream-0 WINDOW_UPDATE (§6.9).
 	//
@@ -234,6 +305,35 @@ type conn struct {
 	// §3.4 requires before anything else.
 	gotSettings bool
 
+	// settingsApplied records that a SETTINGS frame has been applied in full, which
+	// is what makes the next one "after the first SETTINGS frame" for RFC 9218
+	// §2.1's purposes. gotSettings cannot answer that question: it is set before the
+	// first frame's parameters are applied, so it is already true while they are
+	// being applied, and a parameter would be compared against itself.
+	settingsApplied bool
+
+	// peerNoRFC7540Priorities is the peer's SETTINGS_NO_RFC7540_PRIORITIES (RFC 9218
+	// §2.1): true once the client has said it is not sending RFC 9113's deprecated
+	// priority signals. The parameter's initial value is 0, so false is both this
+	// field's zero value and the value the RFC gives a connection where it never
+	// arrives — the absence needs no special case.
+	//
+	// Nothing is scheduled on it, and nothing will be. This server ignores RFC 9113's
+	// priority signals from every peer whatever this says, which §2.1 permits because
+	// this server sends SETTINGS_NO_RFC7540_PRIORITIES itself, so the value changes no
+	// behaviour here. What it does not mean is that priority changes nothing: RFC
+	// 9218's own signal, PRIORITY_UPDATE, is read below and does reach the scheduler.
+	// This field is about the scheme that replaced it, and it is remembered because
+	// §2.1 forbids the peer to change the value — and a rule about a value changing
+	// needs the value it changed from.
+	peerNoRFC7540Priorities bool
+
+	// pending holds the priorities of streams a client has prioritized before
+	// opening, which §7 of RFC 9218 asks a server to buffer and apply at open. It is
+	// this goroutine's alone, like every field above; see handlePriorityUpdate for the
+	// rule that bounds it and internal/priority.Pending for why that rule is enough.
+	pending priority.Pending
+
 	// lastStreamID is the highest stream identifier this connection has
 	// dispatched, which is what a GOAWAY has to carry: §6.8 makes it the promise
 	// that everything above it was untouched and can be retried on a new
@@ -328,6 +428,25 @@ func initialSettings() frame.SettingsFrame {
 		// statement that no promise from us will ever arrive, which lets a client
 		// stop reserving anything for one.
 		{ID: frame.SettingEnablePush, Value: 0},
+
+		// RFC 9218 §2.1: "Servers can send SETTINGS_NO_RFC7540_PRIORITIES with a
+		// value of 1 to indicate that they will ignore HTTP/2 priority signals sent
+		// by clients." This server does ignore them — frame.PriorityFrame is parsed
+		// and discarded, because §5.3 of RFC 9113 deprecated the scheme it belongs to
+		// — so saying so is the honest half of what this parameter is for.
+		//
+		// The other half is that it is not optional if the replacement is to work.
+		// §2.1.1 of RFC 9218: "Similarly, if the client receives
+		// SETTINGS_NO_RFC7540_PRIORITIES with a value of 0 or if the settings
+		// parameter was absent, it SHOULD stop sending PRIORITY_UPDATE frames
+		// (Section 7.1), since those frames are likely to be ignored." A server that
+		// implements extensible priorities and does not advertise this is asking its
+		// clients to stop sending the frames it implemented.
+		//
+		// It goes here rather than in a later SETTINGS because it cannot go anywhere
+		// else. §2.1 of RFC 9218: "If endpoints use SETTINGS_NO_RFC7540_PRIORITIES,
+		// they MUST send it in the first SETTINGS frame."
+		{ID: frame.SettingNoRFC7540Priorities, Value: 1},
 	}}
 }
 
@@ -365,6 +484,16 @@ func (c *conn) Serve() error {
 	// to write the connection's last frames means. See the errPeerClosed case.
 	var gone bool
 
+	// sentGoAway records that this connection is leaving on a GOAWAY we put on the
+	// wire, which is the one ending the half-close and drain below are for: the peer
+	// has a frame to read that a reset would discard, and it has inbound octets we
+	// stopped reading that a blunt Close would answer with that reset. The other
+	// endings do not need it. A peer that closed first (errPeerClosed) has already
+	// sent its FIN and been read to EOF, so there is no backlog to reset over and
+	// nothing it is still waiting to read; a transport failure has no socket left to
+	// be graceful with. See gracefulClose.
+	var sentGoAway bool
+
 	var ce h2.ConnError
 	switch {
 	case errors.Is(err, errPeerClosed):
@@ -385,10 +514,12 @@ func (c *conn) Serve() error {
 		// peer-controlled, and reflecting untrusted octets to their sender is a
 		// habit worth not having even where this one is harmless.
 		sendErr = c.farewell(h2.NoError, "")
+		sentGoAway = true
 		err = nil
 
 	case errors.Is(err, errIdle):
 		sendErr = c.farewell(h2.NoError, "idle timeout")
+		sentGoAway = true
 		err = nil
 
 	case errors.Is(err, errShuttingDown):
@@ -401,14 +532,17 @@ func (c *conn) Serve() error {
 		// stops and there is nothing for a first GOAWAY to hold open.
 		// internal/stream owns the first one.
 		sendErr = c.farewell(h2.NoError, "server shutting down")
+		sentGoAway = true
 		err = nil
 
 	case errors.As(err, &ce):
 		sendErr = c.farewell(ce.Code, ce.Reason)
+		sentGoAway = true
 
 	default:
 		// A transport failure: the socket is broken, so there is no GOAWAY to
-		// send and no point starting one.
+		// send and no point starting one — nor any point half-closing a socket
+		// the transport has already taken away.
 		c.w.Close()
 	}
 
@@ -416,6 +550,13 @@ func (c *conn) Serve() error {
 	// goroutine per connection bounded: Wait returns when the writer has stopped,
 	// and the write deadline guarantees it stops.
 	werr := c.w.Wait()
+
+	// The GOAWAY is in the socket's send buffer now that the writer has stopped, so
+	// this is where the connection can end without a reset. See gracefulClose.
+	if sentGoAway {
+		c.gracefulClose()
+	}
+
 	switch {
 	case err != nil:
 		return err
@@ -432,6 +573,73 @@ func (c *conn) Serve() error {
 		return werr
 	}
 }
+
+// gracefulClose half-closes the write half and then drains the read half, so that
+// the blunt Close deferred at the top of Serve sends a FIN rather than a reset.
+//
+// The race it removes is Mihir's, and it is a real one on a public port. The last
+// frame this connection sends is a GOAWAY, and by the time this runs it is in the
+// socket's send buffer. But a peer that pipelined requests we are refusing — or that
+// simply sent faster than we read — has left octets in our receive buffer, and a
+// TCP stack that is told to Close a socket with unread inbound data does not send a
+// FIN: it sends an RST, which discards whatever was in flight in both directions,
+// including the GOAWAY the peer has not read yet. The peer then sees a connection
+// reset in place of the reason we went to the trouble of sending. It is worst on
+// Windows, where the reset is prompt, and it turns a clean shutdown into a
+// connection error in the client's logs for no reason the client can act on.
+//
+// The fix is the shutdown sequence a TCP server is supposed to use. CloseWrite sends
+// a FIN (or, on TLS, a close_notify), which tells the peer we are done sending and
+// lets it read the GOAWAY that came just before it. Then the inbound backlog is
+// drained until the peer closes too or the grace period runs out, so that the Close
+// which follows has an empty receive buffer and sends a FIN rather than a reset. The
+// drain is bounded by ShutdownGrace because a peer that never closes its own half must
+// not hold this goroutine — the whole point of the deadline is that the reset we are
+// avoiding is a smaller harm than a connection that never ends.
+//
+// It runs on the reader goroutine, after run has returned and the writer has been
+// waited for, so nothing else touches the socket while it works. A socket that cannot
+// half-close on its own — net.Pipe in the tests — takes none of this and is closed the
+// blunt way by the deferred Close, which is the behaviour that was here before.
+func (c *conn) gracefulClose() {
+	hc, ok := c.sock.(halfCloser)
+	if !ok {
+		return
+	}
+	if err := hc.CloseWrite(); err != nil {
+		// The write half is already gone, which means the socket is already broken
+		// in the direction that matters. The deferred Close will finish the job, and
+		// there is nothing left to drain toward.
+		return
+	}
+
+	// Bounded, and bounded short. A peer that reads our GOAWAY and then never closes
+	// its own half must not keep this goroutine here, and the ceiling has to sit well
+	// below ShutdownGrace rather than at it: this drain runs inside the window
+	// Shutdown gives every connection to finish, so a drain that waited the whole
+	// grace would spend a server's entire shutdown budget on one polite peer and
+	// report the connection as closed mid-flight. The FIN CloseWrite just sent is
+	// what actually delivers the GOAWAY in order; this only clears the receive buffer
+	// so the deferred Close finds it empty, which is a round-trip's worth of work, not
+	// a grace period's. A read error — the peer's own close, or the deadline expiring —
+	// is the signal to stop, and neither is worth reporting: the connection is over
+	// either way, and the deferred Close is what ends it.
+	if err := c.sock.SetReadDeadline(time.Now().Add(drainGrace)); err != nil {
+		return
+	}
+	var buf [512]byte
+	for {
+		if _, err := c.sock.Read(buf[:]); err != nil {
+			return
+		}
+	}
+}
+
+// drainGrace is how long gracefulClose spends emptying the receive buffer after the
+// FIN. It is short on purpose: it is the time a peer needs to notice the FIN and stop
+// sending, not the time it might take to close its own half, and it runs inside the
+// server's shutdown grace so it cannot be a fraction of a second more than it must be.
+const drainGrace = 250 * time.Millisecond
 
 // discard ends a connection that never began, without writing to it.
 //
@@ -724,6 +932,9 @@ func (c *conn) dispatch(f frame.Frame) error {
 			"PUSH_PROMISE received on stream %d: a client cannot push (RFC 9113 §8.4)",
 			f.Stream())
 
+	case frame.PriorityUpdateFrame:
+		return c.handlePriorityUpdate(f)
+
 	case frame.WindowUpdateFrame:
 		if f.StreamID == 0 {
 			return c.handleConnectionWindowUpdate(f)
@@ -758,21 +969,29 @@ func (c *conn) handleSettings(f frame.SettingsFrame) error {
 			return err
 		}
 	}
+	// The first SETTINGS frame is now behind us, which is the state RFC 9218 §2.1's
+	// no-change rule is written against. Set after the loop rather than before it, so
+	// that duplicate pairs inside one frame stay legal and last-wins: §6.5 makes the
+	// order within a frame significant and says nothing against repetition, and the
+	// rule §2.1 adds is about the second frame, not the second pair.
+	c.settingsApplied = true
 	return c.w.Enqueue(frame.SettingsFrame{Ack: true})
 }
 
 // applySetting puts one of the peer's parameters into force.
 //
-// Every identifier §11.3 defines is named, including the ones there is nothing to
-// do about, so that "ignored" is a decision on the record rather than a gap.
-// TestApplySettingNamesEverySettingID fails if an identifier is added to the
-// frame package and not accounted for here. An unknown identifier is ignored, as
-// §6.5.2 requires — the extension mechanism depends on it.
+// Every identifier §11.3 defines is named, and so is the one RFC 9218 §2.1 adds,
+// including the ones there is nothing to do about — so that "ignored" is a decision
+// on the record rather than a gap. TestApplySettingNamesEverySettingID fails if an
+// identifier is added to the frame package and not accounted for here. An unknown
+// identifier is ignored, as §6.5.2 requires — the extension mechanism depends on
+// it.
 //
-// Only one parameter can fail to apply, and the error is never about the value
-// itself: the frame layer has already range-checked every setting §6.5.2 gives
-// bounds for. It is about what applying a legal value does to state this
-// connection already holds. See SettingInitialWindowSize.
+// Two parameters can fail to apply, and neither failure is about the value being
+// out of range: the frame layer has already range-checked every setting §6.5.2 and
+// RFC 9218 §2.1 give bounds for. One is about what applying a legal value does to
+// state this connection already holds — see SettingInitialWindowSize — and the other
+// about a legal value contradicting one the peer sent earlier.
 func (c *conn) applySetting(s frame.Setting) error {
 	switch s.ID {
 	case frame.SettingMaxFrameSize:
@@ -785,6 +1004,34 @@ func (c *conn) applySetting(s frame.Setting) error {
 		// do, and this server initiates none: it does not push, and says so in
 		// its own SETTINGS. A client that sets ENABLE_PUSH to 1 gets no pushes
 		// anyway, which is permitted — the setting is a ceiling, not a request.
+
+	case frame.SettingNoRFC7540Priorities:
+		// The peer saying which priority scheme it is using. There is nothing to
+		// apply: this server ignores RFC 9113's priority signals from every peer,
+		// and §2.1 of RFC 9218 permits that because the server says so in its own
+		// SETTINGS. The value is kept only so that the one rule attached to it can
+		// be checked, which is the rule below.
+		//
+		// §2.1 of RFC 9218: "Senders MUST NOT change the
+		// SETTINGS_NO_RFC7540_PRIORITIES value after the first SETTINGS frame.
+		// Receivers that detect a change MAY treat it as a connection error of type
+		// PROTOCOL_ERROR."
+		//
+		// The MAY is taken. The alternative to refusing a change is to believe one
+		// of two statements the peer has made about itself and discard the other,
+		// and nothing in the document says which — while a peer that contradicts
+		// itself here is either broken or measuring what this server tolerates.
+		// Neither is worth a connection.
+		//
+		// The comparison is total because the value is 0 or 1: frame.parseSettings
+		// has already refused anything else as a connection error (§2.1).
+		v := s.Value == 1
+		if c.settingsApplied && v != c.peerNoRFC7540Priorities {
+			return h2.ConnErrorf(h2.ProtocolError,
+				"SETTINGS_NO_RFC7540_PRIORITIES changed to %d after the first SETTINGS frame "+
+					"(RFC 9218 §2.1)", s.Value)
+		}
+		c.peerNoRFC7540Priorities = v
 
 	case frame.SettingHeaderTableSize:
 		// The size of the dynamic table the peer keeps for decoding, and therefore a
@@ -857,10 +1104,151 @@ func (c *conn) handleConnectionWindowUpdate(f frame.WindowUpdateFrame) error {
 	return c.handler.ConnWindowUpdate(f.Increment)
 }
 
+// handlePriorityUpdate takes a client's extensible-priority signal (RFC 9218 §7.1)
+// and gives it to the scheduler.
+//
+// Absorbed at this level for the same reason a stream-0 WINDOW_UPDATE is: the frame
+// arrives on the connection, so there is no stream to hand it to. It is a stronger
+// reason here, because §7 makes it legal for the stream the frame names not to exist
+// yet — so the stream table is not where this frame's rules live even in principle.
+//
+// # Three destinations, decided by one state
+//
+// §5.1 of RFC 9113 gives a stream five states, and §7.1 of RFC 9218 wants a different
+// answer for three groups of them. A live stream — open, or half-closed in either
+// direction — is prioritized now. An idle stream is buffered until it opens, because
+// §7 of RFC 9218 says so: "A client MAY send a PRIORITY_UPDATE frame before the
+// stream that it references is open (except for HTTP/2 push streams; see Section
+// 7.1)." And a closed stream is discarded, which §7.1 of RFC 9218 permits in as many
+// words: "Servers can discard frames where the prioritized stream ID refers to a
+// stream in the 'half-closed (local)' or 'closed' state (i.e., streams where no
+// further data will be sent)."
+//
+// Half-closed (local) is in that sentence and is treated as live here, which is the
+// one place this function is more generous than it has to be. The frame is applied to
+// a stream that will send no more DATA, so applying it changes nothing on the wire —
+// but it costs one map entry that the stream's retirement drops anyway, and buying the
+// distinction would mean asking the stream layer which half of half-closed it is in.
+// A discard this server is permitted to make is not worth an interface method.
+//
+// # What bounds the buffer
+//
+// §7.1 of RFC 9218: "The number of streams that have been prioritized but remain in
+// the 'idle' state plus the number of active streams (those in the 'open' state or in
+// either of the 'half-closed' states; see Section 5.1.2 of [HTTP/2]) MUST NOT exceed
+// the value of the SETTINGS_MAX_CONCURRENT_STREAMS parameter. Servers that receive
+// such a PRIORITY_UPDATE MUST respond with a connection error of type
+// PROTOCOL_ERROR."
+//
+// Both terms are counted rather than estimated: the left is the buffer's own length,
+// the right is the stream layer's, and the limit is the constant this connection put
+// in its own SETTINGS frame above rather than a number repeated here. The check is
+// skipped for a stream already buffered, because §7 makes a second frame for one
+// stream replace the first — a count that does not rise cannot cross a limit.
+//
+// This is the rule that makes the buffer safe to have at all, and it is worth being
+// clear that it is the specification's bound and not a local one: a peer that
+// prioritizes ten thousand streams it never opens is refused at the hundredth, by a
+// number it was told in advance.
+func (c *conn) handlePriorityUpdate(f frame.PriorityUpdateFrame) error {
+	if f.PrioritizedStreamID%2 == 0 {
+		// An even identifier belongs to a server-initiated stream (§5.1.1), which is
+		// to say a push stream — and this server never pushes, so every even stream
+		// on this connection is in the idle state and always will be. That makes the
+		// role rule decidable from the identifier alone, exactly as §8.4's is for
+		// PUSH_PROMISE above: no stream table is consulted, because the answer does
+		// not depend on one.
+		//
+		// §7.1 of RFC 9218: "Servers that receive a PRIORITY_UPDATE for a push
+		// stream in the 'idle' state MUST respond with a connection error of type
+		// PROTOCOL_ERROR."
+		return h2.ConnErrorf(h2.ProtocolError,
+			"PRIORITY_UPDATE prioritizes stream %d, an even identifier and so a push "+
+				"stream (RFC 9113 §5.1.1); this server pushes nothing, so that stream is "+
+				"idle and cannot be prioritized (RFC 9218 §7.1)",
+			f.PrioritizedStreamID)
+	}
+
+	// The parse error is dropped, and internal/request's setPriority drops the same
+	// one for the same reason: §7 of RFC 9218 makes failing to parse a priority field
+	// value a MAY-treat-as-connection-error, this server declines that MAY, and what
+	// internal/priority returns alongside the error is a Params with no parameters set
+	// — which is exactly the right reading of a frame whose parameters could not be
+	// read. §7 of RFC 9218: "A PRIORITY_UPDATE frame communicates a complete
+	// set of all priority parameters in the Priority Field Value field. Omitting a
+	// priority parameter is a signal to use its default value. Failure to parse the
+	// Priority Field Value MAY be treated as a connection error."
+	//
+	// So an unreadable frame is a request to schedule the stream at the defaults, and
+	// it still overrides whatever the client said before — because the frame carries a
+	// complete set, not a patch.
+	p, _ := priority.Parse(f.Field)
+
+	id := f.PrioritizedStreamID
+	switch {
+	case c.handler.Live(id):
+		c.w.Prioritize(id, p)
+
+	case id > c.lastStreamID:
+		// Idle: never used, so §7 of RFC 9218 says to hold the signal for it. The
+		// test is this connection's own high-water mark rather than a question for
+		// the stream layer, because an identifier above every one dispatched has by
+		// definition never been anything but idle — and §5.1.1 of RFC 9113 makes
+		// every identifier at or below it that is not live closed.
+		if !c.pending.Held(id) && c.pending.Len()+c.handler.Len() >= limits.MaxConcurrentStreams {
+			return h2.ConnErrorf(h2.ProtocolError,
+				"PRIORITY_UPDATE prioritizes idle stream %d, which would make %d "+
+					"prioritized idle streams and %d active ones, above the "+
+					"SETTINGS_MAX_CONCURRENT_STREAMS of %d this connection advertised "+
+					"(RFC 9218 §7.1)",
+				id, c.pending.Len()+1, c.handler.Len(), limits.MaxConcurrentStreams)
+		}
+		c.pending.Put(id, p)
+
+	default:
+		// Closed, or skipped past and so closed by §5.1.1 of RFC 9113. Discarded:
+		// there is no stream to schedule and there will not be one, and remembering
+		// the signal would be remembering it forever.
+	}
+	return nil
+}
+
 // handleStreamFrame hands a frame to the stream layer.
+//
+// A frame on an identifier above every one dispatched so far is the moment that
+// stream leaves the idle state, and that moment is where two of RFC 9218's rules
+// land. Both are deferred past the stream layer's own handling, because whether the
+// stream really opened is the stream layer's answer to give: a stream refused over
+// the concurrency limit leaves the idle state too, and it leaves it closed.
 func (c *conn) handleStreamFrame(f frame.Frame) error {
 	if id := f.Stream(); id > c.lastStreamID {
 		c.lastStreamID = id
+		defer c.leftIdle(id)
 	}
 	return c.handler.HandleFrame(f)
+}
+
+// leftIdle applies what a client buffered for a stream that has just left the idle
+// state, and forgets what it buffered for the streams that leaving closed.
+//
+// §7 of RFC 9218: "Servers SHOULD buffer the most recently received PRIORITY_UPDATE
+// frame and apply it once the referenced stream is opened." This is that moment, and
+// it is the only one: from here on the stream is live and handlePriorityUpdate
+// prioritizes it directly.
+//
+// The Live test is what keeps the scheduler's priority table bounded. A stream the
+// table refused, or whose first frame was a protocol error, never becomes a stream and
+// so is never retired — and retirement is what tells the writer to forget a priority.
+// Applying one here would be the one entry nothing ever removes. The buffered signal
+// is consumed in either case, because §5.1.1 of RFC 9113 has closed that stream
+// whether or not it opened.
+//
+// Pruning is the other half of that bound, and Prune's own comment carries the
+// argument: a client that skips identifiers to escape the concurrency limit closes
+// every identifier it skipped in the act of skipping.
+func (c *conn) leftIdle(id uint32) {
+	if p, ok := c.pending.Take(id); ok && c.handler.Live(id) {
+		c.w.Prioritize(id, p)
+	}
+	c.pending.Prune(id)
 }

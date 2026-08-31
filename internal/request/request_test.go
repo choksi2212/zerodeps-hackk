@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"zerodeps/zdh/internal/h2"
+	"zerodeps/zdh/internal/priority"
 )
 
 // testStream is the identifier every test in this file parses on.
@@ -439,10 +440,11 @@ func TestParseRejectsAnEmptyPath(t *testing.T) {
 }
 
 func TestParseRejectsAPathThatIsNotAnAbsolutePath(t *testing.T) {
-	// §8.3.1: ":path" is "the absolute-path production and, optionally, a '?'
-	// character followed by the query production". The absolute-URI case is the one
-	// with teeth: a ":path" of "https://elsewhere/" is how a request gets routed
-	// somewhere its authority never named.
+	// The ":path" of an "http" or "https" request carries, per §8.3.1, "the path and
+	// query parts of the target URI (the absolute-path production and, optionally, a
+	// '?' character followed by the query production; see Section 4.1 of [HTTP])".
+	// The absolute-URI case is the one with teeth: a ":path" of "https://elsewhere/"
+	// is how a request gets routed somewhere its authority never named.
 	for _, path := range []string{"foo", "https://elsewhere/", "?q=1", "index.html", "../etc"} {
 		t.Run(path, func(t *testing.T) {
 			reason := refuse(t, with(pseudoPath, path), true)
@@ -1053,5 +1055,194 @@ func TestValidateTrailersAcceptsTEWithTrailers(t *testing.T) {
 func TestValidateTrailersRejectsTEWithAnyOtherValue(t *testing.T) {
 	if err := ValidateTrailers(testStream, fields("te", "gzip")); err == nil {
 		t.Fatal("ValidateTrailers accepted a TE field with a value other than \"trailers\" (RFC 9113 §8.2.2)")
+	}
+}
+
+// --- the Priority header field (§5 of RFC 9218) -------------------------------
+
+// TestParseTakesNoPriorityFromARequestWithoutTheField is the case that must cost
+// nothing: no field line, no signal, and the zero Params — which §4 of RFC 9218
+// resolves to urgency 3 and non-incremental without anything here saying so.
+func TestParseTakesNoPriorityFromARequestWithoutTheField(t *testing.T) {
+	r := mustParse(t, req(), true)
+
+	if r.Priority != (priority.Params{}) {
+		t.Errorf("Priority = %+v for a request with no Priority field, want the zero Params",
+			r.Priority)
+	}
+	if r.Priority.Urgency() != priority.DefaultUrgency {
+		t.Errorf("Priority.Urgency() = %d, want the default %d",
+			r.Priority.Urgency(), priority.DefaultUrgency)
+	}
+	if r.Priority.HasUrgency() || r.Priority.HasIncremental() {
+		t.Error("a request with no Priority field reports a parameter present")
+	}
+}
+
+func TestParseReadsThePriorityField(t *testing.T) {
+	tests := []struct {
+		value string
+		want  priority.Params
+	}{
+		{"u=0", priority.Params{}.WithUrgency(0)},
+		{"u=7", priority.Params{}.WithUrgency(7)},
+		{"i", priority.Params{}.WithIncremental(true)},
+		{"u=1, i", priority.Params{}.WithUrgency(1).WithIncremental(true)},
+		{"i=?0, u=6", priority.Params{}.WithUrgency(6).WithIncremental(false)},
+
+		// An empty field line is a legal Dictionary of no members, and means what
+		// sending nothing means.
+		{"", priority.Params{}},
+
+		// §4 of RFC 9218's ignore rule reaches this far: the field is read, the
+		// parameter is not usable, and the request is not malformed.
+		{"u=9", priority.Params{}},
+		{"u=abc", priority.Params{}},
+		{"unknown=1", priority.Params{}},
+
+		// And a value that is not a Dictionary at all is the same outcome by a
+		// different route — internal/priority returns an error, and this package
+		// declines the MAY in §7 of RFC 9218 that would make it a connection error.
+		{"u=", priority.Params{}},
+		{"???", priority.Params{}},
+		{"u=1 i", priority.Params{}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.value, func(t *testing.T) {
+			r := mustParse(t, req(fieldPriority, tt.value), true)
+			if r.Priority != tt.want {
+				t.Errorf("Priority = %+v, want %+v", r.Priority, tt.want)
+			}
+		})
+	}
+}
+
+// TestParseKeepsThePriorityFieldInTheFieldList is §5 of RFC 9218's end-to-end
+// property. Content-length is lifted out of the list because it describes the
+// transfer; this describes what the client wants of every hop, so removing it would
+// answer for the next one.
+func TestParseKeepsThePriorityFieldInTheFieldList(t *testing.T) {
+	r := mustParse(t, req(fieldPriority, "u=2"), true)
+
+	var n int
+	for _, f := range r.Fields {
+		if f.Name == fieldPriority {
+			n++
+			if f.Value != "u=2" {
+				t.Errorf("the Priority field line in Fields has value %q, want %q; it must be "+
+					"exactly what the peer sent", f.Value, "u=2")
+			}
+		}
+	}
+	if n != 1 {
+		t.Errorf("Fields carries the Priority field line %d times, want 1", n)
+	}
+	if !r.Priority.HasUrgency() {
+		t.Error("the field was kept in Fields and not parsed into Priority; it must be both")
+	}
+}
+
+// TestParseCombinesPriorityFieldLines is a MUST that belongs to the structured-field
+// layer and can only be obeyed here, because this is the only place that sees more
+// than one field line at a time.
+//
+// §4.2 of RFC 9651: "When generating input_bytes, parsers MUST combine all field lines
+// in the same section (header or trailer) that case-insensitively match the field name
+// into one comma-separated field-value, as per Section 5.2 of [HTTP]; this assures that
+// the entire field value is processed correctly."
+func TestParseCombinesPriorityFieldLines(t *testing.T) {
+	tests := []struct {
+		name  string
+		lines []string
+		want  priority.Params
+	}{
+		{
+			name:  "two lines, one parameter each",
+			lines: []string{"u=1", "i"},
+			want:  priority.Params{}.WithUrgency(1).WithIncremental(true),
+		},
+		{
+			// The combination is "u=1, u=5", and §4.2.2 of RFC 9651 keeps the last —
+			// so the second line wins, exactly as a second member in one line would.
+			name:  "the later line wins a duplicate",
+			lines: []string{"u=1", "u=5"},
+			want:  priority.Params{}.WithUrgency(5),
+		},
+		{
+			name:  "three lines",
+			lines: []string{"u=0", "i=?0", "unknown=1"},
+			want:  priority.Params{}.WithUrgency(0).WithIncremental(false),
+		},
+		{
+			// A line that does not parse takes the whole combined value with it,
+			// which is what a conforming parser does: it parses the concatenation,
+			// not the lines.
+			name:  "one broken line breaks the field",
+			lines: []string{"u=1", "u="},
+			want:  priority.Params{},
+		},
+		{
+			// The case §4.2 of RFC 9651 warns about. Combining an empty line with a
+			// real one yields ", u=1", which begins with a comma and is not a
+			// Dictionary — so a client that splits this field loses it.
+			name:  "an empty line poisons the rest",
+			lines: []string{"", "u=1"},
+			want:  priority.Params{},
+		},
+		{
+			// And the same the other way round: "u=1, " has a trailing comma.
+			name:  "a trailing empty line does too",
+			lines: []string{"u=1", ""},
+			want:  priority.Params{},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			f := req()
+			for _, v := range tt.lines {
+				f = append(f, h2.Field{Name: fieldPriority, Value: v})
+			}
+			r := mustParse(t, f, true)
+			if r.Priority != tt.want {
+				t.Errorf("Priority = %+v from lines %q, want %+v", r.Priority, tt.lines, tt.want)
+			}
+		})
+	}
+}
+
+// TestParseIsLinearInThePriorityFieldLines is the reason the combination goes through
+// a Builder. A peer may spend its whole header list on this one field name, and a
+// parser that appended to a string once per line would do quadratic work on it.
+//
+// The assertion is the result rather than the timing — a benchmark would be a flake
+// waiting to happen — so this is a correctness test with a performance argument in its
+// name: it fails loudly if the combination is ever rewritten in a way that drops or
+// reorders lines at scale, and it runs in the time the linear version takes.
+func TestParseIsLinearInThePriorityFieldLines(t *testing.T) {
+	const lines = 50000
+
+	f := req()
+	for range lines - 1 {
+		f = append(f, h2.Field{Name: fieldPriority, Value: "unknown=1"})
+	}
+	f = append(f, h2.Field{Name: fieldPriority, Value: "u=4, i"})
+
+	r := mustParse(t, f, true)
+	want := priority.Params{}.WithUrgency(4).WithIncremental(true)
+	if r.Priority != want {
+		t.Errorf("Priority = %+v after %d Priority field lines, want %+v", r.Priority, lines, want)
+	}
+}
+
+// TestParseIgnoresPriorityInATrailerSection records a decision rather than a rule.
+// §5 of RFC 9218 puts the field in requests and responses without saying which
+// section, and ValidateTrailers produces no request to hold a priority anyway — but
+// the deciding argument is that a trailer arrives after the request body, which is
+// after the response has been scheduled and usually after it has begun. A priority
+// signal that cannot be acted on is better ignored than half applied.
+func TestParseIgnoresPriorityInATrailerSection(t *testing.T) {
+	if err := ValidateTrailers(testStream, fields(fieldPriority, "u=0")); err != nil {
+		t.Errorf("ValidateTrailers rejected a Priority trailer field: %v; it is an ordinary "+
+			"field line there and must not be an error", err)
 	}
 }

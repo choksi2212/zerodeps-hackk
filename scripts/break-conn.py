@@ -37,6 +37,26 @@ one ending a server survives, because runConn recovers it -- and it runs before 
 writer has stopped, so a writer this call wakes may put a frame on the wire behind the
 GOAWAY that has already gone out.
 
+Two more came with extensible priorities, and both are a comparison rather than a
+route. The §7.1 cap on buffered priority signals is checked with >= rather than >,
+because the frame being admitted is not yet in the buffer it is counted against: the
+> version admits one signal past the SETTINGS_MAX_CONCURRENT_STREAMS this connection
+advertised, which is a limit exceeded by exactly one and visible in nothing else. And
+handleStreamFrame defers the buffer's application past the stream layer's handling
+rather than calling it inline; called inline it asks whether a stream is live before
+the frame that would open it has been handled, so every buffered signal is dropped
+and the SHOULD in §7 of RFC 9218 is honoured in appearance only.
+
+One more is the teardown itself. A connection that leaves on a GOAWAY has that frame
+in the socket's send buffer, but a peer that pipelined a request we are refusing has
+left octets in our receive buffer -- and a blunt Close over unread inbound data is a
+reset, which discards the GOAWAY the peer had not read. gracefulClose closes the write
+half first, so the FIN carries the GOAWAY out in order, and drains before the Close.
+The break that skips it leaves the reset race it removes, and the test that half-closes
+the write half before the socket sees it fail. It fires only on the endings that send a
+GOAWAY: a peer that closed first is already at EOF with no backlog to reset over, and a
+transport failure has no socket left to be polite with, so neither takes the path.
+
 Two guards in discard have no break, and both are named rather than quietly skipped.
 
   * c.w.Close(). Removing it does not fail a test, it deadlocks one: the writer sits
@@ -57,7 +77,7 @@ indistinguishable on this path. Shutdown flushes what is queued, Close does not,
 with an empty queue those are the same thing. The distinction matters in Serve, where
 it is broken and caught.
 
-The campaign went stale once, and the preflight is what said so rather than a run
+The campaign went stale twice, and the preflight is what said so rather than a run
 full of holes. applySetting grew an error return when the connection started routing
 INITIAL_WINDOW_SIZE to the stream layer, which left this file's acknowledge-before-
 apply break anchored on a loop body that no longer existed: it matched 0 times, the
@@ -66,6 +86,13 @@ outcome the preflight is for. The alternative -- a break that removes nothing, s
 every test it names comes back green -- reports as a hole in the suite, and the three
 routing behaviours added in the same commit as the error return genuinely had no
 breaks at all. They have them now.
+
+The second time was the same two shapes again: routing PRIORITY_UPDATE into the
+scheduler put a line between handleSettings' apply loop and its acknowledgement, and
+another inside handleStreamFrame's high-water branch. Both anchors matched 0 times.
+The acknowledge-before-apply break is now anchored on the loop alone and enqueues the
+acknowledgement ahead of it, which needs no line that a later change is likely to sit
+next to.
 
 Run from the repository root. Restores the file on the way out, including on error.
 """
@@ -212,6 +239,16 @@ BREAKS = [
         ["TestServeAlwaysClosesTheSocket"],
     ),
     (
+        "Serve: the write half is never closed, so the final GOAWAY races a reset",
+        """	if sentGoAway {
+		c.gracefulClose()
+	}""",
+        """	if sentGoAway && false {
+		c.gracefulClose()
+	}""",
+        ["TestServeHalfClosesTheWriteHalfBeforeClosingOnAGracefulEnding"],
+    ),
+    (
         "Serve: a connection error ends the connection without telling the peer why",
         """		sendErr = c.farewell(ce.Code, ce.Reason)""",
         """		c.w.Close()""",
@@ -296,7 +333,8 @@ BREAKS = [
         "Serve: a broken socket is sent a GOAWAY, whose failure competes with the real error",
         """	default:
 		// A transport failure: the socket is broken, so there is no GOAWAY to
-		// send and no point starting one.
+		// send and no point starting one — nor any point half-closing a socket
+		// the transport has already taken away.
 		c.w.Close()
 	}""",
         """	default:
@@ -320,9 +358,11 @@ BREAKS = [
         "Serve: closing an idle connection is reported as a failure",
         """	case errors.Is(err, errIdle):
 		sendErr = c.farewell(h2.NoError, "idle timeout")
+		sentGoAway = true
 		err = nil""",
         """	case errors.Is(err, errIdle):
-		sendErr = c.farewell(h2.NoError, "idle timeout")""",
+		sendErr = c.farewell(h2.NoError, "idle timeout")
+		sentGoAway = true""",
         ["TestServeGoesAwayOnTheIdleTimeout"],
     ),
     (
@@ -395,8 +435,7 @@ BREAKS = [
 		if err := c.applySetting(s); err != nil {
 			return err
 		}
-	}
-	return c.w.Enqueue(frame.SettingsFrame{Ack: true})""",
+	}""",
         """	if err := c.w.Enqueue(frame.SettingsFrame{Ack: true}); err != nil {
 		return err
 	}
@@ -404,8 +443,7 @@ BREAKS = [
 		if err := c.applySetting(s); err != nil {
 			return err
 		}
-	}
-	return nil""",
+	}""",
         [
             "TestServeAppliesSettingsBeforeAcknowledging",
             "TestServeStopsOnASettingItCannotApply",
@@ -560,9 +598,11 @@ BREAKS = [
         "handleStreamFrame: the highest dispatched stream is not tracked, so GOAWAY names 0",
         """	if id := f.Stream(); id > c.lastStreamID {
 		c.lastStreamID = id
-	}
-""",
-        "",
+		defer c.leftIdle(id)
+	}""",
+        """	if id := f.Stream(); id > c.lastStreamID {
+		defer c.leftIdle(id)
+	}""",
         ["TestServeReportsTheLastStreamItTouched"],
     ),
     (
@@ -572,10 +612,85 @@ BREAKS = [
         ["TestServeHandsStreamFramesToTheHandler", "TestServeResetsOneStreamAndKeepsTheConnection"],
     ),
 
+    # --- extensible priorities -----------------------------------------------
+    (
+        "dispatch: a PRIORITY_UPDATE is handed to the stream layer, which has no stream 0",
+        """	case frame.PriorityUpdateFrame:
+		return c.handlePriorityUpdate(f)""",
+        """	case frame.PriorityUpdateFrame:
+		_ = f""",
+        ["TestServeKeepsAPriorityUpdateFromTheHandler"],
+    ),
+    (
+        "handlePriorityUpdate: an even prioritized identifier is accepted, not refused as a push stream",
+        """	if f.PrioritizedStreamID%2 == 0 {""",
+        """	if false {""",
+        ["TestServeRefusesAPriorityUpdateForAPushStream"],
+    ),
+    (
+        "handlePriorityUpdate: a live stream is not prioritized, so the signal is discarded",
+        """	case c.handler.Live(id):
+		c.w.Prioritize(id, p)""",
+        """	case false:
+		c.w.Prioritize(id, p)""",
+        ["TestServePrioritizesALiveStreamStraightAway"],
+    ),
+    (
+        "handlePriorityUpdate: a closed stream is buffered rather than discarded, and the entry is never removed",
+        """	case id > c.lastStreamID:""",
+        """	case true:""",
+        ["TestServeDiscardsAPriorityUpdateForAClosedStream"],
+    ),
+    (
+        "handlePriorityUpdate: no §7.1 cap, so a client buffers priorities without bound",
+        """		if !c.pending.Held(id) && c.pending.Len()+c.handler.Len() >= limits.MaxConcurrentStreams {""",
+        """		if false {""",
+        ["TestServeRefusesPrioritizedIdleStreamsPastTheLimit"],
+    ),
+    (
+        "handlePriorityUpdate: the §7.1 cap does not count the frame being admitted, so the limit is exceeded by one",
+        """c.pending.Len()+c.handler.Len() >= limits.MaxConcurrentStreams {""",
+        """c.pending.Len()+c.handler.Len() > limits.MaxConcurrentStreams {""",
+        ["TestServeRefusesPrioritizedIdleStreamsPastTheLimit"],
+    ),
+    (
+        "handlePriorityUpdate: a replacement counts against the cap, so a client cannot change its mind",
+        """		if !c.pending.Held(id) && c.pending.Len()""",
+        """		if c.pending.Len()""",
+        ["TestServeReprioritizingABufferedStreamDoesNotUseUpMoreRoom"],
+    ),
+    (
+        "handleStreamFrame: the buffer is applied before the stream layer has ruled on the frame",
+        """		defer c.leftIdle(id)
+	}
+	return c.handler.HandleFrame(f)""",
+        """		c.leftIdle(id)
+	}
+	return c.handler.HandleFrame(f)""",
+        [
+            "TestServeBuffersAPriorityUpdateUntilTheStreamOpens",
+            "TestServeLetsAPriorityUpdateOverrideTheRequestsOwnPriorityField",
+        ],
+    ),
+    (
+        "leftIdle: a refused stream's buffered priority is applied, and nothing will ever forget it",
+        """	if p, ok := c.pending.Take(id); ok && c.handler.Live(id) {""",
+        """	if p, ok := c.pending.Take(id); ok {""",
+        ["TestServeDoesNotPrioritizeARefusedStream"],
+    ),
+    (
+        "leftIdle: the identifiers §5.1.1 just closed are not pruned, so the buffer fills for good",
+        """	c.pending.Prune(id)
+""",
+        "",
+        ["TestServeOpeningAStreamRestoresRoomToPrioritize"],
+    ),
+
     # --- graceful shutdown ---------------------------------------------------
     (
         "Serve: a shutdown is reported as a failure and the peer is never told why",
         """		sendErr = c.farewell(h2.NoError, "server shutting down")
+		sentGoAway = true
 		err = nil""",
         "",
         [

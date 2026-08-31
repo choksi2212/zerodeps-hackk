@@ -21,9 +21,9 @@ import (
 // FrameType is the 8-bit frame type field (RFC 9113 §11.2).
 type FrameType uint8
 
-// The ten frame types defined by RFC 9113. Types 0x0a and above are
-// unassigned; a receiver must discard them silently rather than error, which is
-// handled in Reader.ReadFrame.
+// The frame types this server implements: the ten of RFC 9113 §11.2, and the one
+// RFC 9218 registers. A type this package does not implement must be discarded
+// silently rather than rejected, which is handled in Reader.ReadFrame.
 const (
 	TypeData         FrameType = 0x0
 	TypeHeaders      FrameType = 0x1
@@ -36,33 +36,54 @@ const (
 	TypeWindowUpdate FrameType = 0x8
 	TypeContinuation FrameType = 0x9
 
-	// maxDefinedType is the highest assigned type. Anything above it is
-	// unknown and must be discarded.
-	maxDefinedType = TypeContinuation
+	// TypePriorityUpdate is PRIORITY_UPDATE (RFC 9218 §7.1), the frame that
+	// carries an extensible-priorities signal. It is not in RFC 9113's own
+	// registry, and the eight-bit space between it and CONTINUATION holds types
+	// this server does not implement — so this is where the assigned range stops
+	// being a range, and why the two tables below are indexed rather than
+	// listed.
+	TypePriorityUpdate FrameType = 0x10
+
+	// maxDefinedType is the highest type this package implements. Anything above
+	// it is unknown and must be discarded — and so is anything inside the hole
+	// beneath it, which is why known does not compare against this.
+	maxDefinedType = TypePriorityUpdate
 )
 
+// frameTypeNames is indexed by frame type, so the unimplemented types in the
+// middle read as the empty string. That is the sentinel String and known both
+// test: a keyed literal cannot drift out of step with the constants above the way
+// a positional one could, where inserting a type would silently rename every type
+// after it.
 var frameTypeNames = [...]string{
-	"DATA",
-	"HEADERS",
-	"PRIORITY",
-	"RST_STREAM",
-	"SETTINGS",
-	"PUSH_PROMISE",
-	"PING",
-	"GOAWAY",
-	"WINDOW_UPDATE",
-	"CONTINUATION",
+	TypeData:           "DATA",
+	TypeHeaders:        "HEADERS",
+	TypePriority:       "PRIORITY",
+	TypeRSTStream:      "RST_STREAM",
+	TypeSettings:       "SETTINGS",
+	TypePushPromise:    "PUSH_PROMISE",
+	TypePing:           "PING",
+	TypeGoAway:         "GOAWAY",
+	TypeWindowUpdate:   "WINDOW_UPDATE",
+	TypeContinuation:   "CONTINUATION",
+	TypePriorityUpdate: "PRIORITY_UPDATE",
 }
 
 func (t FrameType) String() string {
-	if int(t) < len(frameTypeNames) {
+	if int(t) < len(frameTypeNames) && frameTypeNames[t] != "" {
 		return frameTypeNames[t]
 	}
 	return fmt.Sprintf("UNKNOWN_FRAME_TYPE(0x%x)", uint8(t))
 }
 
-// known reports whether the type is assigned by RFC 9113.
-func (t FrameType) known() bool { return t <= maxDefinedType }
+// known reports whether this package has a parser for the type.
+//
+// It asks the parser table rather than comparing against maxDefinedType, because
+// the range has a hole in it: 0xa through 0xf index inside the table and are not
+// implemented, and a range check would call a nil function for them. Asking the
+// table makes "known" and "parseable" the same question by construction, and
+// TestFrameTypeTablesAgree holds the name table to the same shape.
+func (t FrameType) known() bool { return int(t) < len(parsers) && parsers[t] != nil }
 
 // Flags is the 8-bit flags field. The meaning of a bit depends on the frame
 // type, and the same bit means different things in different frames: 0x1 is
@@ -107,30 +128,42 @@ const (
 	SettingInitialWindowSize    SettingID = 0x4
 	SettingMaxFrameSize         SettingID = 0x5
 	SettingMaxHeaderListSize    SettingID = 0x6
+
+	// SettingNoRFC7540Priorities is SETTINGS_NO_RFC7540_PRIORITIES (RFC 9218
+	// §2.1): the parameter by which an endpoint says it is not using the
+	// priority scheme RFC 9113 §5.3 deprecated. The identifiers between it and
+	// SETTINGS_MAX_HEADER_LIST_SIZE belong to extensions this server does not
+	// implement, and an identifier it does not implement must be ignored rather
+	// than rejected — so the gap is a gap in the name table, not an error.
+	SettingNoRFC7540Priorities SettingID = 0x9
 )
 
+// settingNames is indexed by identifier, and an identifier this server does not
+// implement — including 0x0, which is not assigned to anything — reads as the
+// empty string. String and known both test for it, so neither has a special case
+// for zero and neither can be fooled by the hole in the middle.
 var settingNames = [...]string{
-	"UNKNOWN_SETTING(0x0)",
-	"SETTINGS_HEADER_TABLE_SIZE",
-	"SETTINGS_ENABLE_PUSH",
-	"SETTINGS_MAX_CONCURRENT_STREAMS",
-	"SETTINGS_INITIAL_WINDOW_SIZE",
-	"SETTINGS_MAX_FRAME_SIZE",
-	"SETTINGS_MAX_HEADER_LIST_SIZE",
+	SettingHeaderTableSize:      "SETTINGS_HEADER_TABLE_SIZE",
+	SettingEnablePush:           "SETTINGS_ENABLE_PUSH",
+	SettingMaxConcurrentStreams: "SETTINGS_MAX_CONCURRENT_STREAMS",
+	SettingInitialWindowSize:    "SETTINGS_INITIAL_WINDOW_SIZE",
+	SettingMaxFrameSize:         "SETTINGS_MAX_FRAME_SIZE",
+	SettingMaxHeaderListSize:    "SETTINGS_MAX_HEADER_LIST_SIZE",
+	SettingNoRFC7540Priorities:  "SETTINGS_NO_RFC7540_PRIORITIES",
 }
 
 func (id SettingID) String() string {
-	if id != 0 && int(id) < len(settingNames) {
+	if int(id) < len(settingNames) && settingNames[id] != "" {
 		return settingNames[id]
 	}
 	return fmt.Sprintf("UNKNOWN_SETTING(0x%x)", uint16(id))
 }
 
-// known reports whether the identifier is assigned. Unknown identifiers must be
-// ignored rather than rejected (RFC 9113 §6.5.2), so this is used when applying
-// settings, not when parsing them.
+// known reports whether this server implements the identifier. One it does not
+// must be ignored rather than rejected (RFC 9113 §6.5.2), so this is used when
+// applying settings, not when parsing them.
 func (id SettingID) known() bool {
-	return id >= SettingHeaderTableSize && id <= SettingMaxHeaderListSize
+	return int(id) < len(settingNames) && settingNames[id] != ""
 }
 
 // Protocol constants from RFC 9113 §6.5.2 and §11.3.

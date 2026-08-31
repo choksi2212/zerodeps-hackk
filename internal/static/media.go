@@ -92,10 +92,10 @@ var mediaTypes = map[string]string{
 	".ttf":   "font/ttf",
 	".otf":   "font/otf",
 
-	// Media. Served whole: this server sends no accept-ranges field and honours no range
-	// request, so a browser seeking in a large video re-downloads from the start. That is
-	// a stated limitation rather than a bug — see the README — and it is the reason these
-	// entries are short.
+	// Media, which is the reason ranges.go exists: a browser scrubbing through a video sends
+	// one range request per seek, and a server ignoring those would re-send the whole file
+	// from the start for each one. The list is short because the set of container formats a
+	// browser will decode without being asked twice is short.
 	".mp4":  "video/mp4",
 	".webm": "video/webm",
 	".mp3":  "audio/mpeg",

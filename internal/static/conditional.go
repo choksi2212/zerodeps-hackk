@@ -99,39 +99,46 @@ const (
 // precedence over every field read here, and this runs at the one point in serve where a
 // representation has actually been selected: an open handle on a regular file.
 //
-// # There is no entity tag, and both entity-tag fields still have an answer
+// # The two entity-tag fields, and the two comparison functions
 //
-// See the package comment for why this server sends no ETag. It does not leave If-Match and
-// If-None-Match unanswerable: each is defined for a server holding a representation that has no
-// entity tag, and the answer falls out of the definition.
+// tag is the representation's entity tag as etag computed it, and the empty string means there is
+// none — a file whose content could not be hashed. Each field is compared against it by the
+// function §13.2.2 of RFC 9110's steps name for it, and the two are not the same function.
 //
-//   - If-Match with a value of * is true, because it is a question about existence rather than
-//     about tags. §13.1.1 of RFC 9110: "the condition is true if the origin server has a
-//     current representation for the target resource". There is one, open, in the caller's
-//     hand. The other step is a comparison this server cannot win — §13.1.1 of RFC 9110: "the
-//     condition is true if any of the listed tags match the entity tag of the selected
-//     representation" — because no tag matches a representation that has none, which leaves
-//     the step after it and a condition that is false.
-//   - If-None-Match with a value of * is the same question inverted, and the answer inverts
-//     with it. §13.1.2 of RFC 9110: "the condition is false if the origin server has a current
-//     representation for the target resource" — which for a GET or a HEAD is a 304. The list
-//     step inverts too, per §13.1.2 of RFC 9110: "the condition is false if one of the listed
-//     tags matches the entity tag of the selected representation". Again nothing matches, so
-//     the condition is true and the response is the file.
+//   - If-Match takes the strong one. §13.1.1 of RFC 9110: "An origin server MUST use the strong
+//     comparison function when comparing entity tags for If-Match". So a W/ tag in an if-match
+//     never matches, whatever its opaque-tag says.
+//   - If-None-Match takes the weak one. §13.1.2 of RFC 9110: "A recipient MUST use the weak
+//     comparison function when comparing entity tags for If-None-Match". So a client holding a
+//     weak copy of this representation is told it is still current, which is what a weak validator
+//     is for.
 //
-// A repeated field line is a failure of the same kind in both. Two lines carrying one name are
-// a single comma-separated list by §5.3 of RFC 9110, and of a list holding the wildcard §13.1.1
-// of RFC 9110 says it "is syntactically invalid (therefore not allowed to be generated) and
-// furthermore is unlikely to be interoperable". So two if-match lines are not two wildcards,
-// they are one invalid value — and an invalid value is neither the wildcard nor a matching tag.
-// Which is why the wildcard is recognised on a single line only.
-func evaluate(r *exchange.Request, mod, now time.Time) verdict {
+// matchesStrong and matchesWeak are both, and etag.go argues the difference. The wildcard is
+// handled here rather than there, because §13.1.1 of RFC 9110 makes it an alternative to the whole
+// list rather than a member of one: If-Match with a value of * asks about existence, and the answer
+// is yes. §13.1.1 of RFC 9110: "the condition is true if the origin server has a current
+// representation for the target resource", and the caller is holding one open. §13.1.2 of RFC 9110
+// inverts both halves: "the condition is false if the origin server has a current representation for
+// the target resource" — which for a GET or a HEAD is a 304.
+//
+// A repeated field line is a failure in both. Two lines carrying one name are a single
+// comma-separated list by §5.3 of RFC 9110, and of a list holding the wildcard §13.1.1 of RFC 9110
+// says it "is syntactically invalid (therefore not allowed to be generated) and furthermore is
+// unlikely to be interoperable". So two if-match lines are not two wildcards, they are one invalid
+// value — and an invalid value is neither the wildcard nor a matching tag. Which is why the wildcard
+// is recognised on a single line only, and why the comparison is too: a list assembled from two
+// lines is a list this server has been given no reading for.
+//
+// The file with no tag at all still answers both fields, and it answers them the way it did before
+// there were any: the wildcard forms work, since they are questions about existence, and every list
+// of tags matches nothing. matches returns false for an empty tag for exactly that reason.
+func evaluate(r *exchange.Request, tag string, mod, now time.Time) verdict {
 	// Step 1 and step 2 are one branch because §13.2.2 of RFC 9110 makes them one: the second
 	// is reached only when, per §13.2.2 of RFC 9110, "When recipient is the origin server,
 	// If-Match is not present". §13.1.4 of RFC 9110 says it the other way round: "A recipient
 	// MUST ignore If-Unmodified-Since if the request contains an If-Match header field".
 	if value, lines := lookup(r.Fields, fieldIfMatch); lines > 0 {
-		if lines > 1 || value != "*" {
+		if lines > 1 || (value != "*" && !matchesStrong(value, tag)) {
 			return verdictFailed
 		}
 	} else if date, ok := condDate(r, fieldIfUnmodifiedSince, mod, now); ok && mod.After(date) {
@@ -149,15 +156,17 @@ func evaluate(r *exchange.Request, mod, now time.Time) verdict {
 	// request methods". serve has already answered every other method with a 405, so no request
 	// can reach a b) branch from here and there is none to write.
 	if value, lines := lookup(r.Fields, fieldIfNoneMatch); lines > 0 {
-		if lines == 1 && value == "*" {
+		if lines == 1 && (value == "*" || matchesWeak(value, tag)) {
 			return verdictNotModified
 		}
 
-		// A list of entity tags: the condition is true, and step 4 is skipped rather than
-		// evaluated. §13.1.3 of RFC 9110: "A recipient MUST ignore If-Modified-Since if the
-		// request contains an If-None-Match header field". Returning here is that rule. Falling
-		// through to the date would be a server answering a cache-validating request with the
-		// less accurate of the two conditions it was given.
+		// The condition is true, and step 4 is skipped rather than evaluated. §13.1.3 of RFC
+		// 9110: "A recipient MUST ignore If-Modified-Since if the request contains an
+		// If-None-Match header field". Returning here is that rule. Falling through to the date
+		// would be a server answering a cache-validating request with the less accurate of the
+		// two conditions it was given — and worse, one that could contradict the tag it has just
+		// compared, since a file restored to an earlier content has an older date and a
+		// different tag.
 		return verdictSend
 	}
 
@@ -172,10 +181,14 @@ func evaluate(r *exchange.Request, mod, now time.Time) verdict {
 		return verdictNotModified
 	}
 
-	// Step 5 is a range request, and this server has none. §13.2.2 of RFC 9110 reaches it only
-	// "When the method is GET and both Range and If-Range are present", and a server that
-	// ignores Range — as §14.2 of RFC 9110 permits, see the package comment — never gets past
-	// the first clause of that. Step 6 is the file.
+	// Step 5 is the range request, and it is not evaluated here. §13.2.2 of RFC 9110 reaches it
+	// only "When the method is GET and both Range and If-Range are present", and both of its
+	// outcomes are decisions about the range field rather than about the preconditions — §13.2.2
+	// of RFC 9110: "if true and the Range is applicable to the selected representation, respond
+	// 206 (Partial Content)". The other outcome, from §13.2.2 of RFC 9110: "otherwise, ignore
+	// the Range header field and respond 200 (OK)". So serve makes it after this function has
+	// returned verdictSend, by calling evaluateRange, and ifRangeIsFalse is where the condition
+	// itself is evaluated. Step 6 is the file.
 	return verdictSend
 }
 

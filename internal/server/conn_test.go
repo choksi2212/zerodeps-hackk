@@ -15,6 +15,7 @@ import (
 	"zerodeps/zdh/internal/frame"
 	"zerodeps/zdh/internal/h2"
 	"zerodeps/zdh/internal/limits"
+	"zerodeps/zdh/internal/priority"
 )
 
 // shortTimeout is every deadline a test is waiting to fire. longTimeout is every
@@ -53,6 +54,8 @@ type testSocket struct {
 	pending       []byte
 	readDeadlines []time.Time
 	closes        int
+	closeWrites   int
+	teardown      []string
 	eofAtEnd      bool
 	readErr       error
 
@@ -164,7 +167,23 @@ func (ts *testSocket) SetReadDeadline(t time.Time) error {
 func (ts *testSocket) Close() error {
 	ts.readMu.Lock()
 	ts.closes++
+	ts.teardown = append(ts.teardown, "close")
 	ts.readMu.Unlock()
+	return nil
+}
+
+// CloseWrite makes testSocket a halfCloser, so gracefulClose reaches it the same way
+// it reaches a real *net.TCPConn or *tls.Conn. It records the call and its order
+// relative to Close, and — because a peer that has been sent a FIN answers with its
+// own close — arranges for the drain that follows to see EOF at once rather than
+// spending the drain grace waiting on a deadline in a unit test.
+func (ts *testSocket) CloseWrite() error {
+	ts.readMu.Lock()
+	ts.closeWrites++
+	ts.teardown = append(ts.teardown, "closewrite")
+	ts.eofAtEnd = true
+	ts.readMu.Unlock()
+	ts.wake()
 	return nil
 }
 
@@ -172,6 +191,20 @@ func (ts *testSocket) closeCount() int {
 	ts.readMu.Lock()
 	defer ts.readMu.Unlock()
 	return ts.closes
+}
+
+func (ts *testSocket) closeWriteCount() int {
+	ts.readMu.Lock()
+	defer ts.readMu.Unlock()
+	return ts.closeWrites
+}
+
+// teardownOrder is the sequence of write-half and full closes the connection made,
+// which is where gracefulClose's "FIN before the blunt close" is observable.
+func (ts *testSocket) teardownOrder() []string {
+	ts.readMu.Lock()
+	defer ts.readMu.Unlock()
+	return append([]string(nil), ts.teardown...)
 }
 
 func (ts *testSocket) allReadDeadlines() []time.Time {
@@ -194,9 +227,17 @@ func (ts *testSocket) pendingLen() int {
 // context, and answering the two that can fail with a failure instead would make every
 // dispatch test that happens to carry a stream-0 WINDOW_UPDATE fail for a reason it is
 // not about. recordingHandler is the double that watches them.
+//
+// The two stream-set queries answer as an empty table would: no stream is live and none
+// is active. That is what a double which keeps no streams honestly is, and it makes a
+// PRIORITY_UPDATE dispatched through this handler take the buffer-it branch — so the
+// tests that only care that the frame was routed get the simple case, and the tests
+// about the branches use recordingHandler.
 type handlerFunc func(frame.Frame) error
 
 func (h handlerFunc) HandleFrame(f frame.Frame) error   { return h(f) }
+func (h handlerFunc) Live(uint32) bool                  { return false }
+func (h handlerFunc) Len() int                          { return 0 }
 func (h handlerFunc) ConnWindowUpdate(uint32) error     { return nil }
 func (h handlerFunc) SetInitialWindowSize(uint32) error { return nil }
 func (h handlerFunc) SetHeaderTableSize(uint32)         {}
@@ -231,6 +272,38 @@ type recordingHandler struct {
 	// hookErr is what the two hooks that can fail return, kept apart from err so
 	// that a test can fail one without failing frame dispatch.
 	hookErr error
+
+	// live is the set of streams this double reports as open or half-closed, and
+	// active is what it reports as the count of them. They are separate, and
+	// deliberately not derived from each other: §7.1 of RFC 9218's limit is about
+	// the count, the routing decision is about the membership, and a test that wants
+	// a full table without naming a hundred streams sets only the count.
+	live   map[uint32]bool
+	active int
+}
+
+func (h *recordingHandler) Live(id uint32) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.live[id]
+}
+
+func (h *recordingHandler) Len() int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.active
+}
+
+// setLive makes this double report id as a live stream, as the real table does between
+// a stream's first frame and its retirement.
+func (h *recordingHandler) setLive(id uint32) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.live == nil {
+		h.live = make(map[uint32]bool)
+	}
+	h.live[id] = true
+	h.active = len(h.live)
 }
 
 func (h *recordingHandler) HandleFrame(f frame.Frame) error {
@@ -593,6 +666,12 @@ func TestInitialSettingsAdvertiseTheServersLimits(t *testing.T) {
 		// §8.4 already makes a client's PUSH_PROMISE a connection error, so this
 		// exists to tell the client it need not reserve anything for a push from us.
 		frame.SettingEnablePush: 0,
+
+		// One, because this server ignores RFC 9113's priority signals and implements
+		// RFC 9218's instead. §2.1.1 of RFC 9218 has a client that does not see this
+		// stop sending PRIORITY_UPDATE frames, so the value is what keeps the
+		// replacement signal arriving.
+		frame.SettingNoRFC7540Priorities: 1,
 	}
 	for id, value := range want {
 		got, ok := f.Get(id)
@@ -664,6 +743,65 @@ func TestInitialSettingsDoesNotSetTheInitialWindowSize(t *testing.T) {
 		t.Errorf("the server's SETTINGS advertises INITIAL_WINDOW_SIZE = %d; internal/stream sizes "+
 			"every stream receive window at %d and has no way to learn otherwise, so the two would "+
 			"disagree by %d octets per stream", v, flow.InitialWindowSize, int64(v)-flow.InitialWindowSize)
+	}
+}
+
+// TestNoRFC7540PrioritiesIsInTheFirstSettingsFrameOnly is §2.1 of RFC 9218's placement
+// rule, checked on the wire rather than on the value initialSettings returns.
+//
+// §2.1 of RFC 9218: "If endpoints use SETTINGS_NO_RFC7540_PRIORITIES, they MUST send it
+// in the first SETTINGS frame.  Senders MUST NOT change the
+// SETTINGS_NO_RFC7540_PRIORITIES value after the first SETTINGS frame."
+//
+// Both halves are one assertion here, because this server sends exactly one SETTINGS
+// frame carrying parameters: the preface. Every later one is an acknowledgement, and an
+// acknowledgement carries no parameters — §6.5 of RFC 9113 requires an empty payload —
+// so there is no second value to differ from the first. That is what this test pins: not
+// that the value never changes, but that there is no frame in which it could.
+func TestNoRFC7540PrioritiesIsInTheFirstSettingsFrameOnly(t *testing.T) {
+	ts := newTestSocket(&testTarget{}).
+		script(clientHello(t)).
+		script(encodeFrames(t, frame.SettingsFrame{Ack: true}, ping(1))).
+		atEOF()
+
+	if err := serve(t, ts, rejectingHandler(t), testTimeouts()); err != nil {
+		t.Fatalf("Serve: %v", err)
+	}
+
+	got := peerSaw(t, ts)
+	var settings []frame.SettingsFrame
+	for _, f := range got {
+		if sf, ok := f.(frame.SettingsFrame); ok {
+			settings = append(settings, sf)
+		}
+	}
+	if len(settings) < 2 {
+		t.Fatalf("the peer received %d SETTINGS frames, want the preface and at least one "+
+			"acknowledgement; it received %s", len(settings), describe(got))
+	}
+
+	v, ok := settings[0].Get(frame.SettingNoRFC7540Priorities)
+	if !ok {
+		t.Error("the first SETTINGS frame does not carry SETTINGS_NO_RFC7540_PRIORITIES, " +
+			"which is the only frame RFC 9218 §2.1 allows it in")
+	}
+	if v != 1 {
+		t.Errorf("the first SETTINGS frame says SETTINGS_NO_RFC7540_PRIORITIES = %d, want 1", v)
+	}
+	if settings[0].Ack {
+		t.Error("the server's first SETTINGS frame carries the ACK flag")
+	}
+
+	for i, sf := range settings[1:] {
+		if !sf.Ack {
+			t.Errorf("SETTINGS frame %d after the preface is not an acknowledgement; a second "+
+				"SETTINGS carrying parameters is where RFC 9218 §2.1's no-change rule could be "+
+				"broken", i+1)
+		}
+		if len(sf.Settings) != 0 {
+			t.Errorf("the acknowledgement carries %d parameters, want none (RFC 9113 §6.5)",
+				len(sf.Settings))
+		}
 	}
 }
 
@@ -978,6 +1116,156 @@ func TestServeDoesNotAcknowledgeAnAcknowledgement(t *testing.T) {
 	}
 }
 
+// --- SETTINGS_NO_RFC7540_PRIORITIES (RFC 9218 §2.1) --------------------------
+
+// settingsTwice scripts a connection whose first SETTINGS frame carries first and
+// whose second carries second, which is the shape every §2.1 no-change case takes.
+//
+// A nil first is a SETTINGS frame with no parameters in it, not a missing frame: the
+// peer still has to send its preface SETTINGS, and "absent" in these tests means
+// absent from that frame rather than absent from the connection.
+func settingsTwice(t *testing.T, first, second []frame.Setting) []byte {
+	t.Helper()
+	return append(clientHello(t, first...),
+		encodeFrames(t, frame.SettingsFrame{Settings: second})...)
+}
+
+// TestServeAcceptsNoRFC7540Priorities is the ordinary case: a client saying which
+// priority scheme it is using. There is nothing for this server to apply — it
+// ignores RFC 9113's priority signals from every peer, which §2.1 of RFC 9218
+// permits — so the whole observable effect is that the connection survives and the
+// parameter is acknowledged like any other.
+func TestServeAcceptsNoRFC7540Priorities(t *testing.T) {
+	for _, value := range []uint32{0, 1} {
+		ts := newTestSocket(&testTarget{}).
+			script(clientHello(t, frame.Setting{
+				ID:    frame.SettingNoRFC7540Priorities,
+				Value: value,
+			})).
+			atEOF()
+
+		if err := serve(t, ts, rejectingHandler(t), testTimeouts()); err != nil {
+			t.Fatalf("Serve returned %v for SETTINGS_NO_RFC7540_PRIORITIES = %d, want nil "+
+				"(RFC 9218 §2.1)", err, value)
+		}
+		got := peerSaw(t, ts)
+		if s, ok := got[len(got)-1].(frame.SettingsFrame); !ok || !s.Ack {
+			t.Fatalf("the peer received %s, want an acknowledgement last", describe(got))
+		}
+	}
+}
+
+// TestServeRefusesAChangedNoRFC7540Priorities is the MAY this server takes.
+//
+// §2.1 of RFC 9218 forbids the sender to change the value after the first SETTINGS
+// frame and lets the receiver treat a change as a connection error of type
+// PROTOCOL_ERROR. The alternative to refusing is to believe one of the peer's two
+// statements about itself and discard the other, with nothing in the document saying
+// which.
+func TestServeRefusesAChangedNoRFC7540Priorities(t *testing.T) {
+	const id = frame.SettingNoRFC7540Priorities
+	tests := []struct {
+		name          string
+		first, second []frame.Setting
+	}{
+		{"1 then 0", []frame.Setting{{ID: id, Value: 1}}, []frame.Setting{{ID: id, Value: 0}}},
+		{"0 then 1", []frame.Setting{{ID: id, Value: 0}}, []frame.Setting{{ID: id, Value: 1}}},
+		{
+			// Absent from the first frame means 0, because that is the parameter's
+			// initial value — so arriving afterwards with a 1 is a change, and it
+			// breaks the other half of the same sentence too: a peer that uses the
+			// parameter has to send it in the first SETTINGS frame.
+			name:   "absent then 1",
+			second: []frame.Setting{{ID: id, Value: 1}},
+		},
+		{
+			// The change is what matters, not the pair's position in the frame. A
+			// server that only looked at the first parameter of a later SETTINGS
+			// would miss this one.
+			name:  "1 then 0 behind another parameter",
+			first: []frame.Setting{{ID: id, Value: 1}},
+			second: []frame.Setting{
+				{ID: frame.SettingMaxConcurrentStreams, Value: 3},
+				{ID: id, Value: 0},
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ts := newTestSocket(&testTarget{}).
+				script(settingsTwice(t, tt.first, tt.second)).
+				atEOF()
+
+			err := serve(t, ts, rejectingHandler(t), testTimeouts())
+			if ce := connErrorOf(t, err); ce.Code != h2.ProtocolError {
+				t.Errorf("Serve returned %s, want PROTOCOL_ERROR (RFC 9218 §2.1)", ce.Code)
+			}
+			if !strings.Contains(err.Error(), "SETTINGS_NO_RFC7540_PRIORITIES") {
+				t.Errorf("the error does not name the parameter that changed: %v", err)
+			}
+			if ga := goAwayIn(t, peerSaw(t, ts)); ga.ErrCode != h2.ProtocolError {
+				t.Errorf("the GOAWAY carries %s, want PROTOCOL_ERROR", ga.ErrCode)
+			}
+		})
+	}
+}
+
+// TestServeAcceptsAnUnchangedNoRFC7540Priorities is the other side of that rule, and
+// it is the half a change detector gets wrong: §2.1 forbids the value to change, not
+// the parameter to be sent again. A server that refused every repetition would break
+// a client that simply restates its whole parameter set.
+func TestServeAcceptsAnUnchangedNoRFC7540Priorities(t *testing.T) {
+	const id = frame.SettingNoRFC7540Priorities
+	tests := []struct {
+		name          string
+		first, second []frame.Setting
+	}{
+		{"1 then 1", []frame.Setting{{ID: id, Value: 1}}, []frame.Setting{{ID: id, Value: 1}}},
+		{"0 then 0", []frame.Setting{{ID: id, Value: 0}}, []frame.Setting{{ID: id, Value: 0}}},
+		{
+			// Sent late with the value it already had. That breaks §2.1's
+			// send-it-in-the-first-frame requirement without changing anything, and
+			// the only enforcement §2.1 offers a receiver is for a change — so this
+			// is accepted, deliberately, rather than refused on a rule the document
+			// gives us no code for.
+			name:   "absent then 0",
+			second: []frame.Setting{{ID: id, Value: 0}},
+		},
+		{
+			// Duplicates inside one frame are legal and last-wins, and the frame is
+			// the unit the no-change rule counts: 0 then 1 within the first SETTINGS
+			// leaves the value at 1, so the later 1 is not a change. A server that
+			// compared pair by pair would call this connection a violation on its
+			// second parameter.
+			name:   "0 and then 1 in the first frame, then 1",
+			first:  []frame.Setting{{ID: id, Value: 0}, {ID: id, Value: 1}},
+			second: []frame.Setting{{ID: id, Value: 1}},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ts := newTestSocket(&testTarget{}).
+				script(settingsTwice(t, tt.first, tt.second)).
+				atEOF()
+
+			if err := serve(t, ts, rejectingHandler(t), testTimeouts()); err != nil {
+				t.Fatalf("Serve returned %v, want nil: the value did not change (RFC 9218 §2.1)", err)
+			}
+			acks := 0
+			got := peerSaw(t, ts)
+			for _, f := range got {
+				if s, ok := f.(frame.SettingsFrame); ok && s.Ack {
+					acks++
+				}
+			}
+			if acks != 2 {
+				t.Errorf("the server sent %d acknowledgements, want one for each of the client's "+
+					"two SETTINGS frames; the peer received %s", acks, describe(got))
+			}
+		})
+	}
+}
+
 // --- PING (validation matrix row 24) -----------------------------------------
 
 // TestServeAnswersAPing is matrix row 24. The eight octets come back unchanged with
@@ -1185,6 +1473,642 @@ func TestServeRefusesAPushPromiseFromAClient(t *testing.T) {
 	}
 	if ga := goAwayIn(t, peerSaw(t, ts)); ga.ErrCode != h2.ProtocolError {
 		t.Errorf("the GOAWAY carries %s, want PROTOCOL_ERROR", ga.ErrCode)
+	}
+}
+
+// --- PRIORITY_UPDATE (RFC 9218 §7.1) -----------------------------------------
+
+// TestServeKeepsAPriorityUpdateFromTheHandler is the routing decision. The frame
+// arrives on the connection, and the stream it names may not exist yet — §7 of RFC
+// 9218 makes that legal — so it is answered here and never handed to the stream
+// layer.
+//
+// The WINDOW_UPDATE after it is what makes the test mean something: without a frame
+// the handler is supposed to see, a connection that swallowed everything would look
+// exactly like a pass.
+func TestServeKeepsAPriorityUpdateFromTheHandler(t *testing.T) {
+	ts := newTestSocket(&testTarget{}).
+		script(append(clientHello(t), encodeFrames(t,
+			frame.PriorityUpdateFrame{PrioritizedStreamID: 1, Field: "u=0, i"},
+			// A stream this connection has never seen, and a field value that is
+			// not a structured field. Neither is a reason to refuse the frame:
+			// §7 permits the stream to be unopened, and makes acting on an
+			// unparseable field value a MAY rather than a requirement.
+			frame.PriorityUpdateFrame{PrioritizedStreamID: 4095, Field: ")("},
+			frame.WindowUpdateFrame{StreamID: 1, Increment: 4096},
+		)...)).
+		atEOF()
+
+	h := &recordingHandler{}
+	if err := serve(t, ts, h, testTimeouts()); err != nil {
+		t.Fatalf("Serve: %v", err)
+	}
+	got := h.seen()
+	if len(got) != 1 {
+		t.Fatalf("the handler saw %s, want only the stream-1 WINDOW_UPDATE", describe(got))
+	}
+	if want := (frame.WindowUpdateFrame{StreamID: 1, Increment: 4096}); got[0] != want {
+		t.Errorf("the handler saw %#v, want %#v", got[0], want)
+	}
+	noGoAwayIn(t, peerSaw(t, ts))
+}
+
+// TestServeRefusesAPriorityUpdateForAPushStream is the role rule of §7.1, and this
+// server can decide it from the identifier alone.
+//
+// An even stream identifier belongs to a server-initiated stream (§5.1.1), which is
+// to say a push stream; this server pushes nothing, so every even stream on the
+// connection is idle and always will be. §7.1 makes prioritizing a push stream in
+// that state a connection error of type PROTOCOL_ERROR, and no stream table has to
+// be consulted to know that it is one — the same shape of argument as §8.4's for
+// PUSH_PROMISE.
+func TestServeRefusesAPriorityUpdateForAPushStream(t *testing.T) {
+	for _, id := range []uint32{2, 4, 100, 1<<31 - 2} {
+		ts := newTestSocket(&testTarget{}).
+			script(append(clientHello(t), encodeFrames(t,
+				frame.PriorityUpdateFrame{PrioritizedStreamID: id, Field: "u=3"},
+			)...)).
+			atEOF()
+
+		err := serve(t, ts, rejectingHandler(t), testTimeouts())
+		if ce := connErrorOf(t, err); ce.Code != h2.ProtocolError {
+			t.Errorf("prioritized stream %d: Serve returned %s, want PROTOCOL_ERROR "+
+				"(RFC 9218 §7.1)", id, ce.Code)
+		}
+		if !strings.Contains(err.Error(), "push") {
+			t.Errorf("prioritized stream %d: the error does not say what an even identifier "+
+				"means: %v", id, err)
+		}
+		if ga := goAwayIn(t, peerSaw(t, ts)); ga.ErrCode != h2.ProtocolError {
+			t.Errorf("prioritized stream %d: the GOAWAY carries %s, want PROTOCOL_ERROR",
+				id, ga.ErrCode)
+		}
+	}
+}
+
+// openingHandler is a stream layer that opens every stream it is handed a frame for,
+// except the ones named in refuse.
+//
+// The buffer-then-apply path of §7 of RFC 9218 cannot be reached without it. A
+// PRIORITY_UPDATE for an idle stream is held until the stream opens, and "opens" is the
+// stream layer's answer, not the connection's — so a double that never reports a live
+// stream, as recordingHandler does not, only ever exercises the buffering half.
+//
+// refuse is the other half of that answer, and it is not a decoration: a stream over
+// SETTINGS_MAX_CONCURRENT_STREAMS leaves the idle state and lands in closed without ever
+// entering the stream table, so nothing will ever retire it and nothing will ever tell
+// the write half to forget it. That makes it the one case where applying a buffered
+// signal would leak, which is why it has a test of its own.
+//
+// refuse is written before Serve starts and only read after, so it needs no lock of its
+// own; everything the embedded double records is locked as it always was.
+type openingHandler struct {
+	recordingHandler
+	refuse map[uint32]bool
+}
+
+func (h *openingHandler) HandleFrame(f frame.Frame) error {
+	if id := f.Stream(); id != 0 && !h.refuse[id] {
+		h.setLive(id)
+	}
+	return h.recordingHandler.HandleFrame(f)
+}
+
+// signallingHandler is internal/exchange as this file needs it: a stream handler that
+// makes a priority signal from inside HandleFrame, which is what a request carrying §5 of
+// RFC 9218's Priority header field produces.
+//
+// The real one decodes a header section to find the field and parses it. This one is told
+// what the field said, because the question here is when the call happens relative to a
+// PRIORITY_UPDATE and not what produced it — and a double that had to encode HPACK to
+// state a priority would be testing internal/hpack.
+//
+// The signal is made after the embedded handler has taken the frame, which is the order
+// the real layers run in: the stream table opens the stream and then delivers the header
+// section to the request layer.
+type signallingHandler struct {
+	openingHandler
+
+	// w is filled in by capturing when the connection is built, because a handler
+	// cannot be handed the write half of a connection that does not exist yet.
+	w ConnWriter
+
+	// field is what the request's Priority field said.
+	field priority.Params
+
+	// signalled is how many signals this double made. Written from the connection's
+	// reader goroutine and read after awaitServe, by which time Serve has returned and
+	// that goroutine is finished.
+	signalled int
+}
+
+func (h *signallingHandler) HandleFrame(f frame.Frame) error {
+	if err := h.openingHandler.HandleFrame(f); err != nil {
+		return err
+	}
+	if _, ok := f.(frame.HeadersFrame); ok {
+		h.signalled++
+		h.w.Prioritize(f.Stream(), h.field)
+	}
+	return nil
+}
+
+// capturing is the per-connection factory for a handler that needs the write half.
+func capturing(h *signallingHandler) func(ConnWriter) StreamHandler {
+	return func(w ConnWriter) StreamHandler {
+		h.w = w
+		return h
+	}
+}
+
+// priorityOf is what a connection's scheduler was told about a stream.
+//
+// Reaching into the write half is the assertion these tests want, because the effect of
+// a PRIORITY_UPDATE is a scheduling decision and a scheduling decision is invisible on a
+// connection with one stream's worth of frames on it. That the scheduler then acts on
+// what it was told is writer_test.go's and scheduler_test.go's; that the frame reaches it
+// at all, and only when it should, is this file's.
+//
+// It is safe to read after Serve returns without racing the reader goroutine: Serve stops
+// the writer and waits for it before returning, so both goroutines that touch this are
+// finished. The mutex is taken anyway, because a helper that documented why it did not
+// need one would be wrong the day Serve changed.
+func priorityOf(t *testing.T, c *conn, id uint32) (priority.Params, bool) {
+	t.Helper()
+	c.w.mu.Lock()
+	defer c.w.mu.Unlock()
+	p, held := c.w.sched.prio[id]
+	return p, held
+}
+
+// assertNotPrioritized is the negative of priorityOf, phrased so that a failure says
+// what was remembered rather than that something was.
+func assertNotPrioritized(t *testing.T, c *conn, id uint32, why string) {
+	t.Helper()
+	if p, held := priorityOf(t, c, id); held {
+		t.Errorf("the scheduler was told stream %d is %q, but %s",
+			id, p.Field(), why)
+	}
+}
+
+// prioritized runs one connection whose script is the client preface followed by
+// frames, and returns it for inspection.
+//
+// The conn is built rather than served through serve() because the assertions are about
+// what it remembers, not about what the peer received — and after awaitServe there is no
+// goroutine left to race for either.
+func prioritized(t *testing.T, h StreamHandler, frames ...frame.Frame) (*conn, *testSocket, error) {
+	t.Helper()
+	return prioritizedThrough(t, always(h), frames...)
+}
+
+// prioritizedThrough is prioritized for a handler that needs the connection's write half,
+// which it cannot be given until the connection exists. One test needs that; the rest are
+// better off not naming a factory.
+func prioritizedThrough(t *testing.T, mk func(ConnWriter) StreamHandler, frames ...frame.Frame) (*conn, *testSocket, error) {
+	t.Helper()
+	ts := newTestSocket(&testTarget{}).
+		script(append(clientHello(t), encodeFrames(t, frames...)...)).
+		atEOF()
+	c := newConn(ts, mk, testTimeouts())
+	return c, ts, awaitServe(t, serveInBackground(c))
+}
+
+// TestServePrioritizesALiveStreamStraightAway is the first of the three destinations a
+// PRIORITY_UPDATE has. The stream exists, so there is nothing to decide and nothing to
+// remember: the signal goes to the scheduler and the buffer stays empty.
+func TestServePrioritizesALiveStreamStraightAway(t *testing.T) {
+	h := &openingHandler{}
+	c, ts, err := prioritized(t, h,
+		frame.HeadersFrame{StreamID: 1, EndHeaders: true, Fragment: []byte("x")},
+		frame.PriorityUpdateFrame{PrioritizedStreamID: 1, Field: "u=0, i"},
+	)
+	if err != nil {
+		t.Fatalf("Serve: %v", err)
+	}
+	noGoAwayIn(t, peerSaw(t, ts))
+
+	want := priority.Params{}.WithUrgency(0).WithIncremental(true)
+	if got, held := priorityOf(t, c, 1); !held || got != want {
+		t.Errorf("the scheduler was told %q (held=%v), want %q",
+			got.Field(), held, want.Field())
+	}
+	if n := c.pending.Len(); n != 0 {
+		t.Errorf("%d signals were buffered for a stream that was already open, want 0", n)
+	}
+}
+
+// TestServeBuffersAPriorityUpdateUntilTheStreamOpens is the second destination, and it is
+// a SHOULD this server chose to honour. §7 of RFC 9218: "A client MAY send a
+// PRIORITY_UPDATE frame before the stream that it references is open (except for HTTP/2
+// push streams; see Section 7.1)." And §7 of RFC 9218: "Servers SHOULD buffer the most
+// recently received PRIORITY_UPDATE frame and apply it once the referenced stream is
+// opened."
+//
+// The HEADERS frame is what makes the test mean something. Without it the assertion would
+// be that the signal was buffered, which a server that buffered signals and never applied
+// them would also pass — and that server would schedule every reprioritized response at
+// the default urgency.
+func TestServeBuffersAPriorityUpdateUntilTheStreamOpens(t *testing.T) {
+	h := &openingHandler{}
+	c, ts, err := prioritized(t, h,
+		frame.PriorityUpdateFrame{PrioritizedStreamID: 5, Field: "u=1"},
+		frame.HeadersFrame{StreamID: 5, EndHeaders: true, Fragment: []byte("x")},
+	)
+	if err != nil {
+		t.Fatalf("Serve: %v", err)
+	}
+	noGoAwayIn(t, peerSaw(t, ts))
+
+	want := priority.Params{}.WithUrgency(1)
+	if got, held := priorityOf(t, c, 5); !held || got != want {
+		t.Errorf("the scheduler was told %q (held=%v) for the stream that opened, want %q",
+			got.Field(), held, want.Field())
+	}
+	if n := c.pending.Len(); n != 0 {
+		t.Errorf("%d signals are still buffered after the stream they name opened, want 0: "+
+			"a buffer that is not emptied on use is a buffer that grows", n)
+	}
+}
+
+// TestServeKeepsOnlyTheLastBufferedPriorityUpdate is the "most recently received" of §7
+// of RFC 9218, and it is what makes the buffer's bound a bound at all.
+//
+// A client may send as many PRIORITY_UPDATE frames for one idle stream as it likes, and
+// none of them is a protocol error. If each were remembered, or if each counted towards
+// §7.1's limit, a client could exhaust either with frames it is entitled to send — so the
+// two hundred frames here are both a correctness case and an attack.
+func TestServeKeepsOnlyTheLastBufferedPriorityUpdate(t *testing.T) {
+	var script []frame.Frame
+	for u := range 200 {
+		script = append(script, frame.PriorityUpdateFrame{
+			PrioritizedStreamID: 5,
+			Field:               priority.Params{}.WithUrgency(u % numBands).Field(),
+		})
+	}
+	last := priority.Params{}.WithUrgency(199 % numBands)
+	script = append(script, frame.HeadersFrame{
+		StreamID: 5, EndHeaders: true, Fragment: []byte("x"),
+	})
+
+	h := &openingHandler{}
+	c, ts, err := prioritized(t, h, script...)
+	if err != nil {
+		t.Fatalf("Serve: %v", err)
+	}
+	noGoAwayIn(t, peerSaw(t, ts))
+
+	if got, held := priorityOf(t, c, 5); !held || got != last {
+		t.Errorf("the scheduler was told %q (held=%v), want the last of the 200 signals, %q",
+			got.Field(), held, last.Field())
+	}
+}
+
+// TestServeDiscardsAPriorityUpdateForAClosedStream is the third destination, and the one
+// that has to be a discard rather than a buffer: a signal for a stream that will never
+// exist would otherwise be remembered for the life of the connection, one entry per
+// frame, with no rule ever taking it away.
+//
+// Both identifiers here are closed, by different routes. Stream 5 was used and this
+// double never opened it; stream 3 was never used at all, and §5.1.1 of RFC 9113: "When
+// a stream transitions out of the 'idle' state, all streams in the 'idle' state that
+// might have been opened by the peer with a lower-valued stream identifier immediately
+// transition to 'closed'."
+func TestServeDiscardsAPriorityUpdateForAClosedStream(t *testing.T) {
+	h := &recordingHandler{}
+	c, ts, err := prioritized(t, h,
+		frame.HeadersFrame{StreamID: 5, EndHeaders: true, Fragment: []byte("x")},
+		frame.PriorityUpdateFrame{PrioritizedStreamID: 5, Field: "u=0"},
+		frame.PriorityUpdateFrame{PrioritizedStreamID: 3, Field: "u=0"},
+	)
+	if err != nil {
+		t.Fatalf("Serve: %v", err)
+	}
+	noGoAwayIn(t, peerSaw(t, ts))
+
+	assertNotPrioritized(t, c, 5, "the stream never opened and never will")
+	assertNotPrioritized(t, c, 3, "§5.1.1 of RFC 9113 closed it when stream 5 was used")
+	if n := c.pending.Len(); n != 0 {
+		t.Errorf("%d signals were buffered for streams that are closed, want 0", n)
+	}
+}
+
+// TestServeDoesNotPrioritizeARefusedStream is the hole the buffer would leave if it
+// applied a signal to every stream that leaves the idle state rather than to the ones
+// that open.
+//
+// A stream refused over SETTINGS_MAX_CONCURRENT_STREAMS never enters the stream table, so
+// it is never retired, so the write half is never told to forget it — and the signal
+// applied to it would be the one entry in the scheduler's priority table that nothing
+// removes. A client that wanted to grow that table without bound would send exactly this:
+// a PRIORITY_UPDATE and a HEADERS for a stream it knows will be refused, over and over.
+//
+// The buffered signal is consumed either way, which is the other half of the bound.
+// §5.1.1 of RFC 9113 has closed the stream whether or not it opened, so there is nothing
+// left for the entry to be for.
+func TestServeDoesNotPrioritizeARefusedStream(t *testing.T) {
+	h := &openingHandler{refuse: map[uint32]bool{5: true}}
+	c, ts, err := prioritized(t, h,
+		frame.PriorityUpdateFrame{PrioritizedStreamID: 5, Field: "u=0"},
+		frame.HeadersFrame{StreamID: 5, EndHeaders: true, Fragment: []byte("x")},
+	)
+	if err != nil {
+		t.Fatalf("Serve: %v", err)
+	}
+	noGoAwayIn(t, peerSaw(t, ts))
+
+	assertNotPrioritized(t, c, 5, "the stream layer refused it, so nothing will ever "+
+		"retire it and nothing will ever forget this")
+	if n := c.pending.Len(); n != 0 {
+		t.Errorf("%d signals are still buffered for the refused stream, want 0", n)
+	}
+}
+
+// TestServeAppliesAnUnparseablePriorityFieldAsTheDefaults is the MAY this server declines,
+// and the reading it takes instead.
+//
+// §7 of RFC 9218: "A PRIORITY_UPDATE frame communicates a complete set of all priority
+// parameters in the Priority Field Value field. Omitting a priority parameter is a signal
+// to use its default value. Failure to parse the Priority Field Value MAY be treated as a
+// connection error." A field value that cannot be read is therefore a frame whose
+// parameters are all omitted, which is a request for the defaults — and because the frame
+// carries a complete set rather than a patch, it replaces what the client said before
+// rather than leaving it standing.
+//
+// Killing the connection instead would be within the letter of §7 and against the point
+// of it: the client is asking for a scheduling preference, and there is a defined answer
+// to "no preference expressed".
+func TestServeAppliesAnUnparseablePriorityFieldAsTheDefaults(t *testing.T) {
+	h := &openingHandler{}
+	c, ts, err := prioritized(t, h,
+		frame.HeadersFrame{StreamID: 1, EndHeaders: true, Fragment: []byte("x")},
+		frame.PriorityUpdateFrame{PrioritizedStreamID: 1, Field: "u=0, i"},
+		frame.PriorityUpdateFrame{PrioritizedStreamID: 1, Field: ")("},
+	)
+	if err != nil {
+		t.Fatalf("Serve: %v", err)
+	}
+	noGoAwayIn(t, peerSaw(t, ts))
+
+	got, held := priorityOf(t, c, 1)
+	if !held {
+		t.Fatalf("the scheduler was told nothing about stream 1, want the defaults")
+	}
+	if want := (priority.Params{}); got != want {
+		t.Errorf("the scheduler was told %q, want the defaults %q: an unreadable field "+
+			"value carries a complete set of omitted parameters, so it must replace the "+
+			"u=0, i that came before it", got.Field(), want.Field())
+	}
+	if got.Urgency() != priority.DefaultUrgency || got.Incremental() {
+		t.Errorf("the defaults read back as urgency %d incremental %v, want %d and false",
+			got.Urgency(), got.Incremental(), priority.DefaultUrgency)
+	}
+}
+
+// TestServeAcceptsPrioritizedIdleStreamsUpToTheLimit and the test after it are the two
+// sides of §7.1 of RFC 9218's bound on the buffer: "The number of streams that have been
+// prioritized but remain in the 'idle' state plus the number of active streams (those in
+// the 'open' state or in either of the 'half-closed' states; see Section 5.1.2 of
+// [HTTP/2]) MUST NOT exceed the value of the SETTINGS_MAX_CONCURRENT_STREAMS parameter.
+// Servers that receive such a PRIORITY_UPDATE MUST respond with a connection error of
+// type PROTOCOL_ERROR."
+//
+// This one is the side that must not fire. A client entitled to prioritize a hundred idle
+// streams and refused at the hundredth would be a server that made the feature unusable
+// at exactly the point a client with a hundred requests in flight wants it.
+func TestServeAcceptsPrioritizedIdleStreamsUpToTheLimit(t *testing.T) {
+	var script []frame.Frame
+	for i := range limits.MaxConcurrentStreams {
+		script = append(script, frame.PriorityUpdateFrame{
+			PrioritizedStreamID: uint32(2*i + 1), Field: "u=2",
+		})
+	}
+
+	h := &recordingHandler{}
+	c, ts, err := prioritized(t, h, script...)
+	if err != nil {
+		t.Fatalf("Serve after %d prioritized idle streams, the advertised maximum: %v",
+			limits.MaxConcurrentStreams, err)
+	}
+	noGoAwayIn(t, peerSaw(t, ts))
+	if got := c.pending.Len(); got != limits.MaxConcurrentStreams {
+		t.Errorf("%d signals are buffered, want all %d", got, limits.MaxConcurrentStreams)
+	}
+}
+
+// TestServeRefusesPrioritizedIdleStreamsPastTheLimit is the side that must fire, and the
+// arithmetic is the interesting part: the limit counts prioritized idle streams together
+// with active ones, so a connection with streams open has less room to buffer.
+//
+// The limit is measured against limits.MaxConcurrentStreams because that is the value this
+// connection puts in its own SETTINGS frame. A server that enforced a different number
+// from the one it advertised would be refusing frames the peer was told it could send.
+func TestServeRefusesPrioritizedIdleStreamsPastTheLimit(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		active int
+	}{
+		{"with nothing else open", 0},
+		{"with half the limit already open", limits.MaxConcurrentStreams / 2},
+		{"with the limit already open", limits.MaxConcurrentStreams},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// One more than there is room for. The identifiers start above every
+			// stream the handler claims is active so that each one is idle.
+			room := limits.MaxConcurrentStreams - tc.active
+			var script []frame.Frame
+			for i := range room + 1 {
+				script = append(script, frame.PriorityUpdateFrame{
+					PrioritizedStreamID: uint32(2*(i+limits.MaxConcurrentStreams) + 1),
+					Field:               "u=2",
+				})
+			}
+
+			h := &recordingHandler{active: tc.active}
+			c, ts, err := prioritized(t, h, script...)
+			if ce := connErrorOf(t, err); ce.Code != h2.ProtocolError {
+				t.Errorf("Serve returned %s, want PROTOCOL_ERROR (RFC 9218 §7.1)", ce.Code)
+			}
+			if !strings.Contains(err.Error(), "SETTINGS_MAX_CONCURRENT_STREAMS") {
+				t.Errorf("the error does not name the limit it is enforcing: %v", err)
+			}
+			if ga := goAwayIn(t, peerSaw(t, ts)); ga.ErrCode != h2.ProtocolError {
+				t.Errorf("the GOAWAY carries %s, want PROTOCOL_ERROR", ga.ErrCode)
+			}
+			// The refused frame is not buffered, which is what makes the error a
+			// bound rather than an announcement: a connection error that also kept
+			// the entry would be a server that complained and complied.
+			if got := c.pending.Len(); got != room {
+				t.Errorf("%d signals are buffered, want the %d there was room for",
+					got, room)
+			}
+		})
+	}
+}
+
+// TestServeReprioritizingABufferedStreamDoesNotUseUpMoreRoom is the exemption that makes
+// the limit enforceable at all. A client that has prioritized a hundred idle streams and
+// changes its mind about one of them has not asked the server to remember a hundred and
+// one things, and refusing the change would make the limit punish a client for using the
+// feature correctly.
+//
+// The frames here would be a connection error if each counted: a hundred streams
+// prioritized to fill the buffer, and then a hundred more frames for streams already in
+// it.
+func TestServeReprioritizingABufferedStreamDoesNotUseUpMoreRoom(t *testing.T) {
+	var script []frame.Frame
+	for i := range limits.MaxConcurrentStreams {
+		script = append(script, frame.PriorityUpdateFrame{
+			PrioritizedStreamID: uint32(2*i + 1), Field: "u=2",
+		})
+	}
+	for i := range limits.MaxConcurrentStreams {
+		script = append(script, frame.PriorityUpdateFrame{
+			PrioritizedStreamID: uint32(2*i + 1), Field: "u=5, i",
+		})
+	}
+
+	h := &recordingHandler{}
+	c, ts, err := prioritized(t, h, script...)
+	if err != nil {
+		t.Fatalf("Serve: %v", err)
+	}
+	noGoAwayIn(t, peerSaw(t, ts))
+	if got := c.pending.Len(); got != limits.MaxConcurrentStreams {
+		t.Errorf("%d signals are buffered after reprioritizing every one of them, want %d",
+			got, limits.MaxConcurrentStreams)
+	}
+}
+
+// TestServeOpeningAStreamRestoresRoomToPrioritize is the third part of the buffer's bound,
+// and the one that is not a limit: the entries go away on their own as the connection
+// proceeds.
+//
+// §5.1.1 of RFC 9113 is what makes it sound. Using one identifier closes every lower idle
+// one, so a client that prioritized a hundred idle streams and then opened the highest of
+// them has closed the other ninety-nine — and a signal for a closed stream is a signal
+// for a stream that will never be scheduled.
+//
+// The boundary is the assertion. Filling the buffer exactly, opening one stream, and then
+// sending one more frame is the sequence a client with a long-lived connection produces
+// all day, and a server that only freed the entries on the next connection error would
+// stop scheduling for it after a hundred requests.
+func TestServeOpeningAStreamRestoresRoomToPrioritize(t *testing.T) {
+	const highest = uint32(2*limits.MaxConcurrentStreams - 1)
+	var script []frame.Frame
+	for i := range limits.MaxConcurrentStreams {
+		script = append(script, frame.PriorityUpdateFrame{
+			PrioritizedStreamID: uint32(2*i + 1), Field: "u=2",
+		})
+	}
+	script = append(script,
+		frame.HeadersFrame{StreamID: highest, EndHeaders: true, Fragment: []byte("x")},
+		frame.PriorityUpdateFrame{PrioritizedStreamID: highest + 2, Field: "u=0"},
+	)
+
+	h := &openingHandler{}
+	c, ts, err := prioritized(t, h, script...)
+	if err != nil {
+		t.Fatalf("Serve: %v", err)
+	}
+	noGoAwayIn(t, peerSaw(t, ts))
+
+	// One entry: the stream prioritized after the buffer was pruned. The stream that
+	// opened took its own signal out of the buffer and into the scheduler, and the
+	// ninety-nine below it went with it.
+	if got := c.pending.Len(); got != 1 {
+		t.Errorf("%d signals are buffered, want only the one sent after stream %d opened",
+			got, highest)
+	}
+	if !c.pending.Held(highest + 2) {
+		t.Errorf("the signal for stream %d was not buffered, so opening a stream did not "+
+			"make room (RFC 9113 §5.1.1)", highest+2)
+	}
+	want := priority.Params{}.WithUrgency(2)
+	if got, held := priorityOf(t, c, highest); !held || got != want {
+		t.Errorf("the scheduler was told %q (held=%v) for the stream that opened, want %q",
+			got.Field(), held, want.Field())
+	}
+}
+
+// TestServeLetsAPriorityUpdateOverrideTheRequestsOwnPriorityField is §7 of RFC 9218's
+// arbitration between the two carriers, and the demonstration that this server needs no
+// arbitration code to get it right.
+//
+// §7 of RFC 9218: "To solve this condition, for the purposes of scheduling, the most
+// recently received PRIORITY_UPDATE frame can be considered as the most up-to-date
+// information that overrides any other signal."
+//
+// Nothing here compares the two signals, timestamps them, or remembers which is which.
+// Both reach the write half from this connection's reader goroutine, and the frame's call
+// is placed after the field's by construction: handleStreamFrame defers leftIdle past the
+// stream layer, so a buffered frame is applied only after the HEADERS that opened the
+// stream has been all the way through the handler — which is where the request layer
+// signals the field. A frame that arrives later needs no help at all.
+//
+// The first case is the one that would quietly stop being true if that defer were moved,
+// and it is the case a client actually produces: §7 of RFC 9218 lets a PRIORITY_UPDATE be
+// sent before its stream is open, so a client that reprioritizes as it queues requests
+// sends the frame first and the request second. Applying the buffered signal before the
+// header section reached the request layer would let the field it is supposed to override
+// overwrite it, on every such stream, with nothing on the wire to say so.
+//
+// The third case is what stops the other two from passing on a server that ignores the
+// field entirely. It is also §5 of RFC 9218 working: "It is an end-to-end signal that
+// indicates the endpoint's view of how HTTP responses should be prioritized."
+func TestServeLetsAPriorityUpdateOverrideTheRequestsOwnPriorityField(t *testing.T) {
+	field := priority.Params{}.WithUrgency(7).WithIncremental(true)
+	sent := priority.Params{}.WithUrgency(0)
+
+	headers := frame.HeadersFrame{StreamID: 1, EndHeaders: true, Fragment: []byte("x")}
+	update := frame.PriorityUpdateFrame{PrioritizedStreamID: 1, Field: sent.Field()}
+
+	for _, tc := range []struct {
+		name   string
+		script []frame.Frame
+		want   priority.Params
+		why    string
+	}{
+		{
+			name:   "the frame arrived before the request and was buffered",
+			script: []frame.Frame{update, headers},
+			want:   sent,
+			why: "a buffered frame is applied after the request layer has read the " +
+				"field, so it overrides it",
+		},
+		{
+			name:   "the frame arrived after the request",
+			script: []frame.Frame{headers, update},
+			want:   sent,
+			why:    "the frame is the most recently received signal",
+		},
+		{
+			name:   "no frame contradicted it",
+			script: []frame.Frame{headers},
+			want:   field,
+			why:    "the request's own field is the only signal the client sent",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := &signallingHandler{field: field}
+			c, ts, err := prioritizedThrough(t, capturing(h), tc.script...)
+			if err != nil {
+				t.Fatalf("Serve: %v", err)
+			}
+			noGoAwayIn(t, peerSaw(t, ts))
+
+			if h.signalled != 1 {
+				t.Fatalf("the request layer made %d priority signals, want 1: this test "+
+					"means nothing unless the field reached the write half", h.signalled)
+			}
+			if got, held := priorityOf(t, c, 1); !held || got != tc.want {
+				t.Errorf("the scheduler was told %q (held=%v), want %q: %s",
+					got.Field(), held, tc.want.Field(), tc.why)
+			}
+			if n := c.pending.Len(); n != 0 {
+				t.Errorf("%d signals are still buffered, want 0", n)
+			}
+		})
 	}
 }
 
@@ -1856,6 +2780,57 @@ func TestServeAlwaysClosesTheSocket(t *testing.T) {
 		if got := ts.closeCount(); got != 1 {
 			t.Errorf("%s: the socket was closed %d times, want exactly 1", tc.name, got)
 		}
+	}
+}
+
+// TestServeHalfClosesTheWriteHalfBeforeClosingOnAGracefulEnding is Mihir's RST race.
+//
+// A connection that ends by sending a GOAWAY has that frame in the socket's send
+// buffer by the time the writer has stopped. If the socket is then closed with the
+// blunt Close alone, and the peer had sent octets we never read — a pipelined request
+// we are refusing, or anything sent faster than we read it — the kernel answers Close
+// with an RST instead of a FIN, and the RST discards the GOAWAY the peer had not read
+// yet. The peer sees a reset where it should have seen the reason we were leaving.
+//
+// gracefulClose removes it by closing the write half first, which sends a FIN in order
+// behind the buffered GOAWAY, and only then closing. This asserts the order: on a
+// graceful ending the write half is closed before the socket is, and the socket is
+// still closed exactly once.
+func TestServeHalfClosesTheWriteHalfBeforeClosingOnAGracefulEnding(t *testing.T) {
+	// A PING before the preface is a connection error, which ends the connection with a
+	// GOAWAY — the graceful path this is about — without waiting on any timeout.
+	ts := newTestSocket(&testTarget{}).
+		script(append([]byte(frame.ClientPreface), encodeFrames(t, ping(1))...)).
+		atEOF()
+
+	_ = serve(t, ts, rejectingHandler(t), testTimeouts())
+
+	if got := ts.closeWriteCount(); got != 1 {
+		t.Fatalf("the write half was closed %d times on a graceful ending, want exactly 1: "+
+			"without the FIN the GOAWAY races a reset", got)
+	}
+	order := ts.teardownOrder()
+	if len(order) != 2 || order[0] != "closewrite" || order[1] != "close" {
+		t.Fatalf("teardown order was %v, want [closewrite close]: the FIN has to reach the peer "+
+			"before the socket is closed under it", order)
+	}
+}
+
+// TestServeDoesNotHalfCloseAfterATransportFailure is the other side of it: a broken
+// socket has nothing to half-close politely. Sending a FIN into a connection the
+// transport has already taken away is at best a wasted syscall and at worst a second
+// error over the first, so gracefulClose is skipped and the socket is closed once.
+func TestServeDoesNotHalfCloseAfterATransportFailure(t *testing.T) {
+	broken := errors.New("connection reset by peer")
+	ts := newTestSocket(&testTarget{}).script(clientHello(t)).failsWith(broken)
+
+	_ = serve(t, ts, rejectingHandler(t), testTimeouts())
+
+	if got := ts.closeWriteCount(); got != 0 {
+		t.Errorf("the write half was closed %d times after a transport failure, want 0", got)
+	}
+	if got := ts.closeCount(); got != 1 {
+		t.Errorf("the socket was closed %d times, want exactly 1", got)
 	}
 }
 

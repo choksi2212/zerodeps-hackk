@@ -78,16 +78,24 @@ func (h streamHandler) Close(err error) {
 // identifier back into the request layer afterwards, with Attach, because a
 // finished response has to report the stream it finished. That last edge is
 // what makes this a cycle rather than a chain, and Attach is where it closes.
+//
+// Priorities is the only optional field among any of these, and it is filled in
+// because a server that reads the Priority header field and then drops it is one
+// whose scheduler hears half of what its clients say — the frame but not the
+// request. exchange.Config carries the argument for why nil is allowed at all;
+// nothing about this process wants it, so there is a test in this package that
+// the value is really passed.
 func newConn(h exchange.Handler, errLog *log.Logger) func(server.ConnWriter) server.StreamHandler {
 	return func(w server.ConnWriter) server.StreamHandler {
 		enc := response.NewEncoder(hpack.New(), w)
 		sender := flow.NewSender()
 
 		reqs := exchange.New(exchange.Config{
-			Handler: h,
-			Encoder: enc,
-			Credit:  sender,
-			Log:     errLog,
+			Handler:    h,
+			Encoder:    enc,
+			Credit:     sender,
+			Priorities: w,
+			Log:        errLog,
 		})
 
 		// MaxConcurrent is left at its default on purpose. §5.1.2 lets a peer

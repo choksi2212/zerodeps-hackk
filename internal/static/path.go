@@ -71,7 +71,7 @@ const MaxTargetLength = 4096
 // the target ended in "/", which is what distinguishes a request for a directory from a
 // request for the thing inside it — see Handler.serve's redirect. ok is false when the
 // target names something no file can be, and every one of those is answered as a missing
-// file: §15.5.5 of RFC 9110 has the code cover both cases, since the origin server "did
+// file: the code covers both cases, since per §15.5.5 of RFC 9110 the origin server "did
 // not find a current representation for the target resource or is not willing to disclose
 // that one exists", and telling a prober which of its guesses were merely absent is
 // disclosure.
@@ -95,10 +95,10 @@ func resolve(target string) (name string, slash, ok bool) {
 	slash = raw[len(raw)-1] == ""
 
 	// §5.2.4's remove_dot_segments, on the decoded segments, and applied even though this
-	// target is already absolute rather than a reference. §6.2.2.3 of RFC 3986 is explicit
-	// about who gets this wrong and how: "some deployed implementations incorrectly assume
-	// that reference resolution is not necessary when the reference is already a URI and
-	// thus fail to remove dot-segments when they occur in non-relative paths".
+	// target is already absolute rather than a reference. Which implementations get that
+	// wrong, and how, per §6.2.2.3 of RFC 3986: "some deployed implementations incorrectly
+	// assume that reference resolution is not necessary when the reference is already a URI
+	// and thus fail to remove dot-segments when they occur in non-relative paths".
 	//
 	// A ".." with nothing to pop is dropped rather than refused, which is what §5.2.4 does
 	// and is the reason the output cannot escape: after this loop no segment is "..", so

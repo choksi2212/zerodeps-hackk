@@ -120,12 +120,13 @@ func parseSettings(h Header, payload []byte) (Frame, error) {
 	return f, nil
 }
 
-// validateSetting applies the per-identifier range rules of RFC 9113 §6.5.2.
+// validateSetting applies the per-identifier range rules of RFC 9113 §6.5.2, and
+// the one RFC 9218 §2.1 adds.
 //
-// Only three identifiers have a legal range, and each violation has a different
-// error code — one of them is a FLOW_CONTROL_ERROR rather than the
-// PROTOCOL_ERROR that would be the natural guess. Unknown identifiers have no
-// rules at all and must not be rejected.
+// Only four identifiers have a legal range, and the violations do not share an
+// error code — one of them is a FLOW_CONTROL_ERROR rather than the PROTOCOL_ERROR
+// that would be the natural guess. Identifiers this server does not implement have
+// no rules at all and must not be rejected.
 func validateSetting(s Setting) error {
 	switch s.ID {
 	case SettingEnablePush:
@@ -144,6 +145,20 @@ func validateSetting(s Setting) error {
 			return connErrf(h2.ProtocolError,
 				"SETTINGS_MAX_FRAME_SIZE is %d, must be between %d and %d (RFC 9113 §6.5.2)",
 				s.Value, uint32(DefaultMaxFrameSize), uint32(MaxLength))
+		}
+	case SettingNoRFC7540Priorities:
+		// The range rule is checked here with the others, because it is decidable
+		// from the frame alone. The two rules §2.1 puts on the same parameter that
+		// are not — that it must appear in the first SETTINGS frame, and must not
+		// change afterwards — need to remember what an earlier frame said, so they
+		// belong to the connection and are enforced in internal/server.
+		//
+		// §2.1 of RFC 9218: "The value of SETTINGS_NO_RFC7540_PRIORITIES MUST be 0
+		// or 1.  Any value other than 0 or 1 MUST be treated as a connection error
+		// (see Section 5.4.1 of [HTTP/2]) of type PROTOCOL_ERROR."
+		if s.Value > 1 {
+			return connErrf(h2.ProtocolError,
+				"SETTINGS_NO_RFC7540_PRIORITIES is %d, must be 0 or 1 (RFC 9218 §2.1)", s.Value)
 		}
 	}
 	return nil
