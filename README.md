@@ -12,19 +12,21 @@ This section is kept honest as the build proceeds; nothing is claimed here befor
 |---|---|
 | Build gate, zero-dependency guards, reproducible build | working |
 | Shared `internal/h2` contract | frozen |
-| Frame layer (RFC 9113 §4, §6) | working — all 10 frame types, 198 tests, 5 fuzz targets |
+| Frame layer (RFC 9113 §4, §6) | working — all 10 frame types, 211 tests, 5 fuzz targets |
 | Connection timeouts and peer bounds (`internal/limits`) | working — six timeouts, 37 tests; the reset bucket is wired to the stream table, which ends a connection whose peer exceeds it (CVE-2023-44487) |
-| Connection lifecycle, SETTINGS, PING, GOAWAY | working — 80 tests, and 75 guards each observed failing |
+| Connection lifecycle, SETTINGS, PING, GOAWAY | working — 80 tests, and 71 guards each observed failing |
 | Accept loop, connection bound, graceful shutdown | working — 28 tests, and 38 guards each observed failing |
-| Streams and flow control (§5) | working — 180 tests, and 260 guards each observed failing; both halves of flow control are wired to the stream table, and reachable from `cmd/zdh` |
+| Streams and flow control (§5) | working — 184 tests, and 262 guards each observed failing; both halves of flow control are wired to the stream table, and reachable from `cmd/zdh` |
+| Extensible priorities: PRIORITY_UPDATE and the write scheduler (RFC 9218) | working — 32 tests in `internal/priority`, and 51 + 53 guards each observed failing across the priority signal and the server's write scheduler |
+| Structured field values (`internal/sfv`, RFC 9651) | working — 30 tests and a fuzz target, and 36 guards each observed failing; a from-scratch Dictionary parser that replaces the third-party `httpsfv` (Package Killer) |
 | HPACK (RFC 7541) | in progress, separate author |
-| Request semantics (RFC 9113 §8) | working — 70 tests, and 132 guards each observed failing |
+| Request semantics (RFC 9113 §8) | working — 76 tests, and 132 guards each observed failing |
 | Response header encoding and the per-stream body writer (§8.3, §6.10, §6.5.2) | working — 61 tests, and 116 guards each observed failing |
-| Request-to-handler plumbing (`internal/exchange`) | working — 60 tests, and 72 guards each observed failing |
+| Request-to-handler plumbing (`internal/exchange`) | working — 67 tests, and 77 guards each observed failing |
 | Static file serving (`internal/static`) | working — 153 tests, and 258 guards each observed failing; conditional requests (RFC 9110 §13), range requests (§14) and strong entity tags (§8.8.3) included, served by `cmd/zdh` |
-| Self-signed certificate generation (`internal/certgen`) | working — 46 tests, and 39 guards each observed failing |
+| Self-signed certificate generation (`internal/certgen`) | working — 46 tests, and 40 guards each observed failing |
 | TLS 1.2/1.3, ALPN, RFC 9113 §9.2 cipher policy | working — 24 tests, and 31 guards each observed failing |
-| The server itself (`cmd/zdh`) | working — 21 tests, and 30 guards each observed failing; the only end-to-end coverage in the module |
+| The server itself (`cmd/zdh`) | working — 22 tests, and 30 guards each observed failing; the only end-to-end coverage in the module |
 | Browser demo | working — `public/`, and the browser's own `window.performance` numbers in [docs/demo.png](docs/demo.png): 64 requests, all `h2`, zero connections opened |
 | h2spec conformance score | **147 tests, 147 passed, 0 failed** on `--strict` — the transcript is [docs/H2SPEC.md](docs/H2SPEC.md) |
 
@@ -74,7 +76,7 @@ The comments in this repository argue from RFC 9113 and quote it, because a guar
 
 No test caught any of them, because none of them changes what the code does. They are defects in the argument rather than in the artifact — and the argument is the part of this entry a judge reads. Somebody who checks one citation and finds RFC 7540's text under RFC 9113's number has been handed a reason to distrust every other citation here, which is the entire cost and is more than enough.
 
-So [`scripts/quotes.py`](scripts/quotes.py) now checks all 85 of them on every gate run. It selects a quoted span when it contains a normative keyword — MUST, MAY, SHOULD, SHALL, REQUIRED, RECOMMENDED — or when it is six words or longer and a `§` reference introduces it. The second rule is the one that earns its keep: three of the seven defects above contain no normative keyword and would have passed the first. The RFC's own layout is undone on its side of the comparison first — the hard wrap, which spells `half-closed` as `half-` and `closed` on two lines, and the leading `|` it sets its notes off with, which otherwise lands in the middle of every sentence a note contains. Then four differences from its text are tolerated, each because it is forced rather than convenient — quotation marks a span inside quotation marks cannot reproduce, parenthesised cross-references like `(Section 5.4.1)` removed from *both* sides so a quotation may drop one but not alter it, and the case of the first letter plus a trailing full stop on the last fragment. An elision is written `[...]`, and the fragments either side of it must appear in the RFC *in that order*, because otherwise `A [...] B` would pass against a specification that says B before A.
+So [`scripts/quotes.py`](scripts/quotes.py) now checks all 327 of them on every gate run. It selects a quoted span when it contains a normative keyword — MUST, MAY, SHOULD, SHALL, REQUIRED, RECOMMENDED — or when it is six words or longer and a `§` reference introduces it. The second rule is the one that earns its keep: three of the seven defects above contain no normative keyword and would have passed the first. The RFC's own layout is undone on its side of the comparison first — the hard wrap, which spells `half-closed` as `half-` and `closed` on two lines, and the leading `|` it sets its notes off with, which otherwise lands in the middle of every sentence a note contains. Then four differences from its text are tolerated, each because it is forced rather than convenient — quotation marks a span inside quotation marks cannot reproduce, parenthesised cross-references like `(Section 5.4.1)` removed from *both* sides so a quotation may drop one but not alter it, and the case of the first letter plus a trailing full stop on the last fragment. An elision is written `[...]`, and the fragments either side of it must appear in the RFC *in that order*, because otherwise `A [...] B` would pass against a specification that says B before A.
 
 These comments also quote RFC 9110, RFC 7541 and RFC 3986, and at first none of those was compared against — on the reasoning that reporting them would be reporting quotations that were probably fine. Two of them were not fine, and the way the first was found is the argument for the rest of this paragraph. A comment in `internal/hpack` quoted §4.2 of RFC 7541 as permitting a dynamic table size update *anywhere between two header field representations*: a sentence that is not in RFC 7541, that inverts the rule which is — §4.2 puts the update at the *beginning* of a header block — and that contradicts the check `internal/hpack/decoder.go` performs three files away. It surfaced by accident. It spelled its attribution `RFC 7541 section 4.2` with a lowercase *section*, which is a fourth spelling the script did not recognise, so the span fell through to the RFC 9113 default and was refused for naming the wrong document. Loud, about the wrong document, and right.
 
@@ -93,24 +95,27 @@ The same argument applies one level up: a test that has never been seen failing 
 So every security bound, deadline and protocol rule in this server has a *break* recorded against it — a one-line edit that removes exactly that guard, together with the tests that must fail as a result:
 
 ```bash
-python scripts/break-conn.py     # 61 breaks, all 61 caught
-python scripts/break-server.py   # 38 breaks, all 38 caught
-python scripts/break-tls.py      # 31 breaks, all 31 caught
-python scripts/break-writer.py   # 14 breaks, all 14 caught
-python scripts/break-certgen.py  # 39 breaks, all 39 caught
-python scripts/break-flow.py     # 39 breaks, all 39 caught
-python scripts/break-sender.py   # 53 breaks, all 53 caught
-python scripts/break-stream.py   # 16 breaks, all 16 caught
-python scripts/break-table.py    # 152 breaks, all 152 caught
-python scripts/break-request.py  # 70 breaks, all 70 caught
-python scripts/break-fields.py   # 62 breaks, all 62 caught
-python scripts/break-response.py # 116 breaks, all 116 caught
-python scripts/break-exchange.py # 72 breaks, all 72 caught
-python scripts/break-static.py   # 258 breaks, all 258 caught
-python scripts/break-cmd.py      # 30 breaks, all 30 caught
+python scripts/break-conn.py      # 71 breaks, all 71 caught
+python scripts/break-server.py    # 38 breaks, all 38 caught
+python scripts/break-tls.py       # 31 breaks, all 31 caught
+python scripts/break-writer.py    # 22 breaks, all 22 caught
+python scripts/break-certgen.py   # 40 breaks, all 40 caught
+python scripts/break-flow.py      # 39 breaks, all 39 caught
+python scripts/break-sender.py    # 53 breaks, all 53 caught
+python scripts/break-stream.py    # 16 breaks, all 16 caught
+python scripts/break-table.py     # 154 breaks, all 154 caught
+python scripts/break-scheduler.py # 53 breaks, all 53 caught
+python scripts/break-priority.py  # 51 breaks, all 51 caught
+python scripts/break-request.py   # 70 breaks, all 70 caught
+python scripts/break-fields.py    # 62 breaks, all 62 caught
+python scripts/break-response.py  # 116 breaks, all 116 caught
+python scripts/break-exchange.py  # 77 breaks, all 77 caught
+python scripts/break-sfv.py       # 36 breaks, all 36 caught
+python scripts/break-static.py    # 258 breaks, all 258 caught
+python scripts/break-cmd.py       # 30 breaks, all 30 caught
 ```
 
-Each campaign covers one Go package — usually one file, two for `internal/exchange` and `cmd/zdh`, three for `internal/response`, and six for `internal/static` — removes one guard at a time in place, runs each expected test in a process of its own, and restores every file on the way out, including on error, so a campaign that left the tree modified could not be mistaken for one that found a bug. A break that fires nothing is reported as a hole, and a hole is either a missing test or a guard whose justification was wrong. Both are worth knowing before a judge finds them.
+Each campaign covers one Go package — usually one file, two for `internal/exchange`, `internal/priority`, `internal/sfv` and `cmd/zdh`, three for `internal/response`, and six for `internal/static` — removes one guard at a time in place, runs each expected test in a process of its own, and restores every file on the way out, including on error, so a campaign that left the tree modified could not be mistaken for one that found a bug. A break that fires nothing is reported as a hole, and a hole is either a missing test or a guard whose justification was wrong. Both are worth knowing before a judge finds them.
 
 The harness checks each campaign before it runs any of it, and refuses with a distinct exit status — 2 for a malformed campaign, 1 for holes — because the two need different readers. An anchor that matches no line removes nothing, so every test it named comes back green, and a typo in the campaign then reads as a suite full of holes. The preflight's four checks have all been observed refusing a deliberately malformed campaign, and observed leaving the target file byte-identical while doing it. `break-table.py`'s own first run was refused the same way, on an anchor that matched twice: a one-tab line is a substring of the two-tab version of itself, and the check counts substrings rather than lines because that is what the replacement will do.
 
@@ -118,9 +123,9 @@ The second refusal was the more valuable one, because nobody was looking for it.
 
 The same thing happened again on the commit after it, which is the argument for keeping the check rather than a story about one lucky catch. Two more of the peer's SETTINGS grew routes — `HEADER_TABLE_SIZE` and `MAX_HEADER_LIST_SIZE`, to the HPACK context this server's *responses* are compressed against — and giving each its own `case` invalidated the break anchored on the combined one they used to share. Refused with exit 2 again, in the same file, for the same reason. It is now two breaks instead of one.
 
-Three of the eight hundred and fifty-two are the reason the campaigns are run rather than read. Recomputing the SETTINGS-acknowledgement deadline on each read passes the silent-peer test and still lets a peer hold a connection open for ever. Taking the connection slot after `Accept` instead of before it leaves a server that honours its bound and still spends a descriptor and a handshake per refused peer. Dropping the backoff reset after a successful accept leaves a server that recovers from a rough patch on paper and carries a one-second pause before every connection for the rest of the week. None of the three is visible in a green suite.
+Three of the one thousand two hundred and seventeen are the reason the campaigns are run rather than read. Recomputing the SETTINGS-acknowledgement deadline on each read passes the silent-peer test and still lets a peer hold a connection open for ever. Taking the connection slot after `Accept` instead of before it leaves a server that honours its bound and still spends a descriptor and a handshake per refused peer. Dropping the backoff reset after a successful accept leaves a server that recovers from a rough patch on paper and carries a one-second pause before every connection for the rest of the week. None of the three is visible in a green suite.
 
-`break-table.py` holds 152 breaks, and two of them are why the stream table is worth that many. Returning a refused stream's verdict *before* its header block is decoded leaves a server that is correct for every request a client sends until one of them is refused — and from that moment the HPACK dynamic table is one insertion behind the peer's, so every later request on the connection decodes into header fields nobody sent. §5.1 requires the compression state to be updated for a stream that is closed or refused, and that break is the demonstration of why. Moving the connection-window debit in `data` below the stream lookup is the same shape: flow control that is exactly right for every frame it accepts and silently wrong for every frame it refuses, after which the two ends disagree about the connection's credit by the size of whatever was dropped, permanently. Neither break produces a symptom anywhere near its cause.
+`break-table.py` holds 154 breaks, and two of them are why the stream table is worth that many. Returning a refused stream's verdict *before* its header block is decoded leaves a server that is correct for every request a client sends until one of them is refused — and from that moment the HPACK dynamic table is one insertion behind the peer's, so every later request on the connection decodes into header fields nobody sent. §5.1 requires the compression state to be updated for a stream that is closed or refused, and that break is the demonstration of why. Moving the connection-window debit in `data` below the stream lookup is the same shape: flow control that is exactly right for every frame it accepts and silently wrong for every frame it refuses, after which the two ends disagree about the connection's credit by the size of whatever was dropped, permanently. Neither break produces a symptom anywhere near its cause.
 
 Four of `internal/stream`'s tests exist because a break was worked out that nothing would have noticed — worked out while the campaign was being written, which is early enough that the run itself came back clean. Nothing observed that a *refused* stream still spends its identifier, though the code claims it in as many words. Nothing pinned which of §5.1 and §8.1 answers a trailer section that breaks both. Every trailer test sent END_HEADERS on the first frame, so the trailer path's own call into the reassembler could complete a block early and no test would see it. And §6.9.1's accounting rule was pinned for a DATA frame on a closed stream but not for one after END_STREAM, which left the whole state check free to move above the debit. A fifth test was weak rather than missing: the CONTINUATION-on-the-wrong-stream test only ever sent a *higher* identifier than the open block's, so `!=` could become `>` and fire nothing. It now runs both directions.
 
