@@ -85,7 +85,7 @@ function tick(kind, text) {
 // a left edge that stands for the single connection — dozens of them stacking and
 // overlapping is the multiplexing, made visible.
 
-const LANE_H = 240;
+const LANE_H = 300;
 
 function placeBar(i, n, entry, t0) {
   const lanes = $("lanes");

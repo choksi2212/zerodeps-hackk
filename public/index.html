@@ -8,6 +8,7 @@
 <link rel="icon" href="/assets/logo.svg" type="image/svg+xml">
 </head>
 <body>
+<div class="wrap">
 
 <header>
   <img src="/assets/logo.svg" alt="" width="56" height="56">
@@ -29,7 +30,9 @@
   <div class="chip"><span class="chip-n">1218</span><span class="chip-l">guards each proven to fire</span></div>
 </section>
 
-<section class="card">
+<main class="grid">
+
+<section class="card span">
   <h2>What you are looking at</h2>
   <p>This page arrived over HTTP/2 from a server that does not import
      <code>net/http</code>. The connection preface, the SETTINGS exchange, the
@@ -45,7 +48,7 @@
      so it is crisp at any size and carries no dependency of its own. The arrows
      point one way, which is the point: nothing lower knows about anything
      higher. -->
-<section class="card">
+<section class="card span">
   <h2>System design — one directory, one way down</h2>
   <p class="sub">Each box is one Go package. Arrows are imports, and they only
      point down: the frame layer has never heard of a request.</p>
@@ -129,7 +132,7 @@
      invariant the whole server is built on, and it is exactly one sentence:
      one reader, one writer that alone owns the socket, N stream goroutines that
      never touch it. -->
-<section class="card">
+<section class="card span">
   <h2>Control architecture — who is allowed to write</h2>
   <p class="sub">One connection, three kinds of goroutine. Only one of them ever
      touches the socket's write half; everyone else hands it a frame and walks
@@ -190,7 +193,7 @@
 <!-- Data flow: one request, left to right, from octets on the wire to octets
      back. The dot animates along the path so a reader watches a request move
      through the layers rather than reading a list of them. -->
-<section class="card">
+<section class="card span">
   <h2>Data flow — one request, end to end</h2>
   <p class="sub">Follow the dot: this is a GET for a file, from the first octet
      the kernel hands us to the DATA frames going back out.</p>
@@ -236,7 +239,7 @@
      Timing entry, so you watch dozens of streams overlap on a single
      connection in real time. The frame ticker beside it names the frame types
      the exchange is made of. -->
-<section class="card">
+<section class="card span">
   <h2>Live — watch the streams multiplex</h2>
   <p>HTTP/1.1 needs one connection per request in flight; a browser opens six to
      one host and queues the rest. HTTP/2 interleaves them all on one. The button
@@ -276,7 +279,7 @@
   </thead><tbody></tbody></table>
 </section>
 
-<section class="card">
+<section class="card span">
   <h2>What this server refuses</h2>
   <p class="sub">Each of these is one request. The status is what came back.</p>
   <table id="refusals"><thead>
@@ -284,12 +287,16 @@
   </thead><tbody></tbody></table>
 </section>
 
+</main>
+
 <footer>
   <p>zdh — Zero Dependency Hackathon 2026, Track C. Served from a directory by
      <code>internal/static</code>; framed by <code>internal/frame</code>;
      compressed by <code>internal/hpack</code>. This page has no dependency
      either: no framework, no CDN, every diagram is inline SVG.</p>
 </footer>
+
+</div><!-- /.wrap -->
 
 <script src="/assets/zdh.js"></script>
 </body>
