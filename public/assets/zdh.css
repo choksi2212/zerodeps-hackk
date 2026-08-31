@@ -1,16 +1,22 @@
 /* zdh demo styling. No framework, no reset, no font from a CDN — a
    zero-dependency entry whose demo page pulls in three megabytes of somebody
-   else's CSS would be a poor joke. */
+   else's CSS would be a poor joke. Every diagram on the page is inline SVG for
+   the same reason: nothing here is fetched from anywhere but this server. */
 
 :root {
-  --bg: #10131a;
+  --bg: #0e1117;
+  --bg2: #0b0e13;
   --card: #171b24;
   --line: #262c39;
   --ink: #e6e9ef;
   --dim: #98a2b8;
   --accent: #7cc7ff;
+  --accent-dim: #294056;
   --good: #6ee7a8;
+  --good-dim: #17352a;
   --bad: #ff9f9f;
+  --bad-dim: #3a2126;
+  --violet: #c4b5fd;
   --mono: ui-monospace, "Cascadia Mono", "SF Mono", Consolas, monospace;
 }
 
@@ -19,8 +25,11 @@
 body {
   margin: 0 auto;
   padding: 2.5rem 1.25rem 4rem;
-  max-width: 52rem;
-  background: var(--bg);
+  max-width: 56rem;
+  background:
+    radial-gradient(900px 480px at 82% -8%, #16203050 0%, transparent 60%),
+    radial-gradient(760px 420px at -6% 4%, #1a1a3020 0%, transparent 55%),
+    var(--bg);
   color: var(--ink);
   font: 16px/1.6 system-ui, -apple-system, Segoe UI, sans-serif;
 }
@@ -29,14 +38,20 @@ header {
   display: flex;
   gap: 1rem;
   align-items: center;
-  margin-bottom: 2rem;
+  margin-bottom: 1.5rem;
 }
+
+header img { filter: drop-shadow(0 0 18px #7cc7ff40); }
 
 h1 {
   margin: 0;
   font-size: 2.25rem;
   letter-spacing: -0.02em;
   font-family: var(--mono);
+  background: linear-gradient(92deg, var(--ink) 20%, var(--accent) 120%);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
 }
 
 h2 {
@@ -52,10 +67,50 @@ p:last-child { margin-bottom: 0; }
 
 .sub { color: var(--dim); font-size: 0.9rem; }
 
+/* ---- hero band -------------------------------------------------------- */
+
+.hero {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 0.75rem;
+  margin-bottom: 1.5rem;
+}
+
+.chip {
+  background: linear-gradient(180deg, #1b212c 0%, var(--card) 100%);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 1rem 1.1rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+}
+
+.chip-n {
+  font-family: var(--mono);
+  font-size: 1.9rem;
+  font-weight: 600;
+  line-height: 1;
+  color: var(--accent);
+}
+.chip-sub { font-size: 1rem; color: var(--dim); }
+.chip-l {
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--dim);
+}
+
+@media (max-width: 640px) {
+  .hero { grid-template-columns: repeat(2, 1fr); }
+}
+
+/* ---- cards ------------------------------------------------------------ */
+
 .card {
   background: var(--card);
   border: 1px solid var(--line);
-  border-radius: 10px;
+  border-radius: 12px;
   padding: 1.25rem 1.5rem;
   margin-bottom: 1.25rem;
 }
@@ -63,13 +118,15 @@ p:last-child { margin-bottom: 0; }
 code {
   font-family: var(--mono);
   font-size: 0.9em;
-  background: #0c0f15;
+  background: var(--bg2);
   border: 1px solid var(--line);
   border-radius: 4px;
   padding: 0.05em 0.35em;
 }
 
 a { color: var(--accent); }
+
+/* ---- tables ----------------------------------------------------------- */
 
 table {
   width: 100%;
@@ -90,6 +147,8 @@ th, td {
 
 th { color: var(--dim); font-weight: 500; }
 td.n, th.n { text-align: right; }
+tbody tr { transition: background 0.15s; }
+tbody tr:hover { background: #1c222d; }
 
 .tag {
   display: inline-block;
@@ -97,8 +156,12 @@ td.n, th.n { text-align: right; }
   border-radius: 4px;
   font-weight: 600;
 }
-.tag.h2 { color: var(--good); background: #12291f; }
-.tag.other { color: var(--bad); background: #2a1618; }
+.tag.h2 { color: var(--good); background: var(--good-dim); }
+.tag.other { color: var(--bad); background: var(--bad-dim); }
+
+/* ---- buttons ---------------------------------------------------------- */
+
+.controls { display: flex; gap: 0.6rem; flex-wrap: wrap; }
 
 button {
   font: inherit;
@@ -106,11 +169,13 @@ button {
   color: #0b0e13;
   background: var(--accent);
   border: 0;
-  border-radius: 6px;
-  padding: 0.5rem 1rem;
+  border-radius: 8px;
+  padding: 0.55rem 1.1rem;
   cursor: pointer;
+  transition: filter 0.15s, transform 0.05s;
 }
 button:hover { filter: brightness(1.1); }
+button:active { transform: translateY(1px); }
 button:disabled { opacity: 0.5; cursor: progress; }
 
 button.ghost {
@@ -118,6 +183,141 @@ button.ghost {
   background: transparent;
   border: 1px solid var(--line);
 }
+
+/* ---- diagrams (inline SVG) -------------------------------------------- */
+
+.diagram { margin: 0.5rem 0 0.25rem; }
+.diagram svg { width: 100%; height: auto; display: block; }
+
+.node rect {
+  fill: #1c2330;
+  stroke: var(--line);
+  stroke-width: 1.5;
+}
+.node text {
+  fill: var(--ink);
+  font-family: var(--mono);
+  font-size: 14px;
+  text-anchor: middle;
+  dominant-baseline: middle;
+}
+.node .node-sub { fill: var(--dim); font-size: 11px; }
+
+.node.accent rect { stroke: var(--accent); fill: #16283a; }
+.node.accent text:first-of-type { fill: var(--accent); }
+.node.good rect { stroke: var(--good); fill: #133026; }
+.node.good text:first-of-type { fill: var(--good); }
+.node.dim rect { stroke: var(--violet); fill: #1e1b2e; }
+.node.dim text:first-of-type { fill: var(--violet); }
+
+.edge line, .edge path {
+  stroke: var(--dim);
+  stroke-width: 1.75;
+  fill: none;
+}
+.edge.dashed line { stroke-dasharray: 4 4; }
+.arrowhead { fill: var(--dim); }
+.edge-label {
+  fill: var(--dim);
+  font-family: var(--mono);
+  font-size: 11px;
+  text-anchor: middle;
+}
+
+.legend { font-size: 0.8rem; color: var(--dim); margin-top: 0.75rem; }
+.key {
+  display: inline-block;
+  width: 0.7em; height: 0.7em;
+  border-radius: 3px;
+  margin: 0 0.3em 0 0.9em;
+  vertical-align: middle;
+  background: #1c2330;
+  border: 1.5px solid var(--line);
+}
+.legend .key:first-child { margin-left: 0; }
+.key.accent { border-color: var(--accent); background: #16283a; }
+.key.good { border-color: var(--good); background: #133026; }
+.key.dim { border-color: var(--violet); background: #1e1b2e; }
+
+/* data-flow animated dot */
+.flow-track { stroke: var(--line); stroke-width: 2; fill: none; }
+.flow-dot { fill: var(--accent); filter: drop-shadow(0 0 6px var(--accent)); }
+.flow-stops circle { fill: #1c2330; stroke: var(--accent); stroke-width: 2; }
+.flow-stops text {
+  fill: var(--ink);
+  font-family: var(--mono);
+  font-size: 12px;
+  text-anchor: middle;
+}
+.flow-stops .node-sub { fill: var(--dim); font-size: 10px; }
+
+@media (prefers-reduced-motion: reduce) {
+  .flow-dot animateMotion { display: none; }
+}
+
+/* ---- live visualiser -------------------------------------------------- */
+
+.live {
+  display: grid;
+  grid-template-columns: 1fr 15rem;
+  gap: 1rem;
+  margin-top: 1rem;
+}
+@media (max-width: 720px) { .live { grid-template-columns: 1fr; } }
+
+.live-viz {
+  background: var(--bg2);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 0.75rem;
+}
+.lane-head {
+  display: flex;
+  justify-content: space-between;
+  font-family: var(--mono);
+  font-size: 0.75rem;
+  color: var(--dim);
+  margin-bottom: 0.5rem;
+}
+#viz-clock { color: var(--accent); }
+
+.lanes {
+  position: relative;
+  height: 240px;
+  overflow: hidden;
+  border-left: 2px solid var(--line);
+}
+/* each request is one bar; width grows as its own timing says it took */
+.bar {
+  position: absolute;
+  height: 4px;
+  border-radius: 2px;
+  background: linear-gradient(90deg, var(--accent-dim), var(--accent));
+  box-shadow: 0 0 5px #7cc7ff40;
+  transform-origin: left center;
+  animation: grow 0.5s ease-out both;
+}
+.bar.done { background: linear-gradient(90deg, var(--good-dim), var(--good)); box-shadow: none; }
+@keyframes grow { from { transform: scaleX(0); } to { transform: scaleX(1); } }
+
+.ticker {
+  background: var(--bg2);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 0.6rem 0.75rem;
+  font-family: var(--mono);
+  font-size: 0.72rem;
+  line-height: 1.5;
+  height: 274px;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column-reverse;
+}
+.ticker .frame { color: var(--dim); white-space: nowrap; animation: fadein 0.3s ease-out; }
+.ticker .frame b { color: var(--accent); font-weight: 600; }
+.ticker .frame.data b { color: var(--good); }
+.ticker .frame.settings b { color: var(--violet); }
+@keyframes fadein { from { opacity: 0; transform: translateY(3px); } to { opacity: 1; } }
 
 .result { margin-top: 1rem; border-top: 1px solid var(--line); padding-top: 1rem; }
 
