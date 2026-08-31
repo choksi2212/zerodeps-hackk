@@ -29,6 +29,20 @@ type connSocket interface {
 	Close() error
 }
 
+// halfCloser is a socket that can close its write half on its own, leaving the read
+// half open. *net.TCPConn does it with a FIN and *tls.Conn with a close_notify alert,
+// and both are what a connection needs to end without a reset: see gracefulClose.
+//
+// It is a separate, optional interface rather than a method on connSocket because not
+// every connSocket has a write half to close by itself — net.Pipe, which the tests
+// stand a connection up over, tears both halves down together and has no CloseWrite.
+// A socket that cannot half-close is closed the blunt way, which is the behaviour that
+// was here before this interface existed, so the assertion failing is a graceful
+// degradation and not a missing feature.
+type halfCloser interface {
+	CloseWrite() error
+}
+
 // ConnWriter is the connection's write half as everything above it sees it: four
 // methods, and not one of them about the connection's own lifetime.
 //
@@ -470,6 +484,16 @@ func (c *conn) Serve() error {
 	// to write the connection's last frames means. See the errPeerClosed case.
 	var gone bool
 
+	// sentGoAway records that this connection is leaving on a GOAWAY we put on the
+	// wire, which is the one ending the half-close and drain below are for: the peer
+	// has a frame to read that a reset would discard, and it has inbound octets we
+	// stopped reading that a blunt Close would answer with that reset. The other
+	// endings do not need it. A peer that closed first (errPeerClosed) has already
+	// sent its FIN and been read to EOF, so there is no backlog to reset over and
+	// nothing it is still waiting to read; a transport failure has no socket left to
+	// be graceful with. See gracefulClose.
+	var sentGoAway bool
+
 	var ce h2.ConnError
 	switch {
 	case errors.Is(err, errPeerClosed):
@@ -490,10 +514,12 @@ func (c *conn) Serve() error {
 		// peer-controlled, and reflecting untrusted octets to their sender is a
 		// habit worth not having even where this one is harmless.
 		sendErr = c.farewell(h2.NoError, "")
+		sentGoAway = true
 		err = nil
 
 	case errors.Is(err, errIdle):
 		sendErr = c.farewell(h2.NoError, "idle timeout")
+		sentGoAway = true
 		err = nil
 
 	case errors.Is(err, errShuttingDown):
@@ -506,14 +532,17 @@ func (c *conn) Serve() error {
 		// stops and there is nothing for a first GOAWAY to hold open.
 		// internal/stream owns the first one.
 		sendErr = c.farewell(h2.NoError, "server shutting down")
+		sentGoAway = true
 		err = nil
 
 	case errors.As(err, &ce):
 		sendErr = c.farewell(ce.Code, ce.Reason)
+		sentGoAway = true
 
 	default:
 		// A transport failure: the socket is broken, so there is no GOAWAY to
-		// send and no point starting one.
+		// send and no point starting one — nor any point half-closing a socket
+		// the transport has already taken away.
 		c.w.Close()
 	}
 
@@ -521,6 +550,13 @@ func (c *conn) Serve() error {
 	// goroutine per connection bounded: Wait returns when the writer has stopped,
 	// and the write deadline guarantees it stops.
 	werr := c.w.Wait()
+
+	// The GOAWAY is in the socket's send buffer now that the writer has stopped, so
+	// this is where the connection can end without a reset. See gracefulClose.
+	if sentGoAway {
+		c.gracefulClose()
+	}
+
 	switch {
 	case err != nil:
 		return err
@@ -537,6 +573,73 @@ func (c *conn) Serve() error {
 		return werr
 	}
 }
+
+// gracefulClose half-closes the write half and then drains the read half, so that
+// the blunt Close deferred at the top of Serve sends a FIN rather than a reset.
+//
+// The race it removes is Mihir's, and it is a real one on a public port. The last
+// frame this connection sends is a GOAWAY, and by the time this runs it is in the
+// socket's send buffer. But a peer that pipelined requests we are refusing — or that
+// simply sent faster than we read — has left octets in our receive buffer, and a
+// TCP stack that is told to Close a socket with unread inbound data does not send a
+// FIN: it sends an RST, which discards whatever was in flight in both directions,
+// including the GOAWAY the peer has not read yet. The peer then sees a connection
+// reset in place of the reason we went to the trouble of sending. It is worst on
+// Windows, where the reset is prompt, and it turns a clean shutdown into a
+// connection error in the client's logs for no reason the client can act on.
+//
+// The fix is the shutdown sequence a TCP server is supposed to use. CloseWrite sends
+// a FIN (or, on TLS, a close_notify), which tells the peer we are done sending and
+// lets it read the GOAWAY that came just before it. Then the inbound backlog is
+// drained until the peer closes too or the grace period runs out, so that the Close
+// which follows has an empty receive buffer and sends a FIN rather than a reset. The
+// drain is bounded by ShutdownGrace because a peer that never closes its own half must
+// not hold this goroutine — the whole point of the deadline is that the reset we are
+// avoiding is a smaller harm than a connection that never ends.
+//
+// It runs on the reader goroutine, after run has returned and the writer has been
+// waited for, so nothing else touches the socket while it works. A socket that cannot
+// half-close on its own — net.Pipe in the tests — takes none of this and is closed the
+// blunt way by the deferred Close, which is the behaviour that was here before.
+func (c *conn) gracefulClose() {
+	hc, ok := c.sock.(halfCloser)
+	if !ok {
+		return
+	}
+	if err := hc.CloseWrite(); err != nil {
+		// The write half is already gone, which means the socket is already broken
+		// in the direction that matters. The deferred Close will finish the job, and
+		// there is nothing left to drain toward.
+		return
+	}
+
+	// Bounded, and bounded short. A peer that reads our GOAWAY and then never closes
+	// its own half must not keep this goroutine here, and the ceiling has to sit well
+	// below ShutdownGrace rather than at it: this drain runs inside the window
+	// Shutdown gives every connection to finish, so a drain that waited the whole
+	// grace would spend a server's entire shutdown budget on one polite peer and
+	// report the connection as closed mid-flight. The FIN CloseWrite just sent is
+	// what actually delivers the GOAWAY in order; this only clears the receive buffer
+	// so the deferred Close finds it empty, which is a round-trip's worth of work, not
+	// a grace period's. A read error — the peer's own close, or the deadline expiring —
+	// is the signal to stop, and neither is worth reporting: the connection is over
+	// either way, and the deferred Close is what ends it.
+	if err := c.sock.SetReadDeadline(time.Now().Add(drainGrace)); err != nil {
+		return
+	}
+	var buf [512]byte
+	for {
+		if _, err := c.sock.Read(buf[:]); err != nil {
+			return
+		}
+	}
+}
+
+// drainGrace is how long gracefulClose spends emptying the receive buffer after the
+// FIN. It is short on purpose: it is the time a peer needs to notice the FIN and stop
+// sending, not the time it might take to close its own half, and it runs inside the
+// server's shutdown grace so it cannot be a fraction of a second more than it must be.
+const drainGrace = 250 * time.Millisecond
 
 // discard ends a connection that never began, without writing to it.
 //

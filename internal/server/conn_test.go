@@ -54,6 +54,8 @@ type testSocket struct {
 	pending       []byte
 	readDeadlines []time.Time
 	closes        int
+	closeWrites   int
+	teardown      []string
 	eofAtEnd      bool
 	readErr       error
 
@@ -165,7 +167,23 @@ func (ts *testSocket) SetReadDeadline(t time.Time) error {
 func (ts *testSocket) Close() error {
 	ts.readMu.Lock()
 	ts.closes++
+	ts.teardown = append(ts.teardown, "close")
 	ts.readMu.Unlock()
+	return nil
+}
+
+// CloseWrite makes testSocket a halfCloser, so gracefulClose reaches it the same way
+// it reaches a real *net.TCPConn or *tls.Conn. It records the call and its order
+// relative to Close, and — because a peer that has been sent a FIN answers with its
+// own close — arranges for the drain that follows to see EOF at once rather than
+// spending the drain grace waiting on a deadline in a unit test.
+func (ts *testSocket) CloseWrite() error {
+	ts.readMu.Lock()
+	ts.closeWrites++
+	ts.teardown = append(ts.teardown, "closewrite")
+	ts.eofAtEnd = true
+	ts.readMu.Unlock()
+	ts.wake()
 	return nil
 }
 
@@ -173,6 +191,20 @@ func (ts *testSocket) closeCount() int {
 	ts.readMu.Lock()
 	defer ts.readMu.Unlock()
 	return ts.closes
+}
+
+func (ts *testSocket) closeWriteCount() int {
+	ts.readMu.Lock()
+	defer ts.readMu.Unlock()
+	return ts.closeWrites
+}
+
+// teardownOrder is the sequence of write-half and full closes the connection made,
+// which is where gracefulClose's "FIN before the blunt close" is observable.
+func (ts *testSocket) teardownOrder() []string {
+	ts.readMu.Lock()
+	defer ts.readMu.Unlock()
+	return append([]string(nil), ts.teardown...)
 }
 
 func (ts *testSocket) allReadDeadlines() []time.Time {
@@ -2748,6 +2780,57 @@ func TestServeAlwaysClosesTheSocket(t *testing.T) {
 		if got := ts.closeCount(); got != 1 {
 			t.Errorf("%s: the socket was closed %d times, want exactly 1", tc.name, got)
 		}
+	}
+}
+
+// TestServeHalfClosesTheWriteHalfBeforeClosingOnAGracefulEnding is Mihir's RST race.
+//
+// A connection that ends by sending a GOAWAY has that frame in the socket's send
+// buffer by the time the writer has stopped. If the socket is then closed with the
+// blunt Close alone, and the peer had sent octets we never read — a pipelined request
+// we are refusing, or anything sent faster than we read it — the kernel answers Close
+// with an RST instead of a FIN, and the RST discards the GOAWAY the peer had not read
+// yet. The peer sees a reset where it should have seen the reason we were leaving.
+//
+// gracefulClose removes it by closing the write half first, which sends a FIN in order
+// behind the buffered GOAWAY, and only then closing. This asserts the order: on a
+// graceful ending the write half is closed before the socket is, and the socket is
+// still closed exactly once.
+func TestServeHalfClosesTheWriteHalfBeforeClosingOnAGracefulEnding(t *testing.T) {
+	// A PING before the preface is a connection error, which ends the connection with a
+	// GOAWAY — the graceful path this is about — without waiting on any timeout.
+	ts := newTestSocket(&testTarget{}).
+		script(append([]byte(frame.ClientPreface), encodeFrames(t, ping(1))...)).
+		atEOF()
+
+	_ = serve(t, ts, rejectingHandler(t), testTimeouts())
+
+	if got := ts.closeWriteCount(); got != 1 {
+		t.Fatalf("the write half was closed %d times on a graceful ending, want exactly 1: "+
+			"without the FIN the GOAWAY races a reset", got)
+	}
+	order := ts.teardownOrder()
+	if len(order) != 2 || order[0] != "closewrite" || order[1] != "close" {
+		t.Fatalf("teardown order was %v, want [closewrite close]: the FIN has to reach the peer "+
+			"before the socket is closed under it", order)
+	}
+}
+
+// TestServeDoesNotHalfCloseAfterATransportFailure is the other side of it: a broken
+// socket has nothing to half-close politely. Sending a FIN into a connection the
+// transport has already taken away is at best a wasted syscall and at worst a second
+// error over the first, so gracefulClose is skipped and the socket is closed once.
+func TestServeDoesNotHalfCloseAfterATransportFailure(t *testing.T) {
+	broken := errors.New("connection reset by peer")
+	ts := newTestSocket(&testTarget{}).script(clientHello(t)).failsWith(broken)
+
+	_ = serve(t, ts, rejectingHandler(t), testTimeouts())
+
+	if got := ts.closeWriteCount(); got != 0 {
+		t.Errorf("the write half was closed %d times after a transport failure, want 0", got)
+	}
+	if got := ts.closeCount(); got != 1 {
+		t.Errorf("the socket was closed %d times, want exactly 1", got)
 	}
 }
 

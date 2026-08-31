@@ -47,6 +47,16 @@ rather than calling it inline; called inline it asks whether a stream is live be
 the frame that would open it has been handled, so every buffered signal is dropped
 and the SHOULD in §7 of RFC 9218 is honoured in appearance only.
 
+One more is the teardown itself. A connection that leaves on a GOAWAY has that frame
+in the socket's send buffer, but a peer that pipelined a request we are refusing has
+left octets in our receive buffer -- and a blunt Close over unread inbound data is a
+reset, which discards the GOAWAY the peer had not read. gracefulClose closes the write
+half first, so the FIN carries the GOAWAY out in order, and drains before the Close.
+The break that skips it leaves the reset race it removes, and the test that half-closes
+the write half before the socket sees it fail. It fires only on the endings that send a
+GOAWAY: a peer that closed first is already at EOF with no backlog to reset over, and a
+transport failure has no socket left to be polite with, so neither takes the path.
+
 Two guards in discard have no break, and both are named rather than quietly skipped.
 
   * c.w.Close(). Removing it does not fail a test, it deadlocks one: the writer sits
@@ -229,6 +239,16 @@ BREAKS = [
         ["TestServeAlwaysClosesTheSocket"],
     ),
     (
+        "Serve: the write half is never closed, so the final GOAWAY races a reset",
+        """	if sentGoAway {
+		c.gracefulClose()
+	}""",
+        """	if sentGoAway && false {
+		c.gracefulClose()
+	}""",
+        ["TestServeHalfClosesTheWriteHalfBeforeClosingOnAGracefulEnding"],
+    ),
+    (
         "Serve: a connection error ends the connection without telling the peer why",
         """		sendErr = c.farewell(ce.Code, ce.Reason)""",
         """		c.w.Close()""",
@@ -313,7 +333,8 @@ BREAKS = [
         "Serve: a broken socket is sent a GOAWAY, whose failure competes with the real error",
         """	default:
 		// A transport failure: the socket is broken, so there is no GOAWAY to
-		// send and no point starting one.
+		// send and no point starting one — nor any point half-closing a socket
+		// the transport has already taken away.
 		c.w.Close()
 	}""",
         """	default:
@@ -337,9 +358,11 @@ BREAKS = [
         "Serve: closing an idle connection is reported as a failure",
         """	case errors.Is(err, errIdle):
 		sendErr = c.farewell(h2.NoError, "idle timeout")
+		sentGoAway = true
 		err = nil""",
         """	case errors.Is(err, errIdle):
-		sendErr = c.farewell(h2.NoError, "idle timeout")""",
+		sendErr = c.farewell(h2.NoError, "idle timeout")
+		sentGoAway = true""",
         ["TestServeGoesAwayOnTheIdleTimeout"],
     ),
     (
@@ -667,6 +690,7 @@ BREAKS = [
     (
         "Serve: a shutdown is reported as a failure and the peer is never told why",
         """		sendErr = c.farewell(h2.NoError, "server shutting down")
+		sentGoAway = true
 		err = nil""",
         "",
         [
