@@ -119,17 +119,26 @@ code {
 
 .hero { padding: 6rem 0 4rem; text-align: center; }
 
-.badge-row { display: flex; gap: 0.6rem; justify-content: center; flex-wrap: wrap; margin-bottom: 2rem; }
+.badge-row {
+  display: flex; gap: 0.6rem;
+  justify-content: center; align-items: center;
+  flex-wrap: wrap; margin-bottom: 2rem;
+}
 .badge {
-  font-family: var(--mono); font-size: 0.75rem;
+  /* hug the text. without this the flex row stretches the first badge across
+     the whole line and leaves its dot stranded at the far left. */
+  flex: 0 0 auto;
+  display: inline-flex; align-items: center; gap: 0.45rem;
+  font-family: var(--mono); font-size: 0.75rem; white-space: nowrap;
   border: 1px solid var(--line2); border-radius: 999px;
   padding: 0.35rem 0.9rem; color: var(--dim);
   background: #0d111c99; backdrop-filter: blur(6px);
 }
 .badge.live { color: var(--lime); border-color: #2c5e45; }
 .badge .dot {
-  display: inline-block; width: 7px; height: 7px; border-radius: 50%;
-  background: var(--lime); margin-right: 0.45rem;
+  flex: 0 0 auto;
+  width: 7px; height: 7px; border-radius: 50%;
+  background: var(--lime);
   animation: blip 1.6s ease-in-out infinite;
 }
 @keyframes blip { 0%,100% { opacity: 1; box-shadow: 0 0 0 0 #4ade8080; } 50% { opacity: 0.55; box-shadow: 0 0 0 6px #4ade8000; } }
